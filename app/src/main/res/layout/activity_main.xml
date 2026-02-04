@@ -18,6 +18,37 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <!-- Focus Indicator (tap-to-focus) -->
+    <ImageView
+        android:id="@+id/focusIndicator"
+        android:layout_width="@dimen/focus_indicator_size"
+        android:layout_height="@dimen/focus_indicator_size"
+        android:src="@drawable/focus_indicator"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        tools:visibility="visible"
+        tools:translationX="200dp"
+        tools:translationY="200dp" />
+
+    <!-- Zoom Level Display -->
+    <TextView
+        android:id="@+id/tvZoomLevel"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:padding="12dp"
+        android:background="@drawable/zoom_background"
+        android:textColor="@color/white"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:visibility="gone"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        tools:visibility="visible"
+        tools:text="2.0x" />
+
     <!-- Status Overlay -->
     <LinearLayout
         android:id="@+id/overlayStatus"
