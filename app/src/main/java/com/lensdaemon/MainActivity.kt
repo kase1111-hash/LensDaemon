@@ -1,13 +1,20 @@
 package com.lensdaemon
 
 import android.Manifest
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.Bundle
+import android.os.Handler
 import android.os.IBinder
+import android.os.Looper
+import android.util.Size
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
 import android.view.View
 import android.view.WindowInsets
 import android.view.WindowInsetsController
@@ -18,6 +25,7 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
 import com.lensdaemon.camera.CameraService
 import com.lensdaemon.camera.CameraState
+import com.lensdaemon.camera.FocusState
 import com.lensdaemon.camera.LensType
 import com.lensdaemon.databinding.ActivityMainBinding
 import kotlinx.coroutines.flow.collectLatest
@@ -35,6 +43,14 @@ class MainActivity : AppCompatActivity() {
     // Camera service connection
     private var cameraService: CameraService? = null
     private var serviceBound = false
+
+    // Gesture detectors
+    private lateinit var scaleGestureDetector: ScaleGestureDetector
+    private var isScaling = false
+
+    // Focus indicator handler
+    private val focusHandler = Handler(Looper.getMainLooper())
+    private val hideFocusIndicatorRunnable = Runnable { hideFocusIndicator() }
 
     private val requiredPermissions = arrayOf(
         Manifest.permission.CAMERA,
@@ -79,6 +95,7 @@ class MainActivity : AppCompatActivity() {
 
         hideSystemUI()
         setupUI()
+        setupGestureDetectors()
 
         if (hasAllPermissions()) {
             startCameraService()
@@ -94,6 +111,7 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        focusHandler.removeCallbacks(hideFocusIndicatorRunnable)
         if (serviceBound) {
             unbindService(serviceConnection)
             serviceBound = false
@@ -126,9 +144,135 @@ class MainActivity : AppCompatActivity() {
 
             // Select main lens by default
             btnLensMain.isSelected = true
+
+            // Hide focus indicator initially
+            focusIndicator.visibility = View.GONE
         }
 
         updateStatus(StreamingState.IDLE)
+    }
+
+    private fun setupGestureDetectors() {
+        // Pinch-to-zoom gesture detector
+        scaleGestureDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+            override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
+                isScaling = true
+                cameraService?.onPinchStart()
+                return true
+            }
+
+            override fun onScale(detector: ScaleGestureDetector): Boolean {
+                val scaleFactor = detector.scaleFactor
+                val newZoom = cameraService?.onPinchScale(scaleFactor) ?: 1.0f
+                updateZoomDisplay(newZoom)
+                return true
+            }
+
+            override fun onScaleEnd(detector: ScaleGestureDetector) {
+                isScaling = false
+                cameraService?.onPinchEnd()
+                hideZoomDisplayDelayed()
+            }
+        })
+
+        // Touch listener for tap-to-focus and pinch-to-zoom
+        binding.surfacePreview.setOnTouchListener { view, event ->
+            scaleGestureDetector.onTouchEvent(event)
+
+            when (event.actionMasked) {
+                MotionEvent.ACTION_UP -> {
+                    if (!isScaling && event.pointerCount == 1) {
+                        handleTapToFocus(event.x, event.y, view.width, view.height)
+                    }
+                }
+            }
+            true
+        }
+    }
+
+    private fun handleTapToFocus(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
+        val service = cameraService ?: return
+
+        if (!service.isTapToFocusSupported()) {
+            Timber.d("Tap-to-focus not supported")
+            return
+        }
+
+        // Convert to normalized coordinates (0.0 to 1.0)
+        val normalizedX = x / viewWidth
+        val normalizedY = y / viewHeight
+
+        // Trigger tap-to-focus
+        service.triggerTapToFocus(normalizedX, normalizedY, Size(viewWidth, viewHeight))
+
+        // Also trigger spot metering at same location
+        service.triggerSpotMetering(normalizedX, normalizedY)
+
+        // Show focus indicator
+        showFocusIndicator(x, y)
+    }
+
+    private fun showFocusIndicator(x: Float, y: Float) {
+        binding.focusIndicator.apply {
+            // Position the indicator centered on tap location
+            val size = resources.getDimensionPixelSize(R.dimen.focus_indicator_size)
+            translationX = x - size / 2
+            translationY = y - size / 2
+
+            // Reset and animate
+            alpha = 1f
+            scaleX = 1.5f
+            scaleY = 1.5f
+            visibility = View.VISIBLE
+
+            animate()
+                .scaleX(1f)
+                .scaleY(1f)
+                .setDuration(200)
+                .setListener(null)
+                .start()
+        }
+
+        // Schedule hiding the indicator
+        focusHandler.removeCallbacks(hideFocusIndicatorRunnable)
+        focusHandler.postDelayed(hideFocusIndicatorRunnable, 2000)
+    }
+
+    private fun hideFocusIndicator() {
+        binding.focusIndicator.animate()
+            .alpha(0f)
+            .setDuration(200)
+            .setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    binding.focusIndicator.visibility = View.GONE
+                }
+            })
+            .start()
+    }
+
+    private fun updateZoomDisplay(zoom: Float) {
+        binding.tvZoomLevel.apply {
+            text = if (zoom < 2.0f) {
+                String.format("%.1fx", zoom)
+            } else {
+                String.format("%.0fx", zoom)
+            }
+            visibility = View.VISIBLE
+            alpha = 1f
+        }
+    }
+
+    private fun hideZoomDisplayDelayed() {
+        binding.tvZoomLevel.animate()
+            .alpha(0f)
+            .setStartDelay(1000)
+            .setDuration(300)
+            .setListener(object : AnimatorListenerAdapter() {
+                override fun onAnimationEnd(animation: Animator) {
+                    binding.tvZoomLevel.visibility = View.GONE
+                }
+            })
+            .start()
     }
 
     private fun hasAllPermissions(): Boolean {
@@ -225,6 +369,34 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+
+        // Observe focus state
+        lifecycleScope.launch {
+            service.focusState.collectLatest { state ->
+                updateFocusIndicatorState(state)
+            }
+        }
+
+        // Observe zoom level
+        lifecycleScope.launch {
+            service.currentZoom.collectLatest { zoom ->
+                // Only update if zoom display is visible (during gesture)
+                if (binding.tvZoomLevel.visibility == View.VISIBLE) {
+                    updateZoomDisplay(zoom)
+                }
+            }
+        }
+    }
+
+    private fun updateFocusIndicatorState(state: FocusState) {
+        val color = when (state) {
+            FocusState.SCANNING -> R.color.focus_scanning
+            FocusState.FOCUSED -> R.color.focus_success
+            FocusState.FAILED -> R.color.focus_failed
+            FocusState.INACTIVE -> R.color.focus_inactive
+        }
+
+        binding.focusIndicator.setColorFilter(ContextCompat.getColor(this, color))
     }
 
     private fun updateSelectedLensButton(lensType: LensType) {

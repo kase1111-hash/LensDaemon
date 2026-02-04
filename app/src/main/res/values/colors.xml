@@ -30,4 +30,10 @@
     <!-- Overlay -->
     <color name="overlay_dark">#80000000</color>
     <color name="overlay_light">#40FFFFFF</color>
+
+    <!-- Focus Indicator Colors -->
+    <color name="focus_inactive">#FFFFFF</color>
+    <color name="focus_scanning">#FFC107</color>
+    <color name="focus_success">#4CAF50</color>
+    <color name="focus_failed">#F44336</color>
 </resources>

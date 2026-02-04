@@ -5,6 +5,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.hardware.camera2.CameraManager
 import android.os.Binder
 import android.os.IBinder
 import android.util.Size
@@ -15,6 +16,7 @@ import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
 import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import timber.log.Timber
@@ -50,13 +52,27 @@ class CameraService : Service() {
     private val serviceScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     // Camera components
-    private lateinit var cameraManager: LensDaemonCameraManager
+    private lateinit var lensDaemonCameraManager: LensDaemonCameraManager
     private val previewSurfaceProvider = PreviewSurfaceProvider()
+
+    // Controllers (Phase 3)
+    private lateinit var lensController: LensController
+    private val focusController = FocusController()
+    private val exposureController = ExposureController()
+    private val zoomController = ZoomController()
 
     // Current state
     private var currentConfig = CaptureConfig()
     private var isPreviewActive = false
     private var isStreamingActive = false
+
+    // Focus state observable
+    private val _focusState = MutableStateFlow(FocusState.INACTIVE)
+    val focusState: StateFlow<FocusState> = _focusState
+
+    // Zoom state observable
+    private val _currentZoom = MutableStateFlow(1.0f)
+    val currentZoom: StateFlow<Float> = _currentZoom
 
     inner class LocalBinder : Binder() {
         fun getService(): CameraService = this@CameraService
@@ -67,7 +83,18 @@ class CameraService : Service() {
     override fun onCreate() {
         super.onCreate()
         Timber.i("CameraService created")
-        cameraManager = LensDaemonCameraManager(applicationContext)
+
+        val systemCameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        lensDaemonCameraManager = LensDaemonCameraManager(applicationContext)
+
+        // Initialize lens controller with available lenses
+        lensController = LensController(systemCameraManager, lensDaemonCameraManager.availableLenses)
+
+        // Set up zoom change listener
+        zoomController.setOnZoomChangedListener { zoom ->
+            _currentZoom.value = zoom
+            applyZoomToCamera(zoom)
+        }
 
         // Monitor surface state
         serviceScope.launch {
@@ -83,6 +110,13 @@ class CameraService : Service() {
                         Timber.d("Preview surface unavailable")
                     }
                 }
+            }
+        }
+
+        // Monitor focus state
+        serviceScope.launch {
+            focusController.focusState.collectLatest { state ->
+                _focusState.value = state
             }
         }
     }
@@ -119,7 +153,7 @@ class CameraService : Service() {
         super.onDestroy()
         Timber.i("CameraService destroyed")
         stopPreview()
-        cameraManager.release()
+        lensDaemonCameraManager.release()
         previewSurfaceProvider.detach()
         serviceScope.cancel()
     }
@@ -154,6 +188,19 @@ class CameraService : Service() {
         notificationManager.notify(LensDaemonApp.NOTIFICATION_ID, notification)
     }
 
+    private fun initializeControllersForCamera(cameraId: String) {
+        val systemCameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            val characteristics = systemCameraManager.getCameraCharacteristics(cameraId)
+            focusController.initialize(characteristics)
+            exposureController.initialize(characteristics)
+            zoomController.initialize(characteristics)
+            Timber.i("Controllers initialized for camera: $cameraId")
+        } catch (e: Exception) {
+            Timber.e(e, "Failed to initialize controllers for camera: $cameraId")
+        }
+    }
+
     // ==================== Public API ====================
 
     /**
@@ -167,17 +214,22 @@ class CameraService : Service() {
     /**
      * Get available camera lenses.
      */
-    fun getAvailableLenses(): List<CameraLens> = cameraManager.availableLenses
+    fun getAvailableLenses(): List<CameraLens> = lensDaemonCameraManager.availableLenses
 
     /**
      * Get the current lens being used.
      */
-    fun getCurrentLens(): StateFlow<CameraLens?> = cameraManager.currentLens
+    fun getCurrentLens(): StateFlow<CameraLens?> = lensDaemonCameraManager.currentLens
 
     /**
      * Get the current camera state.
      */
-    fun getCameraState(): StateFlow<CameraState> = cameraManager.cameraState
+    fun getCameraState(): StateFlow<CameraState> = lensDaemonCameraManager.cameraState
+
+    /**
+     * Get zoom presets for available lenses.
+     */
+    fun getZoomPresets(): List<ZoomPreset> = lensController.getZoomPresets()
 
     /**
      * Start camera preview with the specified lens.
@@ -200,8 +252,13 @@ class CameraService : Service() {
     private suspend fun openCameraAndStartPreview(lensType: LensType) {
         try {
             Timber.i("Opening camera with lens type: $lensType")
-            val opened = cameraManager.openCamera(lensType)
+            val opened = lensDaemonCameraManager.openCamera(lensType)
             if (opened) {
+                val lens = lensDaemonCameraManager.currentLens.value
+                lens?.let {
+                    lensController.setCurrentLens(it)
+                    initializeControllersForCamera(it.cameraId)
+                }
                 isPreviewActive = true
                 // Wait for surface to be available
                 val surfaceState = previewSurfaceProvider.surfaceState.value
@@ -220,8 +277,10 @@ class CameraService : Service() {
     private suspend fun openCameraAndStartPreview(lens: CameraLens) {
         try {
             Timber.i("Opening camera with lens: ${lens.lensType.displayName}")
-            val opened = cameraManager.openCamera(lens)
+            val opened = lensDaemonCameraManager.openCamera(lens)
             if (opened) {
+                lensController.setCurrentLens(lens)
+                initializeControllersForCamera(lens.cameraId)
                 isPreviewActive = true
                 val surfaceState = previewSurfaceProvider.surfaceState.value
                 if (surfaceState is SurfaceState.Available) {
@@ -239,7 +298,7 @@ class CameraService : Service() {
     private suspend fun startCameraPreview(surface: Surface) {
         try {
             Timber.i("Starting camera preview")
-            cameraManager.startPreview(surface, currentConfig)
+            lensDaemonCameraManager.startPreview(surface, currentConfig)
         } catch (e: Exception) {
             Timber.e(e, "Error starting camera preview")
         }
@@ -251,7 +310,10 @@ class CameraService : Service() {
     fun stopPreview() {
         Timber.i("Stopping preview")
         isPreviewActive = false
-        cameraManager.closeCamera()
+        lensDaemonCameraManager.closeCamera()
+        focusController.reset()
+        exposureController.reset()
+        zoomController.reset()
         updateNotification()
     }
 
@@ -261,7 +323,7 @@ class CameraService : Service() {
     fun switchLens(lensType: LensType) {
         Timber.i("Switching lens to: $lensType")
         serviceScope.launch {
-            val lens = cameraManager.availableLenses.find { it.lensType == lensType }
+            val lens = lensDaemonCameraManager.availableLenses.find { it.lensType == lensType }
             if (lens != null) {
                 openCameraAndStartPreview(lens)
             } else {
@@ -286,41 +348,225 @@ class CameraService : Service() {
         switchLens(lensType)
     }
 
+    // ==================== Zoom Control (Phase 3) ====================
+
     /**
-     * Set the zoom level.
+     * Set the zoom level immediately.
      */
     fun setZoom(zoomLevel: Float) {
-        Timber.i("Setting zoom to: $zoomLevel")
-        currentConfig = currentConfig.copy(zoomRatio = zoomLevel)
-        cameraManager.updateConfig(currentConfig)
+        zoomController.setZoom(zoomLevel)
+    }
+
+    /**
+     * Animate zoom to target level.
+     */
+    fun animateZoomTo(targetZoom: Float) {
+        zoomController.animateZoomTo(targetZoom)
+    }
+
+    /**
+     * Zoom in by a step.
+     */
+    fun zoomIn(step: Float = 0.5f): Float {
+        return zoomController.zoomIn(step)
+    }
+
+    /**
+     * Zoom out by a step.
+     */
+    fun zoomOut(step: Float = 0.5f): Float {
+        return zoomController.zoomOut(step)
+    }
+
+    /**
+     * Reset zoom to 1x.
+     */
+    fun resetZoom() {
+        zoomController.resetZoom()
+    }
+
+    /**
+     * Handle pinch gesture start.
+     */
+    fun onPinchStart() {
+        zoomController.onPinchStart()
+    }
+
+    /**
+     * Handle pinch scale.
+     */
+    fun onPinchScale(scaleFactor: Float): Float {
+        return zoomController.onPinchScale(scaleFactor)
+    }
+
+    /**
+     * Handle pinch gesture end.
+     */
+    fun onPinchEnd() {
+        zoomController.onPinchEnd()
+    }
+
+    /**
+     * Get zoom range for current camera.
+     */
+    fun getZoomRange(): ClosedFloatingPointRange<Float> = zoomController.zoomRange.value
+
+    private fun applyZoomToCamera(zoom: Float) {
+        currentConfig = currentConfig.copy(zoomRatio = zoom)
+        lensDaemonCameraManager.updateConfig(currentConfig)
+    }
+
+    // ==================== Focus Control (Phase 3) ====================
+
+    /**
+     * Trigger tap-to-focus at normalized coordinates.
+     * @param x Normalized X (0.0 to 1.0, left to right)
+     * @param y Normalized Y (0.0 to 1.0, top to bottom)
+     * @param previewSize Size of the preview view
+     */
+    fun triggerTapToFocus(x: Float, y: Float, previewSize: Size) {
+        val result = focusController.triggerTapToFocus(x, y, previewSize)
+        if (result != null) {
+            currentConfig = currentConfig.copy(focusMode = result.mode)
+            lensDaemonCameraManager.updateConfig(currentConfig)
+            Timber.i("Tap-to-focus triggered at ($x, $y)")
+        }
+    }
+
+    /**
+     * Lock focus at current position.
+     */
+    fun lockFocus() {
+        focusController.lockFocus()
+    }
+
+    /**
+     * Unlock focus and return to continuous mode.
+     */
+    fun unlockFocus() {
+        val result = focusController.unlockFocus()
+        currentConfig = currentConfig.copy(focusMode = result.mode)
+        lensDaemonCameraManager.updateConfig(currentConfig)
     }
 
     /**
      * Set focus mode.
      */
     fun setFocusMode(mode: FocusMode) {
-        Timber.i("Setting focus mode to: $mode")
-        currentConfig = currentConfig.copy(focusMode = mode)
-        cameraManager.updateConfig(currentConfig)
+        if (focusController.setFocusMode(mode)) {
+            currentConfig = currentConfig.copy(focusMode = mode)
+            lensDaemonCameraManager.updateConfig(currentConfig)
+        }
     }
+
+    /**
+     * Set manual focus distance (0.0 = infinity, 1.0 = closest).
+     */
+    fun setManualFocusDistance(distance: Float) {
+        if (focusController.setManualFocusDistance(distance)) {
+            currentConfig = currentConfig.copy(focusMode = FocusMode.MANUAL)
+            lensDaemonCameraManager.updateConfig(currentConfig)
+        }
+    }
+
+    /**
+     * Check if tap-to-focus is supported.
+     */
+    fun isTapToFocusSupported(): Boolean = focusController.isTapToFocusSupported()
+
+    /**
+     * Check if manual focus is supported.
+     */
+    fun isManualFocusSupported(): Boolean = focusController.isManualFocusSupported()
+
+    // ==================== Exposure Control (Phase 3) ====================
 
     /**
      * Set exposure compensation.
      */
     fun setExposureCompensation(value: Int) {
-        Timber.i("Setting exposure compensation to: $value")
-        currentConfig = currentConfig.copy(exposureCompensation = value)
-        cameraManager.updateConfig(currentConfig)
+        if (exposureController.setExposureCompensation(value)) {
+            currentConfig = currentConfig.copy(exposureCompensation = value)
+            lensDaemonCameraManager.updateConfig(currentConfig)
+        }
     }
+
+    /**
+     * Adjust exposure compensation by delta.
+     */
+    fun adjustExposureCompensation(delta: Int): Int {
+        val newValue = exposureController.adjustExposureCompensation(delta)
+        currentConfig = currentConfig.copy(exposureCompensation = newValue)
+        lensDaemonCameraManager.updateConfig(currentConfig)
+        return newValue
+    }
+
+    /**
+     * Lock auto-exposure.
+     */
+    fun lockExposure() {
+        exposureController.lockExposure()
+    }
+
+    /**
+     * Unlock auto-exposure.
+     */
+    fun unlockExposure() {
+        exposureController.unlockExposure()
+    }
+
+    /**
+     * Toggle exposure lock.
+     */
+    fun toggleExposureLock(): Boolean {
+        return exposureController.toggleExposureLock()
+    }
+
+    /**
+     * Get exposure lock state.
+     */
+    fun isExposureLocked(): StateFlow<Boolean> = exposureController.aeLocked
 
     /**
      * Set white balance mode.
      */
     fun setWhiteBalance(mode: WhiteBalanceMode) {
-        Timber.i("Setting white balance to: $mode")
-        currentConfig = currentConfig.copy(whiteBalance = mode)
-        cameraManager.updateConfig(currentConfig)
+        if (exposureController.setWhiteBalance(mode)) {
+            currentConfig = currentConfig.copy(whiteBalance = mode)
+            lensDaemonCameraManager.updateConfig(currentConfig)
+        }
     }
+
+    /**
+     * Get supported white balance modes.
+     */
+    fun getSupportedWhiteBalanceModes(): List<WhiteBalanceMode> {
+        return exposureController.getSupportedWhiteBalanceModes()
+    }
+
+    /**
+     * Trigger spot metering at normalized coordinates.
+     */
+    fun triggerSpotMetering(x: Float, y: Float) {
+        exposureController.triggerSpotMetering(x, y)
+        Timber.i("Spot metering triggered at ($x, $y)")
+    }
+
+    /**
+     * Reset metering to center-weighted.
+     */
+    fun resetMetering() {
+        exposureController.resetMetering()
+    }
+
+    /**
+     * Get exposure compensation range.
+     */
+    fun getExposureCompensationRange(): android.util.Range<Int> {
+        return exposureController.getExposureCompensationRange()
+    }
+
+    // ==================== Resolution Control ====================
 
     /**
      * Update capture resolution.
@@ -341,8 +587,8 @@ class CameraService : Service() {
      * Get camera capabilities for current lens.
      */
     fun getCurrentCameraCapabilities(): CameraCapabilities? {
-        val lens = cameraManager.currentLens.value ?: return null
-        return cameraManager.getCameraCapabilities(lens.cameraId)
+        val lens = lensDaemonCameraManager.currentLens.value ?: return null
+        return lensDaemonCameraManager.getCameraCapabilities(lens.cameraId)
     }
 
     // ==================== Streaming (Phase 4-5) ====================

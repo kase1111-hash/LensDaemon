@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 2 complete - Camera2 pipeline with preview, lens enumeration, and capture configuration.
+**Status:** Phase 3 complete - Full lens control with tap-to-focus, pinch-to-zoom, and exposure controls.
 
 ## Tech Stack
 
@@ -112,7 +112,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 |-------|-------|--------|
 | 1 | Project Foundation | Complete |
 | 2 | Camera2 Pipeline | Complete |
-| 3 | Lens Control | Pending |
+| 3 | Lens Control | Complete |
 | 4 | Video Encoding | Pending |
 | 5 | RTSP Server | Pending |
 | 6 | Web Interface | Pending |
@@ -156,4 +156,43 @@ app/src/main/java/com/lensdaemon/camera/
                                  # - Full Camera2 pipeline integration
                                  # - Preview start/stop, lens switching
                                  # - Camera state observation via StateFlow
+```
+
+## Phase 3 Files (Lens Control & Camera Configuration)
+
+```
+app/src/main/java/com/lensdaemon/camera/
+├── LensController.kt            # Multi-lens camera management
+│                                # - Automatic lens selection for zoom levels
+│                                # - Zoom presets based on available lenses
+│                                # - Effective zoom calculation (optical + digital)
+│                                # - Smooth zoom animation support
+├── FocusController.kt           # Focus control and tap-to-focus
+│                                # - Tap-to-focus with metering regions
+│                                # - Focus state tracking (inactive/scanning/success/failed)
+│                                # - Manual focus distance control
+│                                # - Focus lock/unlock operations
+├── ExposureController.kt        # Exposure and white balance control
+│                                # - AE lock/unlock with state tracking
+│                                # - Exposure compensation (EV adjustment)
+│                                # - Spot metering at touch points
+│                                # - White balance modes and AWB lock
+├── ZoomController.kt            # Smooth zoom and pinch-to-zoom
+│                                # - ValueAnimator-based smooth zoom
+│                                # - Pinch gesture handling
+│                                # - Android 11+ CONTROL_ZOOM_RATIO support
+│                                # - Legacy SCALER_CROP_REGION fallback
+└── CameraService.kt             # Updated with all controllers integrated
+                                 # - Public APIs for touch interactions
+                                 # - Controller lifecycle management
+
+app/src/main/res/
+├── drawable/
+│   ├── focus_indicator.xml      # Focus rectangle drawable
+│   └── zoom_background.xml      # Zoom level display background
+├── values/
+│   ├── colors.xml               # Updated with focus state colors
+│   └── dimens.xml               # UI dimensions for focus/zoom elements
+└── layout/
+    └── activity_main.xml        # Updated with focus indicator and zoom display
 ```
