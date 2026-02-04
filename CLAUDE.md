@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 3 complete - Full lens control with tap-to-focus, pinch-to-zoom, and exposure controls.
+**Status:** Phase 4 complete - Hardware video encoding with H.264/H.265 MediaCodec, NAL unit parsing, and adaptive bitrate.
 
 ## Tech Stack
 
@@ -113,7 +113,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 1 | Project Foundation | Complete |
 | 2 | Camera2 Pipeline | Complete |
 | 3 | Lens Control | Complete |
-| 4 | Video Encoding | Pending |
+| 4 | Video Encoding | Complete |
 | 5 | RTSP Server | Pending |
 | 6 | Web Interface | Pending |
 | 7 | Local Recording | Pending |
@@ -195,4 +195,45 @@ app/src/main/res/
 │   └── dimens.xml               # UI dimensions for focus/zoom elements
 └── layout/
     └── activity_main.xml        # Updated with focus indicator and zoom display
+```
+
+## Phase 4 Files (Hardware Video Encoding)
+
+```
+app/src/main/java/com/lensdaemon/encoder/
+├── EncoderConfig.kt             # Encoding configuration data classes
+│                                # - VideoCodec (H264, H265), BitrateMode (VBR, CBR, CQ)
+│                                # - H264Profile, H265Profile enum classes
+│                                # - EncoderConfig with presets (720p, 1080p, 4K)
+│                                # - EncoderState, EncoderError, EncoderStats
+│                                # - EncodedFrame data class with metadata
+├── NalUnitParser.kt             # H.264/H.265 NAL unit extraction
+│                                # - Start code detection (3-byte and 4-byte)
+│                                # - NAL type parsing for AVC and HEVC
+│                                # - SPS/PPS/VPS caching for streaming setup
+│                                # - NalUnit data class with payload extraction
+│                                # - NalUnitBuilder for creating NAL streams
+├── VideoEncoder.kt              # MediaCodec-based video encoder
+│                                # - Hardware encoder detection and selection
+│                                # - Surface input mode for camera integration
+│                                # - Async callback-based encoding
+│                                # - Dynamic bitrate and keyframe control
+│                                # - Encoder capabilities detection
+├── FrameProcessor.kt            # Camera-to-encoder bridge
+│                                # - Frame flow management with backpressure
+│                                # - Encoded frame SharedFlow for consumers
+│                                # - Adaptive bitrate support
+│                                # - FrameProcessorFactory for common configs
+└── EncoderService.kt            # Foreground encoder service
+                                 # - Service binding for camera integration
+                                 # - Notification management
+                                 # - Frame listener dispatch
+                                 # - Encoder lifecycle management
+
+app/src/main/java/com/lensdaemon/camera/
+└── CameraService.kt             # Updated with encoder integration
+                                 # - EncoderService binding
+                                 # - Streaming start/stop with encoding
+                                 # - Encoded frame listeners
+                                 # - Adaptive bitrate control APIs
 ```
