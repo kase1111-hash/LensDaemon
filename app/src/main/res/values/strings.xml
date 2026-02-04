@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LensDaemon</string>
+    <string name="device_admin_description">LensDaemon requires device admin access to enable kiosk mode and prevent unauthorized access to the device.</string>
+
+    <!-- Status Messages -->
+    <string name="status_idle">Idle</string>
+    <string name="status_streaming">Streaming</string>
+    <string name="status_recording">Recording</string>
+    <string name="status_error">Error</string>
+
+    <!-- Button Labels -->
+    <string name="btn_start_stream">Start Stream</string>
+    <string name="btn_stop_stream">Stop Stream</string>
+    <string name="btn_start_recording">Start Recording</string>
+    <string name="btn_stop_recording">Stop Recording</string>
+    <string name="btn_settings">Settings</string>
+
+    <!-- Lens Labels -->
+    <string name="lens_wide">Wide</string>
+    <string name="lens_main">Main</string>
+    <string name="lens_tele">Tele</string>
+
+    <!-- Notification -->
+    <string name="notification_channel_name">LensDaemon Service</string>
+    <string name="notification_channel_description">Shows when LensDaemon is running</string>
+    <string name="notification_title">LensDaemon Active</string>
+    <string name="notification_streaming">Streaming video</string>
+    <string name="notification_recording">Recording video</string>
+</resources>

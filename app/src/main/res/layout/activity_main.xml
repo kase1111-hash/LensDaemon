@@ -1,0 +1,201 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@color/black"
+    tools:context=".MainActivity">
+
+    <!-- Camera Preview Surface -->
+    <SurfaceView
+        android:id="@+id/surfacePreview"
+        android:layout_width="0dp"
+        android:layout_height="0dp"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent" />
+
+    <!-- Status Overlay -->
+    <LinearLayout
+        android:id="@+id/overlayStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="16dp"
+        android:background="@color/overlay_dark"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        android:layout_margin="16dp">
+
+        <View
+            android:id="@+id/statusIndicator"
+            android:layout_width="12dp"
+            android:layout_height="12dp"
+            android:layout_gravity="center_vertical"
+            android:layout_marginEnd="8dp"
+            android:background="@drawable/status_indicator" />
+
+        <TextView
+            android:id="@+id/tvStatus"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="@string/status_idle"
+            android:textColor="@color/white"
+            android:textSize="14sp" />
+
+    </LinearLayout>
+
+    <!-- Stream Info Overlay -->
+    <LinearLayout
+        android:id="@+id/overlayStreamInfo"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="vertical"
+        android:padding="16dp"
+        android:background="@color/overlay_dark"
+        app:layout_constraintTop_toTopOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_margin="16dp"
+        android:visibility="gone"
+        tools:visibility="visible">
+
+        <TextView
+            android:id="@+id/tvRtspUrl"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/light_gray"
+            android:textSize="12sp"
+            tools:text="RTSP: rtsp://192.168.1.50:8554/live" />
+
+        <TextView
+            android:id="@+id/tvResolution"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/light_gray"
+            android:textSize="12sp"
+            tools:text="1920x1080 @ 30fps" />
+
+        <TextView
+            android:id="@+id/tvBitrate"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/light_gray"
+            android:textSize="12sp"
+            tools:text="6.2 Mbps" />
+
+    </LinearLayout>
+
+    <!-- Lens Selection -->
+    <LinearLayout
+        android:id="@+id/lensSelector"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:background="@color/overlay_dark"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        android:layout_margin="16dp">
+
+        <Button
+            android:id="@+id/btnLensWide"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:minWidth="72dp"
+            android:text="@string/lens_wide"
+            android:textSize="12sp"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
+
+        <Button
+            android:id="@+id/btnLensMain"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:minWidth="72dp"
+            android:text="@string/lens_main"
+            android:textSize="12sp"
+            android:layout_marginStart="8dp"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
+
+        <Button
+            android:id="@+id/btnLensTele"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:minWidth="72dp"
+            android:text="@string/lens_tele"
+            android:textSize="12sp"
+            android:layout_marginStart="8dp"
+            style="@style/Widget.MaterialComponents.Button.OutlinedButton" />
+
+    </LinearLayout>
+
+    <!-- Control Buttons -->
+    <LinearLayout
+        android:id="@+id/controlButtons"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:background="@color/overlay_dark"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_margin="16dp">
+
+        <Button
+            android:id="@+id/btnStartStream"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/btn_start_stream"
+            android:textSize="14sp"
+            style="@style/Widget.MaterialComponents.Button" />
+
+        <Button
+            android:id="@+id/btnStopStream"
+            android:layout_width="wrap_content"
+            android:layout_height="48dp"
+            android:text="@string/btn_stop_stream"
+            android:textSize="14sp"
+            android:visibility="gone"
+            android:backgroundTint="@color/status_recording"
+            style="@style/Widget.MaterialComponents.Button"
+            tools:visibility="visible" />
+
+    </LinearLayout>
+
+    <!-- Thermal Status (bottom center) -->
+    <LinearLayout
+        android:id="@+id/thermalStatus"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:padding="8dp"
+        android:background="@color/overlay_dark"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        android:layout_marginBottom="16dp"
+        android:visibility="gone"
+        tools:visibility="visible">
+
+        <TextView
+            android:id="@+id/tvCpuTemp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/thermal_safe"
+            android:textSize="12sp"
+            tools:text="CPU: 42°C" />
+
+        <TextView
+            android:id="@+id/tvBatteryTemp"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:textColor="@color/thermal_safe"
+            android:textSize="12sp"
+            android:layout_marginStart="16dp"
+            tools:text="Battery: 38°C" />
+
+    </LinearLayout>
+
+</androidx.constraintlayout.widget.ConstraintLayout>

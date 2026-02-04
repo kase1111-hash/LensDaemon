@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary Colors -->
+    <color name="primary">#1976D2</color>
+    <color name="primary_dark">#1565C0</color>
+    <color name="primary_light">#42A5F5</color>
+
+    <!-- Accent Colors -->
+    <color name="accent">#FF5722</color>
+    <color name="accent_dark">#E64A19</color>
+
+    <!-- Basic Colors -->
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="gray">#808080</color>
+    <color name="dark_gray">#303030</color>
+    <color name="light_gray">#B0B0B0</color>
+
+    <!-- Status Colors -->
+    <color name="status_streaming">#4CAF50</color>
+    <color name="status_recording">#F44336</color>
+    <color name="status_idle">#9E9E9E</color>
+    <color name="status_error">#FF5722</color>
+
+    <!-- Thermal Colors -->
+    <color name="thermal_safe">#4CAF50</color>
+    <color name="thermal_warning">#FFC107</color>
+    <color name="thermal_critical">#F44336</color>
+
+    <!-- Overlay -->
+    <color name="overlay_dark">#80000000</color>
+    <color name="overlay_light">#40FFFFFF</color>
+</resources>

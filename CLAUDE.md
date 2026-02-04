@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Early specification phase - no source code committed yet.
+**Status:** Phase 1 complete - Project foundation with Gradle, permissions, UI skeleton, and service stubs.
 
 ## Tech Stack
 
@@ -18,7 +18,7 @@ LensDaemon is an Android application that transforms smartphones into dedicated 
 - **Storage:** Local MP4, SMB/NFS, S3-compatible (AWS S3, Backblaze B2, MinIO, Cloudflare R2)
 - **Web Interface:** HTTP server on port 8080 with REST API
 
-## Build Commands (Planned)
+## Build Commands
 
 ```bash
 # Build the project
@@ -40,7 +40,7 @@ LensDaemon is an Android application that transforms smartphones into dedicated 
 ./gradlew installDebug
 ```
 
-## Project Structure (Planned)
+## Project Structure
 
 ```
 com.lensdaemon/
@@ -104,12 +104,22 @@ rtsp://{device-ip}:8554/stream
 http://{device-ip}:8080
 ```
 
-## Development Phases
+## Development Phases (10-Phase Plan)
 
-1. **Phase 1 (MVP):** Camera2 capture, H.264 encoding, basic RTSP, minimal web UI
-2. **Phase 2:** Local recording, SMB/S3 upload, thermal dashboard, adaptive bitrate
-3. **Phase 3:** Kiosk mode, boot autostart, battery bypass, SRT support
-4. **Phase 4:** Setup wizard, device profiles, OTA updates, multi-device management
+See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guide.
+
+| Phase | Focus | Status |
+|-------|-------|--------|
+| 1 | Project Foundation | Complete |
+| 2 | Camera2 Pipeline | Pending |
+| 3 | Lens Control | Pending |
+| 4 | Video Encoding | Pending |
+| 5 | RTSP Server | Pending |
+| 6 | Web Interface | Pending |
+| 7 | Local Recording | Pending |
+| 8 | Network Storage | Pending |
+| 9 | Thermal Management | Pending |
+| 10 | Kiosk Mode | Pending |
 
 ## Contribution Areas
 
@@ -122,4 +132,27 @@ http://{device-ip}:8080
 
 - `README.md` - Project overview and quick start
 - `spec.md` - Detailed technical specification
+- `docs/IMPLEMENTATION_GUIDE.md` - 10-phase implementation roadmap
 - `LICENSE` - MIT license
+
+## Phase 1 Files (Complete)
+
+```
+app/
+├── build.gradle.kts                          # App build config with dependencies
+├── src/main/
+│   ├── AndroidManifest.xml                   # Permissions and components
+│   └── java/com/lensdaemon/
+│       ├── LensDaemonApp.kt                  # Application class
+│       ├── MainActivity.kt                   # Main UI activity
+│       ├── AdminReceiver.kt                  # Device admin receiver
+│       ├── camera/CameraService.kt           # Camera service stub
+│       ├── config/AppConfig.kt               # Configuration data classes
+│       ├── config/ConfigManager.kt           # Config persistence
+│       ├── kiosk/BootReceiver.kt            # Boot receiver stub
+│       ├── storage/UploadService.kt         # Upload service stub
+│       └── web/WebServerService.kt          # Web server stub
+build.gradle.kts                              # Root build config
+settings.gradle.kts                           # Gradle settings
+gradle.properties                             # Gradle properties
+```
