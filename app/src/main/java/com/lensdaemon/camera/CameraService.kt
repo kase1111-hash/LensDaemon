@@ -3,8 +3,10 @@ package com.lensdaemon.camera
 import android.app.Notification
 import android.app.PendingIntent
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.hardware.camera2.CameraManager
 import android.os.Binder
 import android.os.IBinder
@@ -15,6 +17,12 @@ import androidx.core.app.NotificationCompat
 import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
+import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.EncoderConfig
+import com.lensdaemon.encoder.EncoderService
+import com.lensdaemon.encoder.EncoderState
+import com.lensdaemon.encoder.EncoderStats
+import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -74,6 +82,41 @@ class CameraService : Service() {
     private val _currentZoom = MutableStateFlow(1.0f)
     val currentZoom: StateFlow<Float> = _currentZoom
 
+    // Encoder service connection (Phase 4)
+    private var encoderService: EncoderService? = null
+    private var encoderBound = false
+    private var encoderSurface: Surface? = null
+
+    // Encoder state observable
+    private val _encoderState = MutableStateFlow(EncoderState.IDLE)
+    val encoderState: StateFlow<EncoderState> = _encoderState
+
+    // Frame listeners (for external consumers like RTSP server)
+    private val encodedFrameListeners = mutableListOf<(EncodedFrame) -> Unit>()
+
+    private val encoderConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as EncoderService.EncoderBinder
+            encoderService = binder.getService()
+            encoderBound = true
+            Timber.i("EncoderService connected")
+
+            // Observe encoder state
+            serviceScope.launch {
+                encoderService?.encoderState?.collectLatest { state ->
+                    _encoderState.value = state
+                }
+            }
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            encoderService = null
+            encoderBound = false
+            encoderSurface = null
+            Timber.i("EncoderService disconnected")
+        }
+    }
+
     inner class LocalBinder : Binder() {
         fun getService(): CameraService = this@CameraService
     }
@@ -119,6 +162,21 @@ class CameraService : Service() {
                 _focusState.value = state
             }
         }
+
+        // Bind to encoder service
+        bindEncoderService()
+    }
+
+    private fun bindEncoderService() {
+        val intent = Intent(this, EncoderService::class.java)
+        bindService(intent, encoderConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    private fun unbindEncoderService() {
+        if (encoderBound) {
+            unbindService(encoderConnection)
+            encoderBound = false
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -152,7 +210,9 @@ class CameraService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Timber.i("CameraService destroyed")
+        stopStreaming()
         stopPreview()
+        unbindEncoderService()
         lensDaemonCameraManager.release()
         previewSurfaceProvider.detach()
         serviceScope.cancel()
@@ -591,26 +651,222 @@ class CameraService : Service() {
         return lensDaemonCameraManager.getCameraCapabilities(lens.cameraId)
     }
 
-    // ==================== Streaming (Phase 4-5) ====================
+    // ==================== Encoding & Streaming (Phase 4-5) ====================
 
     /**
-     * Start video streaming.
+     * Initialize encoder with configuration.
+     * @return true if initialization successful
+     */
+    fun initializeEncoder(config: EncoderConfig = EncoderConfig.PRESET_1080P): Boolean {
+        if (!encoderBound || encoderService == null) {
+            Timber.e("EncoderService not bound")
+            return false
+        }
+
+        encoderSurface = encoderService?.initializeEncoder(config)
+        if (encoderSurface == null) {
+            Timber.e("Failed to initialize encoder")
+            return false
+        }
+
+        // Set up frame listener to dispatch to registered listeners
+        encoderService?.addFrameListener { frame ->
+            dispatchEncodedFrame(frame)
+        }
+
+        Timber.i("Encoder initialized: ${config.width}x${config.height} @ ${config.bitrateBps}bps")
+        return true
+    }
+
+    /**
+     * Initialize encoder with specific parameters.
+     */
+    fun initializeEncoder(
+        width: Int = 1920,
+        height: Int = 1080,
+        bitrateBps: Int = 4_000_000,
+        frameRate: Int = 30,
+        codec: VideoCodec = VideoCodec.H264
+    ): Boolean {
+        val config = EncoderConfig(
+            codec = codec,
+            resolution = Size(width, height),
+            bitrateBps = bitrateBps,
+            frameRate = frameRate
+        )
+        return initializeEncoder(config)
+    }
+
+    /**
+     * Start video streaming (encoding + preview).
      */
     fun startStreaming() {
-        Timber.i("startStreaming() - Will be implemented in Phase 4-5")
+        if (!isPreviewActive) {
+            Timber.w("Preview not active, cannot start streaming")
+            return
+        }
+
+        if (encoderSurface == null) {
+            // Initialize encoder with default config
+            if (!initializeEncoder()) {
+                Timber.e("Failed to initialize encoder for streaming")
+                return
+            }
+        }
+
+        // Start encoding
+        encoderService?.startEncoding()
         isStreamingActive = true
         updateNotification()
-        // TODO: Phase 4-5 - Initialize encoder and RTSP server
+        Timber.i("Streaming started")
+    }
+
+    /**
+     * Start video streaming with specific encoder configuration.
+     */
+    fun startStreaming(config: EncoderConfig) {
+        if (!isPreviewActive) {
+            Timber.w("Preview not active, cannot start streaming")
+            return
+        }
+
+        // Initialize encoder with provided config
+        if (!initializeEncoder(config)) {
+            Timber.e("Failed to initialize encoder for streaming")
+            return
+        }
+
+        // Start encoding
+        encoderService?.startEncoding()
+        isStreamingActive = true
+        updateNotification()
+        Timber.i("Streaming started with config: ${config.width}x${config.height}")
     }
 
     /**
      * Stop video streaming.
      */
     fun stopStreaming() {
-        Timber.i("stopStreaming() - Will be implemented in Phase 4-5")
+        if (!isStreamingActive) return
+
+        encoderService?.stopEncoding()
         isStreamingActive = false
         updateNotification()
-        // TODO: Phase 4-5 - Stop encoder and RTSP server
+        Timber.i("Streaming stopped")
+    }
+
+    /**
+     * Release encoder resources.
+     */
+    fun releaseEncoder() {
+        encoderService?.releaseEncoder()
+        encoderSurface = null
+        Timber.i("Encoder released")
+    }
+
+    /**
+     * Request a keyframe from encoder.
+     */
+    fun requestKeyFrame() {
+        encoderService?.requestKeyFrame()
+    }
+
+    /**
+     * Update encoding bitrate.
+     */
+    fun updateEncoderBitrate(newBitrateBps: Int) {
+        encoderService?.updateBitrate(newBitrateBps)
+    }
+
+    /**
+     * Enable adaptive bitrate control.
+     */
+    fun setAdaptiveBitrate(enabled: Boolean, minBps: Int = 500_000, maxBps: Int = 8_000_000) {
+        encoderService?.setAdaptiveBitrate(enabled, minBps, maxBps)
+    }
+
+    /**
+     * Notify encoder of network congestion.
+     */
+    fun onNetworkCongestion() {
+        encoderService?.onNetworkCongestion()
+    }
+
+    /**
+     * Notify encoder of network improvement.
+     */
+    fun onNetworkImproved() {
+        encoderService?.onNetworkImproved()
+    }
+
+    /**
+     * Get encoder surface for multi-surface capture.
+     */
+    fun getEncoderSurface(): Surface? = encoderSurface
+
+    /**
+     * Get SPS data for streaming setup.
+     */
+    fun getSps(): ByteArray? = encoderService?.getSps()
+
+    /**
+     * Get PPS data for streaming setup.
+     */
+    fun getPps(): ByteArray? = encoderService?.getPps()
+
+    /**
+     * Get VPS data for H.265 streaming.
+     */
+    fun getVps(): ByteArray? = encoderService?.getVps()
+
+    /**
+     * Check if codec config data is available.
+     */
+    fun hasEncoderConfigData(): Boolean = encoderService?.hasConfigData() ?: false
+
+    /**
+     * Get combined config data (SPS+PPS or VPS+SPS+PPS).
+     */
+    fun getEncoderConfigData(): ByteArray? = encoderService?.getConfigData()
+
+    /**
+     * Get encoder statistics.
+     */
+    fun getEncoderStats(): EncoderStats? = encoderService?.getStats()
+
+    /**
+     * Get current encoder configuration.
+     */
+    fun getEncoderConfig(): EncoderConfig? = encoderService?.getConfig()
+
+    /**
+     * Add listener for encoded frames.
+     */
+    fun addEncodedFrameListener(listener: (EncodedFrame) -> Unit) {
+        synchronized(encodedFrameListeners) {
+            encodedFrameListeners.add(listener)
+        }
+    }
+
+    /**
+     * Remove encoded frame listener.
+     */
+    fun removeEncodedFrameListener(listener: (EncodedFrame) -> Unit) {
+        synchronized(encodedFrameListeners) {
+            encodedFrameListeners.remove(listener)
+        }
+    }
+
+    private fun dispatchEncodedFrame(frame: EncodedFrame) {
+        synchronized(encodedFrameListeners) {
+            encodedFrameListeners.forEach { listener ->
+                try {
+                    listener(frame)
+                } catch (e: Exception) {
+                    Timber.e(e, "Error in encoded frame listener")
+                }
+            }
+        }
     }
 
     /**
@@ -622,4 +878,9 @@ class CameraService : Service() {
      * Check if preview is active.
      */
     fun isPreviewActive(): Boolean = isPreviewActive
+
+    /**
+     * Check if encoder is ready.
+     */
+    fun isEncoderReady(): Boolean = _encoderState.value == EncoderState.READY || _encoderState.value == EncoderState.ENCODING
 }

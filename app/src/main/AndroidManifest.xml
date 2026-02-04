@@ -66,6 +66,12 @@
             android:exported="false"
             android:foregroundServiceType="camera" />
 
+        <!-- Encoder Foreground Service -->
+        <service
+            android:name=".encoder.EncoderService"
+            android:exported="false"
+            android:foregroundServiceType="camera" />
+
         <!-- Web Server Service -->
         <service
             android:name=".web.WebServerService"
