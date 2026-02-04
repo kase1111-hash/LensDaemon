@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 1 complete - Project foundation with Gradle, permissions, UI skeleton, and service stubs.
+**Status:** Phase 2 complete - Camera2 pipeline with preview, lens enumeration, and capture configuration.
 
 ## Tech Stack
 
@@ -111,7 +111,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | Phase | Focus | Status |
 |-------|-------|--------|
 | 1 | Project Foundation | Complete |
-| 2 | Camera2 Pipeline | Pending |
+| 2 | Camera2 Pipeline | Complete |
 | 3 | Lens Control | Pending |
 | 4 | Video Encoding | Pending |
 | 5 | RTSP Server | Pending |
@@ -135,24 +135,25 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 - `docs/IMPLEMENTATION_GUIDE.md` - 10-phase implementation roadmap
 - `LICENSE` - MIT license
 
-## Phase 1 Files (Complete)
+## Phase 2 Files (Camera2 Pipeline)
 
 ```
-app/
-├── build.gradle.kts                          # App build config with dependencies
-├── src/main/
-│   ├── AndroidManifest.xml                   # Permissions and components
-│   └── java/com/lensdaemon/
-│       ├── LensDaemonApp.kt                  # Application class
-│       ├── MainActivity.kt                   # Main UI activity
-│       ├── AdminReceiver.kt                  # Device admin receiver
-│       ├── camera/CameraService.kt           # Camera service stub
-│       ├── config/AppConfig.kt               # Configuration data classes
-│       ├── config/ConfigManager.kt           # Config persistence
-│       ├── kiosk/BootReceiver.kt            # Boot receiver stub
-│       ├── storage/UploadService.kt         # Upload service stub
-│       └── web/WebServerService.kt          # Web server stub
-build.gradle.kts                              # Root build config
-settings.gradle.kts                           # Gradle settings
-gradle.properties                             # Gradle properties
+app/src/main/java/com/lensdaemon/camera/
+├── CameraConfig.kt              # Camera configuration data classes
+│                                # - CameraLens, LensType, CaptureConfig
+│                                # - FocusMode, WhiteBalanceMode, StabilizationMode
+│                                # - CameraCapabilities, CameraState, CameraError
+├── LensDaemonCameraManager.kt   # Camera2 API wrapper
+│                                # - Camera enumeration and lens detection
+│                                # - Multi-camera/physical camera support
+│                                # - Session management and frame capture
+│                                # - Zoom, focus, exposure, white balance control
+├── PreviewSurfaceProvider.kt    # Preview surface lifecycle management
+│                                # - SurfaceView and TextureView support
+│                                # - Optimal size calculation
+│                                # - Transform matrix for aspect ratio
+└── CameraService.kt             # Foreground camera service (updated)
+                                 # - Full Camera2 pipeline integration
+                                 # - Preview start/stop, lens switching
+                                 # - Camera state observation via StateFlow
 ```
