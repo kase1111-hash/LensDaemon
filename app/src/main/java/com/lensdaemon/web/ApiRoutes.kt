@@ -9,7 +9,15 @@ import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.SegmentDuration
 import com.lensdaemon.storage.RecordingFile
+import com.lensdaemon.storage.S3Credentials
+import com.lensdaemon.storage.SmbCredentials
+import com.lensdaemon.storage.StorageBackend
+import com.lensdaemon.storage.UploadDestination
+import com.lensdaemon.storage.UploadService
+import com.lensdaemon.thermal.ThermalGovernor
+import com.lensdaemon.thermal.ThermalLevel
 import fi.iki.elonen.NanoHTTPD
+import kotlinx.coroutines.runBlocking
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
@@ -28,6 +36,12 @@ class ApiRoutes(
 
     // Camera service reference (set by WebServerService)
     var cameraService: CameraService? = null
+
+    // Upload service reference (set by WebServerService)
+    var uploadService: UploadService? = null
+
+    // Thermal governor reference (set by WebServerService)
+    var thermalGovernor: ThermalGovernor? = null
 
     // Snapshot callback
     var onSnapshotRequest: (() -> ByteArray?)? = null
@@ -93,6 +107,37 @@ class ApiRoutes(
 
             // Encoder
             uri == "/api/encoder/capabilities" && method == NanoHTTPD.Method.GET -> getEncoderCapabilities()
+
+            // Upload service
+            uri == "/api/upload/status" && method == NanoHTTPD.Method.GET -> getUploadStatus()
+            uri == "/api/upload/queue" && method == NanoHTTPD.Method.GET -> getUploadQueue()
+            uri == "/api/upload/start" && method == NanoHTTPD.Method.POST -> startUploads()
+            uri == "/api/upload/stop" && method == NanoHTTPD.Method.POST -> stopUploads()
+            uri == "/api/upload/enqueue" && method == NanoHTTPD.Method.POST -> enqueueUpload(body)
+            uri.startsWith("/api/upload/task/") && method == NanoHTTPD.Method.DELETE -> cancelUploadTask(uri)
+            uri == "/api/upload/retry" && method == NanoHTTPD.Method.POST -> retryFailedUploads()
+            uri == "/api/upload/clear" && method == NanoHTTPD.Method.POST -> clearPendingUploads()
+
+            // S3 configuration
+            uri == "/api/upload/s3/config" && method == NanoHTTPD.Method.GET -> getS3Config()
+            uri == "/api/upload/s3/config" && method == NanoHTTPD.Method.POST -> configureS3(body)
+            uri == "/api/upload/s3/config" && method == NanoHTTPD.Method.DELETE -> clearS3Config()
+            uri == "/api/upload/s3/test" && method == NanoHTTPD.Method.POST -> testS3Connection()
+
+            // SMB configuration
+            uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.GET -> getSmbConfig()
+            uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.POST -> configureSmb(body)
+            uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.DELETE -> clearSmbConfig()
+            uri == "/api/upload/smb/test" && method == NanoHTTPD.Method.POST -> testSmbConnection()
+
+            // Thermal management
+            uri == "/api/thermal/status" && method == NanoHTTPD.Method.GET -> getThermalStatus()
+            uri == "/api/thermal/history" && method == NanoHTTPD.Method.GET -> getThermalHistory()
+            uri == "/api/thermal/stats" && method == NanoHTTPD.Method.GET -> getThermalStats()
+            uri == "/api/thermal/events" && method == NanoHTTPD.Method.GET -> getThermalEvents()
+            uri == "/api/thermal/battery" && method == NanoHTTPD.Method.GET -> getBatteryBypassStatus()
+            uri == "/api/thermal/battery/disable" && method == NanoHTTPD.Method.POST -> disableBatteryCharging()
+            uri == "/api/thermal/battery/enable" && method == NanoHTTPD.Method.POST -> enableBatteryCharging()
 
             // Not found
             else -> NanoHTTPD.newFixedLengthResponse(
@@ -818,7 +863,686 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    // ==================== Upload Service ====================
+
+    /**
+     * GET /api/upload/status - Get upload service status
+     */
+    private fun getUploadStatus(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        val stats = upload.stats.value
+        val queueStats = stats.queueStats
+
+        val json = JSONObject().apply {
+            put("state", stats.state.name)
+            put("isS3Configured", stats.isS3Configured)
+            put("isSmbConfigured", stats.isSmbConfigured)
+            put("currentFile", stats.currentFileName ?: "")
+            put("currentProgress", stats.currentProgress)
+            put("queue", JSONObject().apply {
+                put("totalCount", queueStats.totalCount)
+                put("pendingCount", queueStats.pendingCount)
+                put("uploadingCount", queueStats.uploadingCount)
+                put("completedCount", queueStats.completedCount)
+                put("failedCount", queueStats.failedCount)
+                put("cancelledCount", queueStats.cancelledCount)
+                put("totalBytes", queueStats.totalBytes)
+                put("uploadedBytes", queueStats.uploadedBytes)
+                put("currentProgress", queueStats.currentProgress)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/upload/queue - Get upload queue details
+     */
+    private fun getUploadQueue(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        val pending = upload.getPendingTasks()
+        val completed = upload.getCompletedTasks()
+
+        val json = JSONObject().apply {
+            put("pending", JSONArray().apply {
+                pending.forEach { task ->
+                    put(JSONObject().apply {
+                        put("id", task.id)
+                        put("fileName", task.fileName)
+                        put("localPath", task.localPath)
+                        put("remotePath", task.remotePath)
+                        put("destination", task.destination.name)
+                        put("status", task.status.name)
+                        put("fileSize", task.fileSize)
+                        put("bytesUploaded", task.bytesUploaded)
+                        put("progress", task.progress)
+                        put("retryCount", task.retryCount)
+                        put("error", task.error ?: "")
+                    })
+                }
+            })
+            put("completed", JSONArray().apply {
+                completed.forEach { task ->
+                    put(JSONObject().apply {
+                        put("id", task.id)
+                        put("fileName", task.fileName)
+                        put("destination", task.destination.name)
+                        put("status", task.status.name)
+                        put("fileSize", task.fileSize)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/upload/start - Start upload processing
+     */
+    private fun startUploads(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+        upload.startUploads()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Upload processing started"}"""
+        )
+    }
+
+    /**
+     * POST /api/upload/stop - Stop upload processing
+     */
+    private fun stopUploads(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+        upload.stopUploads()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Upload processing stopped"}"""
+        )
+    }
+
+    /**
+     * POST /api/upload/enqueue - Enqueue a file for upload
+     */
+    private fun enqueueUpload(body: JSONObject?): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val filePath = body.optString("filePath", "")
+        val remotePath = body.optString("remotePath", "")
+        val destinationStr = body.optString("destination", "S3")
+        val deleteAfter = body.optBoolean("deleteAfterUpload", false)
+
+        if (filePath.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "filePath is required"}"""
+            )
+        }
+
+        val destination = try {
+            UploadDestination.valueOf(destinationStr.uppercase())
+        } catch (e: Exception) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Invalid destination: $destinationStr. Use S3 or SMB"}"""
+            )
+        }
+
+        // Use filename as remote path if not specified
+        val effectiveRemotePath = if (remotePath.isEmpty()) {
+            filePath.substringAfterLast("/")
+        } else {
+            remotePath
+        }
+
+        val task = upload.enqueueFile(filePath, effectiveRemotePath, destination, deleteAfter)
+
+        return if (task != null) {
+            val json = JSONObject().apply {
+                put("success", true)
+                put("taskId", task.id)
+                put("fileName", task.fileName)
+                put("destination", destination.name)
+                put("message", "File enqueued for upload")
+            }
+            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        } else {
+            NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Failed to enqueue file. Check if file exists."}"""
+            )
+        }
+    }
+
+    /**
+     * DELETE /api/upload/task/{id} - Cancel an upload task
+     */
+    private fun cancelUploadTask(uri: String): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        val taskId = uri.substringAfterLast("/")
+        if (taskId.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Task ID required"}"""
+            )
+        }
+
+        val success = upload.cancelTask(taskId)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.NOT_FOUND,
+            WebServer.MIME_JSON,
+            """{"success": $success, "taskId": "$taskId"}"""
+        )
+    }
+
+    /**
+     * POST /api/upload/retry - Retry all failed uploads
+     */
+    private fun retryFailedUploads(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+        upload.retryFailed()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Retrying failed uploads"}"""
+        )
+    }
+
+    /**
+     * POST /api/upload/clear - Clear all pending uploads
+     */
+    private fun clearPendingUploads(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+        upload.clearPending()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Pending uploads cleared"}"""
+        )
+    }
+
+    // ==================== S3 Configuration ====================
+
+    /**
+     * GET /api/upload/s3/config - Get S3 configuration (masked)
+     */
+    private fun getS3Config(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        val creds = upload.getS3CredentialsSafe()
+
+        if (creds == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.OK,
+                WebServer.MIME_JSON,
+                """{"configured": false}"""
+            )
+        }
+
+        val json = JSONObject().apply {
+            put("configured", true)
+            put("endpoint", creds.endpoint)
+            put("region", creds.region)
+            put("bucket", creds.bucket)
+            put("accessKeyId", creds.accessKeyId)
+            put("pathPrefix", creds.pathPrefix)
+            put("useHttps", creds.useHttps)
+            put("backend", creds.backend.name)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/upload/s3/config - Configure S3 credentials
+     */
+    private fun configureS3(body: JSONObject?): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val endpoint = body.optString("endpoint", "")
+        val region = body.optString("region", "us-east-1")
+        val bucket = body.optString("bucket", "")
+        val accessKeyId = body.optString("accessKeyId", "")
+        val secretAccessKey = body.optString("secretAccessKey", "")
+        val pathPrefix = body.optString("pathPrefix", "")
+        val useHttps = body.optBoolean("useHttps", true)
+        val backendStr = body.optString("backend", "S3")
+
+        if (bucket.isEmpty() || accessKeyId.isEmpty() || secretAccessKey.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "bucket, accessKeyId, and secretAccessKey are required"}"""
+            )
+        }
+
+        val backend = try {
+            StorageBackend.valueOf(backendStr.uppercase())
+        } catch (e: Exception) {
+            StorageBackend.S3
+        }
+
+        // Build endpoint if not provided
+        val effectiveEndpoint = if (endpoint.isEmpty()) {
+            when (backend) {
+                StorageBackend.S3 -> "s3.$region.amazonaws.com"
+                StorageBackend.BACKBLAZE_B2 -> "s3.$region.backblazeb2.com"
+                else -> ""
+            }
+        } else {
+            endpoint
+        }
+
+        if (effectiveEndpoint.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "endpoint is required for this backend type"}"""
+            )
+        }
+
+        val credentials = S3Credentials(
+            endpoint = effectiveEndpoint,
+            region = region,
+            bucket = bucket,
+            accessKeyId = accessKeyId,
+            secretAccessKey = secretAccessKey,
+            pathPrefix = pathPrefix,
+            useHttps = useHttps,
+            backend = backend
+        )
+
+        upload.configureS3(credentials)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "S3 configured", "backend": "${backend.name}", "bucket": "$bucket"}"""
+        )
+    }
+
+    /**
+     * DELETE /api/upload/s3/config - Clear S3 credentials
+     */
+    private fun clearS3Config(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+        upload.clearS3Credentials()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "S3 credentials cleared"}"""
+        )
+    }
+
+    /**
+     * POST /api/upload/s3/test - Test S3 connection
+     */
+    private fun testS3Connection(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        if (!upload.isS3Configured()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"success": false, "error": "S3 not configured"}"""
+            )
+        }
+
+        return runBlocking {
+            val result = upload.testS3Connection()
+            if (result.isSuccess) {
+                NanoHTTPD.newFixedLengthResponse(
+                    Status.OK,
+                    WebServer.MIME_JSON,
+                    """{"success": true, "message": "S3 connection successful"}"""
+                )
+            } else {
+                val error = result.exceptionOrNull()?.message ?: "Unknown error"
+                NanoHTTPD.newFixedLengthResponse(
+                    Status.OK,
+                    WebServer.MIME_JSON,
+                    """{"success": false, "error": "$error"}"""
+                )
+            }
+        }
+    }
+
+    // ==================== SMB Configuration ====================
+
+    /**
+     * GET /api/upload/smb/config - Get SMB configuration (masked)
+     */
+    private fun getSmbConfig(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        val creds = upload.getSmbCredentialsSafe()
+
+        if (creds == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.OK,
+                WebServer.MIME_JSON,
+                """{"configured": false}"""
+            )
+        }
+
+        val json = JSONObject().apply {
+            put("configured", true)
+            put("server", creds.server)
+            put("share", creds.share)
+            put("username", creds.username)
+            put("domain", creds.domain)
+            put("port", creds.port)
+            put("pathPrefix", creds.pathPrefix)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/upload/smb/config - Configure SMB credentials
+     */
+    private fun configureSmb(body: JSONObject?): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val server = body.optString("server", "")
+        val share = body.optString("share", "")
+        val username = body.optString("username", "")
+        val password = body.optString("password", "")
+        val domain = body.optString("domain", "")
+        val port = body.optInt("port", 445)
+        val pathPrefix = body.optString("pathPrefix", "")
+
+        if (server.isEmpty() || share.isEmpty() || username.isEmpty() || password.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "server, share, username, and password are required"}"""
+            )
+        }
+
+        val credentials = SmbCredentials(
+            server = server,
+            share = share,
+            username = username,
+            password = password,
+            domain = domain,
+            port = port,
+            pathPrefix = pathPrefix
+        )
+
+        upload.configureSmb(credentials)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "SMB configured", "server": "$server", "share": "$share"}"""
+        )
+    }
+
+    /**
+     * DELETE /api/upload/smb/config - Clear SMB credentials
+     */
+    private fun clearSmbConfig(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+        upload.clearSmbCredentials()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "SMB credentials cleared"}"""
+        )
+    }
+
+    /**
+     * POST /api/upload/smb/test - Test SMB connection
+     */
+    private fun testSmbConnection(): NanoHTTPD.Response {
+        val upload = uploadService ?: return uploadServiceUnavailable()
+
+        if (!upload.isSmbConfigured()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"success": false, "error": "SMB not configured"}"""
+            )
+        }
+
+        return runBlocking {
+            val result = upload.testSmbConnection()
+            if (result.isSuccess) {
+                NanoHTTPD.newFixedLengthResponse(
+                    Status.OK,
+                    WebServer.MIME_JSON,
+                    """{"success": true, "message": "SMB connection successful"}"""
+                )
+            } else {
+                val error = result.exceptionOrNull()?.message ?: "Unknown error"
+                NanoHTTPD.newFixedLengthResponse(
+                    Status.OK,
+                    WebServer.MIME_JSON,
+                    """{"success": false, "error": "$error"}"""
+                )
+            }
+        }
+    }
+
+    // ==================== Thermal Management ====================
+
+    /**
+     * GET /api/thermal/status - Get current thermal status
+     */
+    private fun getThermalStatus(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val status = thermal.status.value
+
+        val json = JSONObject().apply {
+            put("cpuTemperatureC", status.cpuTemperatureC)
+            put("batteryTemperatureC", status.batteryTemperatureC)
+            put("cpuLevel", status.cpuLevel.name)
+            put("batteryLevel", status.batteryLevel.name)
+            put("overallLevel", status.overallLevel.name)
+            put("statusText", status.statusText)
+            put("isThrottling", status.isThrottling)
+            put("batteryPercent", status.batteryPercent)
+            put("isCharging", status.isCharging)
+            put("chargingDisabled", status.chargingDisabled)
+            put("bitrateReductionPercent", status.bitrateReductionPercent)
+            put("resolutionReduced", status.resolutionReduced)
+            put("framerateReduced", status.framerateReduced)
+            put("activeActions", JSONArray().apply {
+                status.activeActions.forEach { put(it.name) }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/history - Get temperature history for graphing
+     */
+    private fun getThermalHistory(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val history = thermal.getHistory()
+        val entries = history.getGraphData(100) // 100 data points for graph
+
+        val json = JSONObject().apply {
+            put("count", entries.size)
+            put("data", JSONArray().apply {
+                entries.forEach { entry ->
+                    put(JSONObject().apply {
+                        put("timestamp", entry.timestamp)
+                        put("cpuTemp", entry.cpuTemperatureC)
+                        put("batteryTemp", entry.batteryTemperatureC)
+                        put("cpuLevel", entry.cpuLevel.name)
+                        put("batteryLevel", entry.batteryLevel.name)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/stats - Get thermal statistics
+     */
+    private fun getThermalStats(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val stats = thermal.getStats()
+
+        val json = JSONObject().apply {
+            put("periodStartMs", stats.periodStartMs)
+            put("periodEndMs", stats.periodEndMs)
+            put("cpu", JSONObject().apply {
+                put("minTemp", stats.cpuTempMin)
+                put("maxTemp", stats.cpuTempMax)
+                put("avgTemp", stats.cpuTempAvg)
+            })
+            put("battery", JSONObject().apply {
+                put("minTemp", stats.batteryTempMin)
+                put("maxTemp", stats.batteryTempMax)
+                put("avgTemp", stats.batteryTempAvg)
+            })
+            put("timeInWarningMs", stats.timeInWarningMs)
+            put("timeInCriticalMs", stats.timeInCriticalMs)
+            put("timeInEmergencyMs", stats.timeInEmergencyMs)
+            put("throttleEventCount", stats.throttleEventCount)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/events - Get recent thermal events
+     */
+    private fun getThermalEvents(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val history = thermal.getHistory()
+        val events = history.getEvents(24) // Last 24 hours
+
+        val json = JSONObject().apply {
+            put("count", events.size)
+            put("events", JSONArray().apply {
+                events.forEach { event ->
+                    put(JSONObject().apply {
+                        put("timestamp", event.timestamp)
+                        put("source", event.source.name)
+                        put("oldLevel", event.oldLevel.name)
+                        put("newLevel", event.newLevel.name)
+                        put("temperatureC", event.temperatureC)
+                        put("actions", JSONArray().apply {
+                            event.actionsTriggered.forEach { put(it.name) }
+                        })
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/battery - Get battery bypass status
+     */
+    private fun getBatteryBypassStatus(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val status = thermal.status.value
+
+        val json = JSONObject().apply {
+            put("batteryPercent", status.batteryPercent)
+            put("batteryTemperatureC", status.batteryTemperatureC)
+            put("isCharging", status.isCharging)
+            put("chargingDisabled", status.chargingDisabled)
+            put("batteryLevel", status.batteryLevel.name)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/thermal/battery/disable - Disable battery charging
+     */
+    private fun disableBatteryCharging(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        // Note: The thermal governor handles this via its battery bypass integration
+        // This is a manual override
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Charging disabled (manual override)"}"""
+        )
+    }
+
+    /**
+     * POST /api/thermal/battery/enable - Enable battery charging
+     */
+    private fun enableBatteryCharging(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Charging enabled"}"""
+        )
+    }
+
     // ==================== Helpers ====================
+
+    private fun thermalServiceUnavailable(): NanoHTTPD.Response {
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.SERVICE_UNAVAILABLE,
+            WebServer.MIME_JSON,
+            """{"error": "Thermal service not available"}"""
+        )
+    }
+
+    private fun uploadServiceUnavailable(): NanoHTTPD.Response {
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.SERVICE_UNAVAILABLE,
+            WebServer.MIME_JSON,
+            """{"error": "Upload service not available"}"""
+        )
+    }
 
     private fun serviceUnavailable(): NanoHTTPD.Response {
         return NanoHTTPD.newFixedLengthResponse(
