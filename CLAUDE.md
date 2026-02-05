@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** AI Director Phase 2 complete - Camera integration, remote LLM support, transition animations, and quality metrics collection.
+**Status:** AI Director Phase 3 complete - Web dashboard UI, real-time status updates, script input/management, and take visualization.
 
 ## Tech Stack
 
@@ -774,3 +774,87 @@ Supported providers:
 - **Anthropic**: `api.anthropic.com` - Claude models
 - **Ollama**: `localhost:11434` - Local LLM (no API key needed)
 - **Generic**: Any OpenAI-compatible endpoint
+
+## AI Director Phase 3 Files (Web Dashboard & UI)
+
+```
+app/src/main/assets/web/
+├── index.html                   # Updated with AI Director section
+│                                # - Toggle switch for enable/disable
+│                                # - Director status display (state, scene, cue, take)
+│                                # - Script textarea with cue format placeholder
+│                                # - Load Script / Clear buttons
+│                                # - Director controls (Start, Pause, Stop, Next Cue)
+│                                # - Quick cue buttons (Wide, Medium, Close-up, Push In, Pull Back)
+│                                # - Takes list with quality visualization
+│                                # - Session stats (Total Takes, Avg Quality, Best Takes, Cue Success)
+├── styles.css                   # Updated with Director styles
+│                                # - Toggle switch styling
+│                                # - Director panel disabled/enabled states
+│                                # - State color classes (disabled, idle, running, paused, etc.)
+│                                # - Script textarea styling
+│                                # - Quick cue button grid
+│                                # - Takes list with quality score badges (excellent, good, fair, poor)
+│                                # - Director stats mini-dashboard
+└── dashboard.js                 # Updated with Director functionality
+                                 # - Director state management
+                                 # - toggleDirector() with enable/disable API
+                                 # - loadScript(), clearScript() handlers
+                                 # - startDirector(), pauseDirector(), stopDirector()
+                                 # - advanceDirector() for next cue
+                                 # - executeQuickCue() for quick cue buttons
+                                 # - fetchTakesList() and renderTakesList()
+                                 # - updateDirectorStatus() from polling
+                                 # - SSE event stream (startDirectorEventStream)
+                                 # - Quality score color mapping
+
+app/src/main/java/com/lensdaemon/web/
+├── ApiRoutes.kt                 # Updated with new director endpoints
+│                                # - Director status in main /api/status response
+│                                # - GET /api/director/events - SSE endpoint
+│                                # - POST /api/director/script/clear - clear loaded script
+└── WebServerService.kt          # Already integrated from Phase 2
+
+app/src/main/java/com/lensdaemon/director/
+└── DirectorManager.kt           # Updated with new methods
+                                 # - getSessionDuration() for session time tracking
+                                 # - clearScript() to reset session and script
+```
+
+## Director Dashboard Features
+
+The web dashboard now includes a comprehensive AI Director control panel:
+
+**Status Display:**
+- Director state (DISABLED, IDLE, READY, RUNNING, PAUSED, THERMAL_HOLD)
+- Current scene label
+- Current cue being executed
+- Take number
+
+**Script Management:**
+- Textarea with placeholder showing cue format examples
+- Load Script button to parse and validate
+- Clear button to reset
+
+**Playback Controls:**
+- Start/Resume - Begin script execution
+- Pause - Temporarily halt execution
+- Stop - End execution and reset position
+- Next Cue - Manually advance to next cue
+
+**Quick Cues:**
+- One-click buttons for common camera commands
+- Wide, Medium, Close-up shot presets
+- Push In, Pull Back transitions
+
+**Takes List:**
+- Live list of recorded takes
+- Quality score with color-coded badge
+- Scene and duration info
+- Manual mark indicators
+
+**Session Stats:**
+- Total takes recorded
+- Average quality score
+- Best takes count
+- Cue success rate

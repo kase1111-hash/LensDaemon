@@ -145,6 +145,115 @@
                     </div>
                 </div>
             </section>
+
+            <!-- AI Director Section -->
+            <section class="director-section">
+                <div class="director-header">
+                    <h3>AI Director</h3>
+                    <label class="toggle-switch">
+                        <input type="checkbox" id="director-enabled">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+
+                <div id="director-panel" class="director-panel disabled">
+                    <!-- Director Status -->
+                    <div class="director-status">
+                        <div class="status-row">
+                            <span class="label">State:</span>
+                            <span id="director-state" class="value state-disabled">DISABLED</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Scene:</span>
+                            <span id="director-scene" class="value">-</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Current Cue:</span>
+                            <span id="director-cue" class="value">-</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Take:</span>
+                            <span id="director-take" class="value">#0</span>
+                        </div>
+                    </div>
+
+                    <!-- Script Input -->
+                    <div class="script-input">
+                        <label for="script-textarea">Script</label>
+                        <textarea id="script-textarea" placeholder="[SCENE: Opening]
+[SHOT: WIDE]
+Establishing shot of the room.
+
+[TRANSITION: PUSH IN] - 2s
+Move to subject.
+
+[SHOT: CLOSE-UP]
+[FOCUS: FACE]
+Focus on speaker.
+
+[BEAT]
+Hold for a moment.
+
+[CUT TO: WIDE]
+Return to wide shot."></textarea>
+                        <div class="script-actions">
+                            <button id="btn-load-script" class="btn btn-primary">Load Script</button>
+                            <button id="btn-clear-script" class="btn btn-secondary">Clear</button>
+                        </div>
+                    </div>
+
+                    <!-- Director Controls -->
+                    <div class="director-controls">
+                        <button id="btn-director-start" class="btn btn-success" disabled>Start</button>
+                        <button id="btn-director-pause" class="btn btn-warning" disabled>Pause</button>
+                        <button id="btn-director-stop" class="btn btn-danger" disabled>Stop</button>
+                        <button id="btn-director-advance" class="btn btn-secondary" disabled>Next Cue</button>
+                    </div>
+
+                    <!-- Quick Cue Buttons -->
+                    <div class="quick-cues">
+                        <span class="label">Quick Cues:</span>
+                        <div class="cue-buttons">
+                            <button class="btn btn-cue" data-cue="[SHOT: WIDE]">Wide</button>
+                            <button class="btn btn-cue" data-cue="[SHOT: MEDIUM]">Medium</button>
+                            <button class="btn btn-cue" data-cue="[SHOT: CLOSE-UP]">Close-up</button>
+                            <button class="btn btn-cue" data-cue="[TRANSITION: PUSH IN] - 1s">Push In</button>
+                            <button class="btn btn-cue" data-cue="[TRANSITION: PULL BACK] - 1s">Pull Back</button>
+                        </div>
+                    </div>
+
+                    <!-- Takes List -->
+                    <div class="takes-section">
+                        <div class="takes-header">
+                            <span>Takes</span>
+                            <button id="btn-refresh-takes" class="btn btn-small">Refresh</button>
+                        </div>
+                        <div id="takes-list" class="takes-list">
+                            <div class="no-takes">No takes recorded</div>
+                        </div>
+                    </div>
+
+                    <!-- Session Stats -->
+                    <div class="director-stats">
+                        <div class="stat-mini">
+                            <span class="label">Total Takes</span>
+                            <span id="dir-stat-takes" class="value">0</span>
+                        </div>
+                        <div class="stat-mini">
+                            <span class="label">Avg Quality</span>
+                            <span id="dir-stat-quality" class="value">-</span>
+                        </div>
+                        <div class="stat-mini">
+                            <span class="label">Best Takes</span>
+                            <span id="dir-stat-best" class="value">0</span>
+                        </div>
+                        <div class="stat-mini">
+                            <span class="label">Cue Success</span>
+                            <span id="dir-stat-success" class="value">-</span>
+                        </div>
+                    </div>
+                </div>
+            </section>
         </main>
 
         <footer>

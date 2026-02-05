@@ -575,6 +575,27 @@ class DirectorManager(
     }
 
     /**
+     * Get session duration in seconds
+     */
+    fun getSessionDuration(): Long {
+        val session = _currentSession.value ?: return 0
+        return (System.currentTimeMillis() - session.startTimeMs) / 1000
+    }
+
+    /**
+     * Clear loaded script and reset session
+     */
+    fun clearScript() {
+        stopExecution()
+        _currentSession.value = null
+        if (_state.value != DirectorState.DISABLED) {
+            _state.value = DirectorState.IDLE
+            emitEvent(DirectorEvent.StateChanged(DirectorState.IDLE))
+        }
+        Timber.tag(TAG).i("Script cleared")
+    }
+
+    /**
      * Clean up resources
      */
     fun destroy() {

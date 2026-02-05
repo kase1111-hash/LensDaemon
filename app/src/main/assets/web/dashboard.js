@@ -11,6 +11,11 @@ let isRtspRunning = false;
 let isPreviewActive = false;
 let statusInterval = null;
 
+// Director state
+let directorEnabled = false;
+let directorState = 'DISABLED';
+let directorEventSource = null;
+
 // DOM Elements
 const elements = {
     connectionStatus: document.getElementById('connection-status'),
@@ -38,7 +43,29 @@ const elements = {
     statFps: document.getElementById('stat-fps'),
     statBitrate: document.getElementById('stat-bitrate'),
     statEncoder: document.getElementById('stat-encoder'),
-    deviceInfo: document.getElementById('device-info')
+    deviceInfo: document.getElementById('device-info'),
+
+    // Director elements
+    directorEnabled: document.getElementById('director-enabled'),
+    directorPanel: document.getElementById('director-panel'),
+    directorState: document.getElementById('director-state'),
+    directorScene: document.getElementById('director-scene'),
+    directorCue: document.getElementById('director-cue'),
+    directorTake: document.getElementById('director-take'),
+    scriptTextarea: document.getElementById('script-textarea'),
+    btnLoadScript: document.getElementById('btn-load-script'),
+    btnClearScript: document.getElementById('btn-clear-script'),
+    btnDirectorStart: document.getElementById('btn-director-start'),
+    btnDirectorPause: document.getElementById('btn-director-pause'),
+    btnDirectorStop: document.getElementById('btn-director-stop'),
+    btnDirectorAdvance: document.getElementById('btn-director-advance'),
+    cueButtons: document.querySelectorAll('.btn-cue'),
+    takesList: document.getElementById('takes-list'),
+    btnRefreshTakes: document.getElementById('btn-refresh-takes'),
+    statTotalTakes: document.getElementById('dir-stat-takes'),
+    statAvgQuality: document.getElementById('dir-stat-quality'),
+    statBestTakes: document.getElementById('dir-stat-best'),
+    statCueSuccess: document.getElementById('dir-stat-success')
 };
 
 // Initialize
@@ -85,6 +112,41 @@ function setupEventListeners() {
     elements.exposureSlider.addEventListener('change', (e) => {
         setExposure(parseInt(e.target.value));
     });
+
+    // Director controls
+    if (elements.directorEnabled) {
+        elements.directorEnabled.addEventListener('change', toggleDirector);
+    }
+    if (elements.btnLoadScript) {
+        elements.btnLoadScript.addEventListener('click', loadScript);
+    }
+    if (elements.btnClearScript) {
+        elements.btnClearScript.addEventListener('click', clearScript);
+    }
+    if (elements.btnDirectorStart) {
+        elements.btnDirectorStart.addEventListener('click', startDirector);
+    }
+    if (elements.btnDirectorPause) {
+        elements.btnDirectorPause.addEventListener('click', pauseDirector);
+    }
+    if (elements.btnDirectorStop) {
+        elements.btnDirectorStop.addEventListener('click', stopDirector);
+    }
+    if (elements.btnDirectorAdvance) {
+        elements.btnDirectorAdvance.addEventListener('click', advanceDirector);
+    }
+
+    // Quick cue buttons
+    if (elements.cueButtons) {
+        elements.cueButtons.forEach(btn => {
+            btn.addEventListener('click', () => executeQuickCue(btn.dataset.cue));
+        });
+    }
+
+    // Refresh takes button
+    if (elements.btnRefreshTakes) {
+        elements.btnRefreshTakes.addEventListener('click', fetchTakesList);
+    }
 }
 
 // API calls
@@ -149,6 +211,11 @@ async function fetchStatus() {
         if (status.camera?.zoom) {
             elements.zoomSlider.value = status.camera.zoom;
             elements.zoomValue.textContent = `${status.camera.zoom.toFixed(1)}x`;
+        }
+
+        // Director status
+        if (status.director) {
+            updateDirectorStatus(status.director);
         }
 
     } else {
@@ -333,4 +400,322 @@ function formatBitrate(bps) {
         return (bps / 1000).toFixed(0) + ' kbps';
     }
     return bps + ' bps';
+}
+
+function formatDuration(seconds) {
+    const hrs = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    if (hrs > 0) {
+        return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+    }
+    return `${mins}:${secs.toString().padStart(2, '0')}`;
+}
+
+// ==================== AI Director Functions ====================
+
+// Toggle director enabled state
+async function toggleDirector() {
+    const enabled = elements.directorEnabled.checked;
+
+    // Use separate enable/disable endpoints
+    const endpoint = enabled ? '/api/director/enable' : '/api/director/disable';
+    const result = await apiCall(endpoint, 'POST');
+
+    if (result?.success) {
+        directorEnabled = enabled;
+        updateDirectorPanelState(enabled);
+
+        if (enabled) {
+            // Start SSE connection for real-time updates
+            startDirectorEventStream();
+            // Fetch takes list
+            fetchTakesList();
+        } else {
+            // Stop SSE connection
+            stopDirectorEventStream();
+        }
+    } else {
+        // Revert checkbox
+        elements.directorEnabled.checked = !enabled;
+        alert('Failed to toggle director: ' + (result?.message || 'Unknown error'));
+    }
+}
+
+// Update director panel enabled/disabled state
+function updateDirectorPanelState(enabled) {
+    if (elements.directorPanel) {
+        if (enabled) {
+            elements.directorPanel.classList.remove('disabled');
+        } else {
+            elements.directorPanel.classList.add('disabled');
+        }
+    }
+}
+
+// Update director status from API response
+function updateDirectorStatus(director) {
+    directorEnabled = director.enabled;
+    directorState = director.state;
+
+    // Update checkbox
+    if (elements.directorEnabled) {
+        elements.directorEnabled.checked = director.enabled;
+    }
+
+    // Update panel state
+    updateDirectorPanelState(director.enabled);
+
+    // Update state display
+    if (elements.directorState) {
+        elements.directorState.textContent = director.state;
+        elements.directorState.className = 'value state-' + director.state.toLowerCase().replace('_', '-');
+    }
+
+    // Update scene/cue/take info
+    if (elements.directorScene) {
+        elements.directorScene.textContent = director.currentScene || '-';
+    }
+    if (elements.directorCue) {
+        elements.directorCue.textContent = director.currentCue || '-';
+    }
+    if (elements.directorTake) {
+        elements.directorTake.textContent = director.currentTake || '-';
+    }
+
+    // Update control button states
+    updateDirectorControls(director.state);
+
+    // Update session stats
+    if (director.stats) {
+        updateDirectorStats(director.stats);
+    }
+}
+
+// Update director control button states based on state
+function updateDirectorControls(state) {
+    const canStart = state === 'IDLE' || state === 'READY';
+    const canPause = state === 'RUNNING';
+    const canStop = state === 'RUNNING' || state === 'PAUSED';
+    const canAdvance = state === 'RUNNING' || state === 'PAUSED';
+
+    if (elements.btnDirectorStart) {
+        elements.btnDirectorStart.disabled = !canStart;
+        elements.btnDirectorStart.textContent = state === 'PAUSED' ? 'Resume' : 'Start';
+    }
+    if (elements.btnDirectorPause) {
+        elements.btnDirectorPause.disabled = !canPause;
+    }
+    if (elements.btnDirectorStop) {
+        elements.btnDirectorStop.disabled = !canStop;
+    }
+    if (elements.btnDirectorAdvance) {
+        elements.btnDirectorAdvance.disabled = !canAdvance;
+    }
+}
+
+// Update director stats display
+function updateDirectorStats(stats) {
+    if (elements.statTotalTakes) {
+        elements.statTotalTakes.textContent = stats.totalTakes || 0;
+    }
+    if (elements.statAvgQuality) {
+        const score = stats.averageScore || stats.avgQualityScore || 0;
+        elements.statAvgQuality.textContent = score > 0 ? score.toFixed(1) : '-';
+    }
+    if (elements.statBestTakes) {
+        elements.statBestTakes.textContent = stats.goodTakes || stats.bestTakeCount || 0;
+    }
+    if (elements.statCueSuccess) {
+        const rate = stats.cueSuccessRate || 0;
+        elements.statCueSuccess.textContent = rate > 0 ? `${(rate * 100).toFixed(0)}%` : '-';
+    }
+}
+
+// Load script into director
+async function loadScript() {
+    const script = elements.scriptTextarea.value.trim();
+    if (!script) {
+        alert('Please enter a script');
+        return;
+    }
+
+    const result = await apiCall('/api/director/script', 'POST', { script });
+    if (result?.success) {
+        elements.btnDirectorStart.disabled = false;
+        alert('Script loaded: ' + (result.cueCount || 0) + ' cues parsed');
+    } else {
+        alert('Failed to load script: ' + (result?.message || 'Unknown error'));
+    }
+}
+
+// Clear script
+function clearScript() {
+    elements.scriptTextarea.value = '';
+    apiCall('/api/director/script/clear', 'POST');
+}
+
+// Start director playback
+async function startDirector() {
+    const result = await apiCall('/api/director/start', 'POST');
+    if (!result?.success) {
+        alert('Failed to start director: ' + (result?.message || 'Unknown error'));
+    }
+}
+
+// Pause director playback
+async function pauseDirector() {
+    const result = await apiCall('/api/director/pause', 'POST');
+    if (!result?.success) {
+        alert('Failed to pause director: ' + (result?.message || 'Unknown error'));
+    }
+}
+
+// Stop director playback
+async function stopDirector() {
+    const result = await apiCall('/api/director/stop', 'POST');
+    if (!result?.success) {
+        alert('Failed to stop director: ' + (result?.message || 'Unknown error'));
+    }
+}
+
+// Advance to next cue
+async function advanceDirector() {
+    const result = await apiCall('/api/director/advance', 'POST');
+    if (!result?.success) {
+        alert('Failed to advance: ' + (result?.message || 'Unknown error'));
+    }
+}
+
+// Execute quick cue
+async function executeQuickCue(cue) {
+    const result = await apiCall('/api/director/cue', 'POST', { cue });
+    if (!result?.success) {
+        console.error('Failed to execute cue:', result?.message);
+    }
+}
+
+// Fetch takes list
+async function fetchTakesList() {
+    const result = await apiCall('/api/director/takes');
+    if (result?.success && result.takes) {
+        renderTakesList(result.takes);
+    }
+}
+
+// Render takes list
+function renderTakesList(takes) {
+    if (!elements.takesList) return;
+
+    if (!takes || takes.length === 0) {
+        elements.takesList.innerHTML = '<div class="no-takes">No takes recorded yet</div>';
+        return;
+    }
+
+    elements.takesList.innerHTML = takes.map((take, index) => {
+        const qualityClass = getQualityClass(take.qualityScore);
+        const marks = take.marks || [];
+        const marksHtml = marks.map(m => `<span class="mark mark-${m.toLowerCase()}">${m}</span>`).join('');
+
+        return `
+            <div class="take-item ${take.best ? 'best' : ''}">
+                <div class="take-number">#${index + 1}</div>
+                <div class="take-info">
+                    <div class="take-scene">${take.scene || 'Scene'}</div>
+                    <div class="take-duration">${formatDuration(take.duration || 0)}</div>
+                </div>
+                <div class="take-marks">${marksHtml}</div>
+                <div class="quality-score ${qualityClass}">${(take.qualityScore || 0).toFixed(1)}</div>
+            </div>
+        `;
+    }).join('');
+}
+
+// Get quality class based on score
+function getQualityClass(score) {
+    if (score >= 9.0) return 'excellent';
+    if (score >= 7.0) return 'good';
+    if (score >= 5.0) return 'fair';
+    return 'poor';
+}
+
+// Start Server-Sent Events for director updates
+function startDirectorEventStream() {
+    if (directorEventSource) {
+        directorEventSource.close();
+    }
+
+    try {
+        directorEventSource = new EventSource('/api/director/events');
+
+        directorEventSource.onmessage = (event) => {
+            try {
+                const data = JSON.parse(event.data);
+                handleDirectorEvent(data);
+            } catch (e) {
+                console.error('Failed to parse director event:', e);
+            }
+        };
+
+        directorEventSource.onerror = (error) => {
+            console.error('Director event stream error:', error);
+            // Reconnect after delay
+            setTimeout(() => {
+                if (directorEnabled) {
+                    startDirectorEventStream();
+                }
+            }, 5000);
+        };
+
+        directorEventSource.addEventListener('state', (event) => {
+            const data = JSON.parse(event.data);
+            updateDirectorStatus(data);
+        });
+
+        directorEventSource.addEventListener('cue', (event) => {
+            const data = JSON.parse(event.data);
+            if (elements.directorCue) {
+                elements.directorCue.textContent = data.cue || '-';
+            }
+        });
+
+        directorEventSource.addEventListener('take', (event) => {
+            const data = JSON.parse(event.data);
+            // Refresh takes list when a new take is recorded
+            fetchTakesList();
+        });
+
+    } catch (e) {
+        console.error('Failed to start director event stream:', e);
+    }
+}
+
+// Stop Server-Sent Events
+function stopDirectorEventStream() {
+    if (directorEventSource) {
+        directorEventSource.close();
+        directorEventSource = null;
+    }
+}
+
+// Handle director events
+function handleDirectorEvent(data) {
+    switch (data.type) {
+        case 'state':
+            updateDirectorStatus(data);
+            break;
+        case 'cue':
+            if (elements.directorCue) {
+                elements.directorCue.textContent = data.cue || '-';
+            }
+            break;
+        case 'take':
+            fetchTakesList();
+            break;
+        case 'scene':
+            if (elements.directorScene) {
+                elements.directorScene.textContent = data.scene || '-';
+            }
+            break;
+    }
 }

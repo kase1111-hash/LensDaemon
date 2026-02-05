@@ -188,6 +188,8 @@ class ApiRoutes(
             uri == "/api/director/takes/best" && method == NanoHTTPD.Method.GET -> getBestTakes()
             uri == "/api/director/takes/compare" && method == NanoHTTPD.Method.GET -> compareTakes()
             uri == "/api/director/session" && method == NanoHTTPD.Method.GET -> getDirectorSession()
+            uri == "/api/director/events" && method == NanoHTTPD.Method.GET -> getDirectorEvents()
+            uri == "/api/director/script/clear" && method == NanoHTTPD.Method.POST -> clearDirectorScript()
 
             // Not found
             else -> NanoHTTPD.newFixedLengthResponse(
@@ -252,6 +254,30 @@ class ApiRoutes(
                 put("clients", camera?.getRtspClientCount() ?: 0)
                 put("playing", camera?.getRtspPlayingCount() ?: 0)
             })
+
+            // Director status
+            directorManager?.let { director ->
+                put("director", JSONObject().apply {
+                    val status = director.getStatus()
+                    put("enabled", status.enabled)
+                    put("state", status.state.name)
+                    put("currentScene", status.currentScene ?: "")
+                    put("currentCue", status.currentCue ?: "")
+                    put("currentTake", status.takeNumber)
+                    put("stats", JSONObject().apply {
+                        val takeManager = director.getTakeManager()
+                        val takes = takeManager.recordedTakes.value
+                        val goodTakes = takes.count { it.qualityScore >= 7.0f }
+                        val avgScore = if (takes.isNotEmpty()) {
+                            takes.map { it.qualityScore }.average().toFloat()
+                        } else 0f
+                        put("totalTakes", takes.size)
+                        put("goodTakes", goodTakes)
+                        put("averageScore", avgScore)
+                        put("sessionTime", director.getSessionDuration())
+                    })
+                })
+            }
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -2352,6 +2378,52 @@ class ApiRoutes(
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/director/events - Server-Sent Events for director state updates
+     */
+    private fun getDirectorEvents(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        // Create initial state event
+        val status = director.getStatus()
+        val initialEvent = JSONObject().apply {
+            put("type", "state")
+            put("enabled", status.enabled)
+            put("state", status.state.name)
+            put("currentScene", status.currentScene ?: "")
+            put("currentCue", status.currentCue ?: "")
+            put("currentTake", status.takeNumber)
+        }
+
+        // SSE format: "data: {json}\n\n"
+        val sseData = "data: ${initialEvent.toString()}\n\n"
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            "text/event-stream",
+            sseData
+        ).apply {
+            addHeader("Cache-Control", "no-cache")
+            addHeader("Connection", "keep-alive")
+            addHeader("Access-Control-Allow-Origin", "*")
+        }
+    }
+
+    /**
+     * POST /api/director/script/clear - Clear the loaded script
+     */
+    private fun clearDirectorScript(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        director.clearScript()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Script cleared"}"""
+        )
     }
 
     // ==================== Helpers ====================
