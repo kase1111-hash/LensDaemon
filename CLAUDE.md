@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 7 complete - Local recording with MP4 muxing, file segmentation, retention policies, and storage management.
+**Status:** Phase 8 complete - Network storage with S3-compatible backends (AWS S3, Backblaze B2, MinIO, Cloudflare R2) and SMB/CIFS shares.
 
 ## Tech Stack
 
@@ -117,7 +117,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 5 | RTSP Server | Complete |
 | 6 | Web Interface | Complete |
 | 7 | Local Recording | Complete |
-| 8 | Network Storage | Pending |
+| 8 | Network Storage | Complete |
 | 9 | Thermal Management | Pending |
 | 10 | Kiosk Mode | Pending |
 
@@ -386,4 +386,62 @@ app/src/main/java/com/lensdaemon/web/
                                  # - GET /api/recordings, DELETE /api/recordings/{filename}
                                  # - GET /api/storage/status
                                  # - POST /api/storage/cleanup
+```
+
+## Phase 8 Files (Network Storage - S3 & SMB)
+
+```
+app/src/main/java/com/lensdaemon/storage/
+├── CredentialStore.kt           # Encrypted credential storage
+│                                # - S3Credentials with factory methods for AWS, B2, MinIO, R2
+│                                # - SmbCredentials for SMB/CIFS shares
+│                                # - StorageBackend enum (S3, BACKBLAZE_B2, MINIO, CLOUDFLARE_R2)
+│                                # - Android Keystore for AES-256-GCM encryption
+│                                # - Secure storage/retrieval/deletion
+├── UploadQueue.kt               # Persistent upload queue management
+│                                # - UploadTask, UploadStatus, UploadDestination
+│                                # - UploadQueueStats with progress tracking
+│                                # - UploadEventListener for callbacks
+│                                # - JSON persistence for app restart recovery
+│                                # - Exponential backoff retry (3 retries, 5s/15s/45s)
+│                                # - Concurrent upload limit (default: 2)
+├── S3Client.kt                  # S3-compatible storage client
+│                                # - AWS Signature V4 authentication
+│                                # - Multipart upload for files >5MB
+│                                # - Progress callback support
+│                                # - testConnection, uploadFile, deleteObject
+│                                # - S3UploadResult with ETag and version
+│                                # - Supports AWS S3, Backblaze B2, MinIO, Cloudflare R2
+├── SmbClient.kt                 # SMB/CIFS network share client
+│                                # - SMB2 protocol implementation
+│                                # - NTLM authentication support
+│                                # - SmbUploadResult with metadata
+│                                # - uploadFile, testConnection, createDirectory
+│                                # - deleteFile, listFiles operations
+│                                # - Progress callback with chunked writes
+└── UploadService.kt             # Foreground upload service
+                                 # - Service binding with UploadBinder
+                                 # - S3 and SMB client coordination
+                                 # - Foreground notification with progress
+                                 # - startUploads, stopUploads, enqueueFile
+                                 # - configureS3, configureSmb with validation
+                                 # - testS3Connection, testSmbConnection
+                                 # - Credential management APIs
+
+app/src/main/java/com/lensdaemon/web/
+├── ApiRoutes.kt                 # Updated with upload API endpoints
+│                                # - GET /api/upload/status - upload service state
+│                                # - GET /api/upload/queue - pending/completed tasks
+│                                # - POST /api/upload/start|stop - control processing
+│                                # - POST /api/upload/enqueue - enqueue file
+│                                # - DELETE /api/upload/task/{id} - cancel task
+│                                # - POST /api/upload/retry - retry failed
+│                                # - POST /api/upload/clear - clear pending
+│                                # - GET/POST/DELETE /api/upload/s3/config
+│                                # - POST /api/upload/s3/test - test connection
+│                                # - GET/POST/DELETE /api/upload/smb/config
+│                                # - POST /api/upload/smb/test - test connection
+└── WebServerService.kt          # Updated with UploadService binding
+                                 # - UploadService connection management
+                                 # - uploadService reference for ApiRoutes
 ```

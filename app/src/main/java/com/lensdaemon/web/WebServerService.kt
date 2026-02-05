@@ -15,6 +15,7 @@ import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
 import com.lensdaemon.camera.CameraService
+import com.lensdaemon.storage.UploadService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -87,6 +88,30 @@ class WebServerService : Service() {
         }
     }
 
+    // Upload service connection
+    private var uploadService: UploadService? = null
+    private var uploadBound = false
+
+    private val uploadConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as UploadService.UploadBinder
+            uploadService = binder.getService()
+            uploadBound = true
+
+            // Connect upload service to API routes
+            apiRoutes?.uploadService = uploadService
+
+            Timber.i("$TAG: UploadService connected")
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            uploadService = null
+            uploadBound = false
+            apiRoutes?.uploadService = null
+            Timber.i("$TAG: UploadService disconnected")
+        }
+    }
+
     // State
     private val _serverState = MutableStateFlow(WebServerState.STOPPED)
     val serverState: StateFlow<WebServerState> = _serverState.asStateFlow()
@@ -105,6 +130,9 @@ class WebServerService : Service() {
 
         // Bind to camera service
         bindCameraService()
+
+        // Bind to upload service
+        bindUploadService()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -122,6 +150,7 @@ class WebServerService : Service() {
         super.onDestroy()
         stopServer()
         unbindCameraService()
+        unbindUploadService()
         serviceScope.cancel()
         Timber.i("$TAG: Service destroyed")
     }
@@ -185,6 +214,24 @@ class WebServerService : Service() {
         if (cameraBound) {
             unbindService(cameraConnection)
             cameraBound = false
+        }
+    }
+
+    /**
+     * Bind to upload service
+     */
+    private fun bindUploadService() {
+        val intent = Intent(this, UploadService::class.java)
+        bindService(intent, uploadConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    /**
+     * Unbind from upload service
+     */
+    private fun unbindUploadService() {
+        if (uploadBound) {
+            unbindService(uploadConnection)
+            uploadBound = false
         }
     }
 
