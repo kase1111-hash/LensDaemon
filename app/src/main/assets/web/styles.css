@@ -740,3 +740,351 @@ input:checked + .toggle-slider:before {
     font-weight: 600;
     color: var(--primary-color);
 }
+
+/* ==================== Script File Browser ==================== */
+
+.script-browser {
+    background-color: var(--bg-color);
+    border-radius: 6px;
+    padding: 15px;
+    grid-column: 1 / -1;
+}
+
+.browser-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.browser-header .label {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.script-files-list {
+    max-height: 150px;
+    overflow-y: auto;
+    background-color: var(--card-bg);
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    margin-bottom: 10px;
+}
+
+.no-scripts {
+    padding: 15px;
+    text-align: center;
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.85rem;
+}
+
+.script-file-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-color);
+    cursor: pointer;
+    transition: background-color 0.2s;
+}
+
+.script-file-item:last-child {
+    border-bottom: none;
+}
+
+.script-file-item:hover {
+    background-color: rgba(33, 150, 243, 0.1);
+}
+
+.script-file-item.active {
+    background-color: rgba(33, 150, 243, 0.15);
+    border-left: 3px solid var(--primary-color);
+}
+
+.script-file-name {
+    font-size: 0.85rem;
+    color: var(--text-color);
+    font-weight: 500;
+}
+
+.script-file-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.script-file-size {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.script-file-date {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+}
+
+.btn-delete-script {
+    padding: 2px 6px;
+    font-size: 0.7rem;
+    background-color: transparent;
+    color: var(--danger-color);
+    border: 1px solid var(--danger-color);
+    border-radius: 3px;
+    cursor: pointer;
+    opacity: 0;
+    transition: opacity 0.2s;
+}
+
+.script-file-item:hover .btn-delete-script {
+    opacity: 1;
+}
+
+.btn-delete-script:hover {
+    background-color: var(--danger-color);
+    color: white;
+}
+
+.browser-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+}
+
+.input-small {
+    flex: 1;
+    padding: 6px 10px;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background-color: var(--card-bg);
+    color: var(--text-color);
+    font-size: 0.8rem;
+}
+
+.input-small:focus {
+    outline: none;
+    border-color: var(--primary-color);
+}
+
+.input-small::placeholder {
+    color: var(--text-muted);
+    opacity: 0.6;
+}
+
+/* ==================== Timeline Visualization ==================== */
+
+.timeline-section {
+    grid-column: 1 / -1;
+    background-color: var(--bg-color);
+    border-radius: 6px;
+    padding: 15px;
+}
+
+.timeline-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+}
+
+.timeline-header .label {
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.timeline-progress {
+    font-size: 0.8rem;
+    color: var(--primary-color);
+    font-weight: 500;
+}
+
+.timeline-container {
+    padding: 10px 0;
+}
+
+.timeline-track {
+    position: relative;
+    height: 40px;
+    background-color: var(--card-bg);
+    border-radius: 4px;
+    border: 1px solid var(--border-color);
+    overflow: hidden;
+}
+
+.timeline-scenes {
+    display: flex;
+    height: 100%;
+    width: 100%;
+}
+
+.timeline-scene-block {
+    height: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.7rem;
+    color: var(--text-color);
+    border-right: 1px solid var(--border-color);
+    position: relative;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    padding: 0 4px;
+    transition: background-color 0.3s;
+}
+
+.timeline-scene-block:last-child {
+    border-right: none;
+}
+
+.timeline-scene-block.past {
+    background-color: rgba(76, 175, 80, 0.3);
+}
+
+.timeline-scene-block.current {
+    background-color: rgba(33, 150, 243, 0.4);
+    border: 1px solid var(--primary-color);
+}
+
+.timeline-scene-block.future {
+    background-color: rgba(255, 255, 255, 0.05);
+}
+
+.timeline-cue-marker {
+    position: absolute;
+    bottom: 0;
+    width: 2px;
+    height: 8px;
+    background-color: var(--text-muted);
+}
+
+.timeline-cue-marker.executed {
+    background-color: var(--success-color);
+}
+
+.timeline-cue-marker.current {
+    background-color: var(--primary-color);
+    height: 12px;
+    width: 3px;
+}
+
+.timeline-playhead {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 3px;
+    height: 100%;
+    background-color: var(--danger-color);
+    z-index: 10;
+    transition: left 0.3s ease;
+    display: none;
+}
+
+.timeline-playhead.active {
+    display: block;
+}
+
+.timeline-playhead::after {
+    content: '';
+    position: absolute;
+    top: -4px;
+    left: -4px;
+    width: 0;
+    height: 0;
+    border-left: 5px solid transparent;
+    border-right: 5px solid transparent;
+    border-top: 6px solid var(--danger-color);
+}
+
+/* Scene Navigation */
+.scene-nav {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.scene-nav-btn {
+    padding: 4px 10px;
+    font-size: 0.75rem;
+    background-color: var(--card-bg);
+    color: var(--text-muted);
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.scene-nav-btn:hover {
+    background-color: rgba(33, 150, 243, 0.15);
+    border-color: var(--primary-color);
+    color: var(--text-color);
+}
+
+.scene-nav-btn.active {
+    background-color: var(--primary-color);
+    border-color: var(--primary-color);
+    color: white;
+}
+
+.scene-nav-btn.completed {
+    background-color: rgba(76, 175, 80, 0.2);
+    border-color: var(--success-color);
+    color: var(--success-color);
+}
+
+/* ==================== Session Export ==================== */
+
+.session-export {
+    grid-column: 1 / -1;
+    display: flex;
+    gap: 10px;
+    justify-content: flex-end;
+    padding-top: 10px;
+    border-top: 1px solid var(--border-color);
+}
+
+.btn-export {
+    padding: 8px 14px;
+    font-size: 0.8rem;
+    background-color: var(--border-color);
+    color: var(--text-color);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.btn-export:hover {
+    background-color: var(--primary-color);
+    color: white;
+}
+
+/* ==================== Take File Link ==================== */
+
+.take-file-link {
+    font-size: 0.7rem;
+    color: var(--primary-color);
+    text-decoration: none;
+    display: block;
+    margin-top: 2px;
+}
+
+.take-file-link:hover {
+    text-decoration: underline;
+}
+
+.take-item.best {
+    border-left: 3px solid var(--success-color);
+}
+
+.take-item .take-suggested {
+    font-size: 0.7rem;
+    color: var(--success-color);
+    font-weight: 500;
+    margin-left: 4px;
+}

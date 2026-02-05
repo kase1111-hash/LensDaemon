@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** AI Director Phase 4 complete - DirectorService lifecycle, script file persistence, take-recording integration, and metadata markers.
+**Status:** AI Director Phase 5 complete - Dashboard enhancements with script file browser, timeline visualization, scene navigation, and session export/reporting.
 
 ## Tech Stack
 
@@ -964,3 +964,64 @@ directorService.onTakeEnded = { take ->
 directorService.onRecordingMarker = { marker ->
     // Embed marker in recording metadata
 }
+```
+
+## AI Director Phase 5 Files (Dashboard Enhancements)
+
+```
+app/src/main/assets/web/
+├── index.html                   # Updated with Phase 5 UI elements
+│                                # - Script file browser (saved scripts list, save as)
+│                                # - Timeline visualization (scene blocks, playhead, progress)
+│                                # - Scene navigation buttons (click to jump)
+│                                # - Session export buttons (report, script, takes CSV)
+├── styles.css                   # Updated with Phase 5 styles
+│                                # - Script file browser styling
+│                                # - Script file item hover/active states
+│                                # - Delete button with hover reveal
+│                                # - Timeline track and scene blocks
+│                                # - Past/current/future scene coloring
+│                                # - Animated playhead with indicator triangle
+│                                # - Scene navigation button states
+│                                # - Session export button row
+│                                # - Take file link styling
+└── dashboard.js                 # Updated with Phase 5 functionality
+                                 # - Script file management (fetch, render, load, save, delete)
+                                 # - Timeline rendering from parsed scenes
+                                 # - Playhead position tracking
+                                 # - Scene navigation with jump-to-scene
+                                 # - Session report export (JSON)
+                                 # - Script export (text)
+                                 # - Takes CSV export
+                                 # - File size/date formatting utilities
+                                 # - HTML escaping for user content
+```
+
+## Phase 5 Dashboard Features
+
+### Script File Browser
+- List of saved script files with name, size, and date
+- Click to load a script from saved files
+- Save current script with custom filename
+- Delete saved scripts with confirmation
+- Active file highlighting
+
+### Timeline Visualization
+- Horizontal track showing all scenes proportional to cue count
+- Color-coded scene blocks:
+  - Green tint = completed scenes (past)
+  - Blue highlight = current scene
+  - Dim = upcoming scenes (future)
+- Animated playhead showing current position
+- Cue progress counter (e.g., "5 / 20 cues")
+
+### Scene Navigation
+- One-click buttons for each scene in the script
+- Active state shows current scene
+- Completed state for past scenes
+- Click to jump director to any scene
+
+### Session Export
+- **Export Session Report** - Full JSON with session info, takes, stats
+- **Export Script** - Download current script as text file
+- **Export Takes CSV** - Spreadsheet-compatible takes data with quality scores
