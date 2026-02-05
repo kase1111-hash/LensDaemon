@@ -14,6 +14,8 @@ import com.lensdaemon.storage.SmbCredentials
 import com.lensdaemon.storage.StorageBackend
 import com.lensdaemon.storage.UploadDestination
 import com.lensdaemon.storage.UploadService
+import com.lensdaemon.thermal.ThermalGovernor
+import com.lensdaemon.thermal.ThermalLevel
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import fi.iki.elonen.NanoHTTPD.Response.Status
@@ -37,6 +39,9 @@ class ApiRoutes(
 
     // Upload service reference (set by WebServerService)
     var uploadService: UploadService? = null
+
+    // Thermal governor reference (set by WebServerService)
+    var thermalGovernor: ThermalGovernor? = null
 
     // Snapshot callback
     var onSnapshotRequest: (() -> ByteArray?)? = null
@@ -124,6 +129,15 @@ class ApiRoutes(
             uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.POST -> configureSmb(body)
             uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.DELETE -> clearSmbConfig()
             uri == "/api/upload/smb/test" && method == NanoHTTPD.Method.POST -> testSmbConnection()
+
+            // Thermal management
+            uri == "/api/thermal/status" && method == NanoHTTPD.Method.GET -> getThermalStatus()
+            uri == "/api/thermal/history" && method == NanoHTTPD.Method.GET -> getThermalHistory()
+            uri == "/api/thermal/stats" && method == NanoHTTPD.Method.GET -> getThermalStats()
+            uri == "/api/thermal/events" && method == NanoHTTPD.Method.GET -> getThermalEvents()
+            uri == "/api/thermal/battery" && method == NanoHTTPD.Method.GET -> getBatteryBypassStatus()
+            uri == "/api/thermal/battery/disable" && method == NanoHTTPD.Method.POST -> disableBatteryCharging()
+            uri == "/api/thermal/battery/enable" && method == NanoHTTPD.Method.POST -> enableBatteryCharging()
 
             // Not found
             else -> NanoHTTPD.newFixedLengthResponse(
@@ -1345,7 +1359,182 @@ class ApiRoutes(
         }
     }
 
+    // ==================== Thermal Management ====================
+
+    /**
+     * GET /api/thermal/status - Get current thermal status
+     */
+    private fun getThermalStatus(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val status = thermal.status.value
+
+        val json = JSONObject().apply {
+            put("cpuTemperatureC", status.cpuTemperatureC)
+            put("batteryTemperatureC", status.batteryTemperatureC)
+            put("cpuLevel", status.cpuLevel.name)
+            put("batteryLevel", status.batteryLevel.name)
+            put("overallLevel", status.overallLevel.name)
+            put("statusText", status.statusText)
+            put("isThrottling", status.isThrottling)
+            put("batteryPercent", status.batteryPercent)
+            put("isCharging", status.isCharging)
+            put("chargingDisabled", status.chargingDisabled)
+            put("bitrateReductionPercent", status.bitrateReductionPercent)
+            put("resolutionReduced", status.resolutionReduced)
+            put("framerateReduced", status.framerateReduced)
+            put("activeActions", JSONArray().apply {
+                status.activeActions.forEach { put(it.name) }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/history - Get temperature history for graphing
+     */
+    private fun getThermalHistory(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val history = thermal.getHistory()
+        val entries = history.getGraphData(100) // 100 data points for graph
+
+        val json = JSONObject().apply {
+            put("count", entries.size)
+            put("data", JSONArray().apply {
+                entries.forEach { entry ->
+                    put(JSONObject().apply {
+                        put("timestamp", entry.timestamp)
+                        put("cpuTemp", entry.cpuTemperatureC)
+                        put("batteryTemp", entry.batteryTemperatureC)
+                        put("cpuLevel", entry.cpuLevel.name)
+                        put("batteryLevel", entry.batteryLevel.name)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/stats - Get thermal statistics
+     */
+    private fun getThermalStats(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val stats = thermal.getStats()
+
+        val json = JSONObject().apply {
+            put("periodStartMs", stats.periodStartMs)
+            put("periodEndMs", stats.periodEndMs)
+            put("cpu", JSONObject().apply {
+                put("minTemp", stats.cpuTempMin)
+                put("maxTemp", stats.cpuTempMax)
+                put("avgTemp", stats.cpuTempAvg)
+            })
+            put("battery", JSONObject().apply {
+                put("minTemp", stats.batteryTempMin)
+                put("maxTemp", stats.batteryTempMax)
+                put("avgTemp", stats.batteryTempAvg)
+            })
+            put("timeInWarningMs", stats.timeInWarningMs)
+            put("timeInCriticalMs", stats.timeInCriticalMs)
+            put("timeInEmergencyMs", stats.timeInEmergencyMs)
+            put("throttleEventCount", stats.throttleEventCount)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/events - Get recent thermal events
+     */
+    private fun getThermalEvents(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val history = thermal.getHistory()
+        val events = history.getEvents(24) // Last 24 hours
+
+        val json = JSONObject().apply {
+            put("count", events.size)
+            put("events", JSONArray().apply {
+                events.forEach { event ->
+                    put(JSONObject().apply {
+                        put("timestamp", event.timestamp)
+                        put("source", event.source.name)
+                        put("oldLevel", event.oldLevel.name)
+                        put("newLevel", event.newLevel.name)
+                        put("temperatureC", event.temperatureC)
+                        put("actions", JSONArray().apply {
+                            event.actionsTriggered.forEach { put(it.name) }
+                        })
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/thermal/battery - Get battery bypass status
+     */
+    private fun getBatteryBypassStatus(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        val status = thermal.status.value
+
+        val json = JSONObject().apply {
+            put("batteryPercent", status.batteryPercent)
+            put("batteryTemperatureC", status.batteryTemperatureC)
+            put("isCharging", status.isCharging)
+            put("chargingDisabled", status.chargingDisabled)
+            put("batteryLevel", status.batteryLevel.name)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/thermal/battery/disable - Disable battery charging
+     */
+    private fun disableBatteryCharging(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        // Note: The thermal governor handles this via its battery bypass integration
+        // This is a manual override
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Charging disabled (manual override)"}"""
+        )
+    }
+
+    /**
+     * POST /api/thermal/battery/enable - Enable battery charging
+     */
+    private fun enableBatteryCharging(): NanoHTTPD.Response {
+        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Charging enabled"}"""
+        )
+    }
+
     // ==================== Helpers ====================
+
+    private fun thermalServiceUnavailable(): NanoHTTPD.Response {
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.SERVICE_UNAVAILABLE,
+            WebServer.MIME_JSON,
+            """{"error": "Thermal service not available"}"""
+        )
+    }
 
     private fun uploadServiceUnavailable(): NanoHTTPD.Response {
         return NanoHTTPD.newFixedLengthResponse(

@@ -16,6 +16,7 @@ import com.lensdaemon.MainActivity
 import com.lensdaemon.R
 import com.lensdaemon.camera.CameraService
 import com.lensdaemon.storage.UploadService
+import com.lensdaemon.thermal.ThermalService
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -112,6 +113,30 @@ class WebServerService : Service() {
         }
     }
 
+    // Thermal service connection
+    private var thermalService: ThermalService? = null
+    private var thermalBound = false
+
+    private val thermalConnection = object : ServiceConnection {
+        override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
+            val binder = service as ThermalService.ThermalBinder
+            thermalService = binder.getService()
+            thermalBound = true
+
+            // Connect thermal governor to API routes
+            apiRoutes?.thermalGovernor = thermalService?.getGovernor()
+
+            Timber.i("$TAG: ThermalService connected")
+        }
+
+        override fun onServiceDisconnected(name: ComponentName?) {
+            thermalService = null
+            thermalBound = false
+            apiRoutes?.thermalGovernor = null
+            Timber.i("$TAG: ThermalService disconnected")
+        }
+    }
+
     // State
     private val _serverState = MutableStateFlow(WebServerState.STOPPED)
     val serverState: StateFlow<WebServerState> = _serverState.asStateFlow()
@@ -133,6 +158,9 @@ class WebServerService : Service() {
 
         // Bind to upload service
         bindUploadService()
+
+        // Bind to thermal service
+        bindThermalService()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -151,6 +179,7 @@ class WebServerService : Service() {
         stopServer()
         unbindCameraService()
         unbindUploadService()
+        unbindThermalService()
         serviceScope.cancel()
         Timber.i("$TAG: Service destroyed")
     }
@@ -232,6 +261,24 @@ class WebServerService : Service() {
         if (uploadBound) {
             unbindService(uploadConnection)
             uploadBound = false
+        }
+    }
+
+    /**
+     * Bind to thermal service
+     */
+    private fun bindThermalService() {
+        val intent = Intent(this, ThermalService::class.java)
+        bindService(intent, thermalConnection, Context.BIND_AUTO_CREATE)
+    }
+
+    /**
+     * Unbind from thermal service
+     */
+    private fun unbindThermalService() {
+        if (thermalBound) {
+            unbindService(thermalConnection)
+            thermalBound = false
         }
     }
 

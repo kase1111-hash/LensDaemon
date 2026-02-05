@@ -84,6 +84,12 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- Thermal Management Service -->
+        <service
+            android:name=".thermal.ThermalService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Device Admin Receiver for Kiosk Mode -->
         <receiver
             android:name=".AdminReceiver"

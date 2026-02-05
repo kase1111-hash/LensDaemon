@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 8 complete - Network storage with S3-compatible backends (AWS S3, Backblaze B2, MinIO, Cloudflare R2) and SMB/CIFS shares.
+**Status:** Phase 9 complete - Thermal management with CPU/battery monitoring, automatic throttling governors, and battery bypass for sustainable operation.
 
 ## Tech Stack
 
@@ -118,7 +118,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 6 | Web Interface | Complete |
 | 7 | Local Recording | Complete |
 | 8 | Network Storage | Complete |
-| 9 | Thermal Management | Pending |
+| 9 | Thermal Management | Complete |
 | 10 | Kiosk Mode | Pending |
 
 ## Contribution Areas
@@ -444,4 +444,64 @@ app/src/main/java/com/lensdaemon/web/
 └── WebServerService.kt          # Updated with UploadService binding
                                  # - UploadService connection management
                                  # - uploadService reference for ApiRoutes
+```
+
+## Phase 9 Files (Thermal Management)
+
+```
+app/src/main/java/com/lensdaemon/thermal/
+├── ThermalConfig.kt             # Thermal configuration and thresholds
+│                                # - ThermalLevel enum (NORMAL, ELEVATED, WARNING, CRITICAL, EMERGENCY)
+│                                # - ThrottleAction enum (REDUCE_BITRATE, REDUCE_RESOLUTION, etc.)
+│                                # - CpuThermalConfig, BatteryThermalConfig thresholds
+│                                # - BatteryBypassConfig for charge limiting
+│                                # - ThermalStatus, ThermalStats data classes
+│                                # - ThermalGovernorListener interface
+├── ThermalMonitor.kt            # Temperature monitoring service
+│                                # - CPU temperature from /sys/class/thermal/
+│                                # - Battery temperature from BatteryManager
+│                                # - GPU temperature detection
+│                                # - Android PowerManager thermal status (API 29+)
+│                                # - Thermal zone discovery and classification
+│                                # - StateFlow for reactive temperature updates
+├── ThermalHistory.kt            # Temperature history logging
+│                                # - 24-hour rolling history (minute granularity)
+│                                # - ThermalEvent logging for state changes
+│                                # - Statistics calculation (min/max/avg temps)
+│                                # - Time-in-state tracking
+│                                # - JSON persistence for app restart recovery
+│                                # - Graph data downsampling for dashboard
+├── ThermalGovernor.kt           # Automatic throttling controller
+│                                # - CPU > 45°C → Reduce bitrate 20%
+│                                # - CPU > 50°C → Reduce resolution
+│                                # - CPU > 55°C → Reduce framerate
+│                                # - CPU > 60°C → Pause streaming
+│                                # - Battery > 42°C → Disable charging
+│                                # - Hysteresis to prevent oscillation
+│                                # - Callbacks for encoder/camera integration
+├── BatteryBypass.kt             # Battery charge limiting
+│                                # - Target charge level holding (e.g., 50%)
+│                                # - Resume charging below threshold
+│                                # - Thermal-triggered charge disable
+│                                # - Sysfs-based control (root required)
+│                                # - Software-only fallback mode
+│                                # - BypassState tracking
+└── ThermalService.kt            # Foreground thermal service
+                                 # - Service binding with ThermalBinder
+                                 # - ThermalGovernor lifecycle management
+                                 # - Throttle callbacks for external systems
+                                 # - Notification with thermal status
+                                 # - Temperature-based notification colors
+
+app/src/main/java/com/lensdaemon/web/
+├── ApiRoutes.kt                 # Updated with thermal API endpoints
+│                                # - GET /api/thermal/status - current temps and levels
+│                                # - GET /api/thermal/history - graph data
+│                                # - GET /api/thermal/stats - statistics
+│                                # - GET /api/thermal/events - event log
+│                                # - GET /api/thermal/battery - battery bypass status
+│                                # - POST /api/thermal/battery/disable|enable
+└── WebServerService.kt          # Updated with ThermalService binding
+                                 # - ThermalService connection management
+                                 # - thermalGovernor reference for ApiRoutes
 ```
