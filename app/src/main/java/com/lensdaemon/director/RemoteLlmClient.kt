@@ -7,6 +7,7 @@ import timber.log.Timber
 import java.io.BufferedReader
 import java.io.OutputStreamWriter
 import java.net.HttpURLConnection
+import java.net.InetAddress
 import java.net.URL
 
 /**
@@ -100,6 +101,50 @@ class RemoteLlmClient(
     }
 
     /**
+     * Validate that an endpoint URL is safe (not targeting private/internal networks).
+     * Allows localhost only for Ollama provider.
+     * Returns true if the URL is safe to connect to.
+     */
+    fun validateEndpoint(endpoint: String): Result<Unit> {
+        return try {
+            val url = URL(endpoint)
+            val protocol = url.protocol.lowercase()
+
+            // Only allow HTTP/HTTPS
+            if (protocol != "http" && protocol != "https") {
+                return Result.failure(IllegalArgumentException("Only HTTP/HTTPS protocols are allowed"))
+            }
+
+            // Require HTTPS for non-local endpoints
+            val host = url.host.lowercase()
+            val isLocalHost = host == "localhost" || host == "127.0.0.1" || host == "::1"
+
+            if (isLocalHost) {
+                // Only allow local connections for Ollama
+                if (provider != LlmProvider.OLLAMA) {
+                    return Result.failure(IllegalArgumentException("Local endpoints only allowed for Ollama provider"))
+                }
+                return Result.success(Unit)
+            }
+
+            // Block private IP ranges for non-local hosts
+            val address = InetAddress.getByName(host)
+            if (address.isSiteLocalAddress || address.isLinkLocalAddress || address.isLoopbackAddress) {
+                return Result.failure(IllegalArgumentException("Private/internal network addresses are not allowed"))
+            }
+
+            // Warn (but allow) HTTP for remote endpoints
+            if (protocol == "http") {
+                Timber.tag(TAG).w("Using HTTP for remote LLM endpoint - HTTPS recommended")
+            }
+
+            Result.success(Unit)
+        } catch (e: Exception) {
+            Result.failure(IllegalArgumentException("Invalid endpoint URL: ${e.message}"))
+        }
+    }
+
+    /**
      * Interpret a script fragment and return camera cues
      */
     suspend fun interpretScript(scriptFragment: String): ParsedCueResponse {
@@ -175,6 +220,17 @@ Output camera cues in the specified format, one per line."""
      */
     private suspend fun sendRequest(prompt: String): LlmResponse = withContext(Dispatchers.IO) {
         val startTime = System.currentTimeMillis()
+
+        // Validate endpoint before connecting
+        val validationResult = validateEndpoint(config.endpoint)
+        if (validationResult.isFailure) {
+            return@withContext LlmResponse(
+                success = false,
+                content = "",
+                latencyMs = System.currentTimeMillis() - startTime,
+                error = "Endpoint validation failed: ${validationResult.exceptionOrNull()?.message}"
+            )
+        }
 
         try {
             val (url, requestBody) = when (provider) {

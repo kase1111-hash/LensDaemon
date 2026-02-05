@@ -37,6 +37,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.ByteArrayInputStream
+import java.io.File
 
 /**
  * REST API routes handler for LensDaemon web interface
@@ -46,6 +47,12 @@ class ApiRoutes(
 ) {
     companion object {
         private const val TAG = "ApiRoutes"
+
+        // Read-only endpoints that don't require authentication
+        private val PUBLIC_ENDPOINTS = setOf(
+            "/api/status",
+            "/api/device"
+        )
     }
 
     // Camera service reference (set by WebServerService)
@@ -66,10 +73,73 @@ class ApiRoutes(
     // Snapshot callback
     var onSnapshotRequest: (() -> ByteArray?)? = null
 
+    // API authentication token (null = auth disabled for backwards compat)
+    var apiToken: String? = null
+
+    /**
+     * Validate a filename is safe (no path traversal)
+     * Returns the sanitized filename or null if invalid.
+     */
+    private fun sanitizeFileName(fileName: String): String? {
+        if (fileName.isEmpty()) return null
+        // Reject path separators and traversal sequences
+        if (fileName.contains("/") || fileName.contains("\\") ||
+            fileName.contains("..") || fileName.contains("\u0000")) {
+            return null
+        }
+        // Only allow alphanumeric, dash, underscore, dot, space
+        val sanitized = fileName.trim()
+        if (!sanitized.matches(Regex("^[a-zA-Z0-9._\\- ]+$"))) {
+            return null
+        }
+        return sanitized
+    }
+
+    /**
+     * Validate that a resolved file is within the expected directory.
+     */
+    private fun validateFileInDirectory(file: File, directory: File): Boolean {
+        return file.canonicalPath.startsWith(directory.canonicalPath + File.separator) ||
+               file.canonicalPath == directory.canonicalPath
+    }
+
+    /**
+     * Check API authentication.
+     * Returns an error response if auth fails, null if auth passes.
+     */
+    private fun checkAuth(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
+        val token = apiToken ?: return null  // Auth disabled
+
+        val uri = session.uri
+        // Allow public read-only endpoints without auth
+        if (uri in PUBLIC_ENDPOINTS && session.method == NanoHTTPD.Method.GET) {
+            return null
+        }
+
+        val authHeader = session.headers["authorization"] ?: ""
+        val providedToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
+            authHeader.substring(7).trim()
+        } else {
+            session.parms?.get("token") ?: ""
+        }
+
+        if (providedToken != token) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.UNAUTHORIZED,
+                WebServer.MIME_JSON,
+                """{"error": "Authentication required", "hint": "Provide Bearer token in Authorization header"}"""
+            )
+        }
+        return null
+    }
+
     /**
      * Handle API request
      */
     fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        // Check authentication first
+        checkAuth(session)?.let { return it }
+
         val uri = session.uri
         val method = session.method
 
@@ -906,15 +976,15 @@ class ApiRoutes(
 
         // Update encoder config if streaming
         if (body.has("bitrate")) {
-            camera.updateEncoderBitrate(body.getInt("bitrate"))
+            camera.updateEncoderBitrate(body.optInt("bitrate", 0))
         }
 
         // Update camera config
         if (body.has("zoom")) {
-            camera.setZoom(body.getDouble("zoom").toFloat())
+            camera.setZoom(body.optDouble("zoom", 1.0).toFloat())
         }
         if (body.has("exposureCompensation")) {
-            camera.setExposureCompensation(body.getInt("exposureCompensation"))
+            camera.setExposureCompensation(body.optInt("exposureCompensation", 0))
         }
 
         return NanoHTTPD.newFixedLengthResponse(
@@ -1312,11 +1382,11 @@ class ApiRoutes(
                     """{"success": true, "message": "S3 connection successful"}"""
                 )
             } else {
-                val error = result.exceptionOrNull()?.message ?: "Unknown error"
+                Timber.tag(TAG).w("S3 connection test failed: ${result.exceptionOrNull()?.message}")
                 NanoHTTPD.newFixedLengthResponse(
                     Status.OK,
                     WebServer.MIME_JSON,
-                    """{"success": false, "error": "$error"}"""
+                    """{"success": false, "error": "S3 connection test failed"}"""
                 )
             }
         }
@@ -1437,11 +1507,11 @@ class ApiRoutes(
                     """{"success": true, "message": "SMB connection successful"}"""
                 )
             } else {
-                val error = result.exceptionOrNull()?.message ?: "Unknown error"
+                Timber.tag(TAG).w("SMB connection test failed: ${result.exceptionOrNull()?.message}")
                 NanoHTTPD.newFixedLengthResponse(
                     Status.OK,
                     WebServer.MIME_JSON,
-                    """{"success": false, "error": "$error"}"""
+                    """{"success": false, "error": "SMB connection test failed"}"""
                 )
             }
         }
@@ -2040,11 +2110,11 @@ class ApiRoutes(
             }
             NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
         } else {
-            val error = result.exceptionOrNull()?.message ?: "Unknown error"
+            Timber.tag(TAG).w("Script load failed: ${result.exceptionOrNull()?.message}")
             NanoHTTPD.newFixedLengthResponse(
                 Status.BAD_REQUEST,
                 WebServer.MIME_JSON,
-                """{"success": false, "error": "$error"}"""
+                """{"success": false, "error": "Failed to parse script"}"""
             )
         }
     }
@@ -2479,10 +2549,10 @@ class ApiRoutes(
             """{"error": "Request body required"}"""
         )
 
-        val fileName = body.optString("fileName", "")
+        val rawFileName = body.optString("fileName", "")
         val scriptText = body.optString("script", "")
 
-        if (fileName.isEmpty() || scriptText.isEmpty()) {
+        if (rawFileName.isEmpty() || scriptText.isEmpty()) {
             return NanoHTTPD.newFixedLengthResponse(
                 Status.BAD_REQUEST,
                 WebServer.MIME_JSON,
@@ -2490,11 +2560,25 @@ class ApiRoutes(
             )
         }
 
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
+        val baseName = sanitizeFileName(rawFileName) ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Invalid file name"}"""
+        )
+
+        val scriptsDir = File(context.filesDir, "director_scripts")
         scriptsDir.mkdirs()
 
-        val actualFileName = if (fileName.endsWith(".txt")) fileName else "$fileName.txt"
-        val file = java.io.File(scriptsDir, actualFileName)
+        val actualFileName = if (baseName.endsWith(".txt")) baseName else "$baseName.txt"
+        val file = File(scriptsDir, actualFileName)
+
+        if (!validateFileInDirectory(file, scriptsDir)) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Invalid file name"}"""
+            )
+        }
 
         return try {
             file.writeText(scriptText)
@@ -2504,10 +2588,11 @@ class ApiRoutes(
                 """{"success": true, "fileName": "$actualFileName", "message": "Script saved"}"""
             )
         } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to save script")
             NanoHTTPD.newFixedLengthResponse(
                 Status.INTERNAL_ERROR,
                 WebServer.MIME_JSON,
-                """{"error": "Failed to save script: ${e.message}"}"""
+                """{"error": "Failed to save script"}"""
             )
         }
     }
@@ -2516,8 +2601,8 @@ class ApiRoutes(
      * GET /api/director/scripts/{fileName} - Load script file content
      */
     private fun loadScriptFile(uri: String): NanoHTTPD.Response {
-        val fileName = uri.removePrefix("/api/director/scripts/")
-        if (fileName.isEmpty() || fileName == "save" || fileName == "export" || fileName == "import") {
+        val rawFileName = uri.removePrefix("/api/director/scripts/")
+        if (rawFileName.isEmpty() || rawFileName == "save" || rawFileName == "export" || rawFileName == "import") {
             return NanoHTTPD.newFixedLengthResponse(
                 Status.BAD_REQUEST,
                 WebServer.MIME_JSON,
@@ -2525,14 +2610,28 @@ class ApiRoutes(
             )
         }
 
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-        val file = java.io.File(scriptsDir, fileName)
+        val fileName = sanitizeFileName(rawFileName) ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Invalid file name"}"""
+        )
+
+        val scriptsDir = File(context.filesDir, "director_scripts")
+        val file = File(scriptsDir, fileName)
+
+        if (!validateFileInDirectory(file, scriptsDir)) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Invalid file name"}"""
+            )
+        }
 
         if (!file.exists()) {
             return NanoHTTPD.newFixedLengthResponse(
                 Status.NOT_FOUND,
                 WebServer.MIME_JSON,
-                """{"error": "Script file not found: $fileName"}"""
+                """{"error": "Script file not found"}"""
             )
         }
 
@@ -2557,10 +2656,11 @@ class ApiRoutes(
 
             NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
         } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Failed to read script")
             NanoHTTPD.newFixedLengthResponse(
                 Status.INTERNAL_ERROR,
                 WebServer.MIME_JSON,
-                """{"error": "Failed to read script: ${e.message}"}"""
+                """{"error": "Failed to read script"}"""
             )
         }
     }
@@ -2569,17 +2669,23 @@ class ApiRoutes(
      * DELETE /api/director/scripts/{fileName} - Delete script file
      */
     private fun deleteScriptFile(uri: String): NanoHTTPD.Response {
-        val fileName = uri.removePrefix("/api/director/scripts/")
-        if (fileName.isEmpty()) {
+        val rawFileName = uri.removePrefix("/api/director/scripts/")
+        val fileName = sanitizeFileName(rawFileName) ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Invalid file name"}"""
+        )
+
+        val scriptsDir = File(context.filesDir, "director_scripts")
+        val file = File(scriptsDir, fileName)
+
+        if (!validateFileInDirectory(file, scriptsDir)) {
             return NanoHTTPD.newFixedLengthResponse(
                 Status.BAD_REQUEST,
                 WebServer.MIME_JSON,
-                """{"error": "File name required"}"""
+                """{"error": "Invalid file name"}"""
             )
         }
-
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-        val file = java.io.File(scriptsDir, fileName)
 
         if (!file.exists()) {
             return NanoHTTPD.newFixedLengthResponse(
@@ -2655,11 +2761,19 @@ class ApiRoutes(
 
         val result = director.loadScript(scriptText)
 
+        var saved = false
         if (result.isSuccess && saveToFile && fileName.isNotEmpty()) {
-            val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-            scriptsDir.mkdirs()
-            val actualFileName = if (fileName.endsWith(".txt")) fileName else "$fileName.txt"
-            java.io.File(scriptsDir, actualFileName).writeText(scriptText)
+            val safeName = sanitizeFileName(fileName)
+            if (safeName != null) {
+                val scriptsDir = File(context.filesDir, "director_scripts")
+                scriptsDir.mkdirs()
+                val actualFileName = if (safeName.endsWith(".txt")) safeName else "$safeName.txt"
+                val file = File(scriptsDir, actualFileName)
+                if (validateFileInDirectory(file, scriptsDir)) {
+                    file.writeText(scriptText)
+                    saved = true
+                }
+            }
         }
 
         return if (result.isSuccess) {
@@ -2669,15 +2783,15 @@ class ApiRoutes(
                 put("message", "Script imported")
                 put("scenes", script.scenes.size)
                 put("totalCues", script.totalCues)
-                put("saved", saveToFile && fileName.isNotEmpty())
+                put("saved", saved)
             }
             NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
         } else {
-            val error = result.exceptionOrNull()?.message ?: "Unknown error"
+            Timber.tag(TAG).w("Script import failed: ${result.exceptionOrNull()?.message}")
             NanoHTTPD.newFixedLengthResponse(
                 Status.BAD_REQUEST,
                 WebServer.MIME_JSON,
-                """{"success": false, "error": "$error"}"""
+                """{"success": false, "error": "Failed to parse script"}"""
             )
         }
     }
