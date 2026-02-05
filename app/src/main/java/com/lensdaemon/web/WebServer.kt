@@ -145,7 +145,7 @@ class WebServer(
             newFixedLengthResponse(
                 Response.Status.INTERNAL_ERROR,
                 MIME_JSON,
-                """{"error": "Internal server error", "message": "${e.message}"}"""
+                """{"error": "Internal server error"}"""
             )
         }
     }

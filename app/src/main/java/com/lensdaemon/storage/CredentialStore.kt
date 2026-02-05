@@ -391,7 +391,8 @@ class CredentialStore(
      * Encrypt a string value
      */
     private fun encrypt(plainText: String): String {
-        val key = getKey() ?: return plainText
+        val key = getKey()
+            ?: throw SecurityException("Encryption key unavailable - cannot store credentials securely")
 
         return try {
             val cipher = Cipher.getInstance("AES/GCM/NoPadding")
@@ -406,9 +407,11 @@ class CredentialStore(
             System.arraycopy(encrypted, 0, combined, iv.size, encrypted.size)
 
             Base64.encodeToString(combined, Base64.NO_WRAP)
+        } catch (e: SecurityException) {
+            throw e
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Encryption failed")
-            plainText
+            throw SecurityException("Encryption failed - cannot store credentials securely", e)
         }
     }
 
@@ -416,7 +419,8 @@ class CredentialStore(
      * Decrypt a string value
      */
     private fun decrypt(encryptedText: String): String {
-        val key = getKey() ?: return encryptedText
+        val key = getKey()
+            ?: throw SecurityException("Encryption key unavailable - cannot decrypt credentials")
 
         return try {
             val combined = Base64.decode(encryptedText, Base64.NO_WRAP)
@@ -430,9 +434,11 @@ class CredentialStore(
             cipher.init(Cipher.DECRYPT_MODE, key, spec)
 
             String(cipher.doFinal(encrypted), Charsets.UTF_8)
+        } catch (e: SecurityException) {
+            throw e
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Decryption failed")
-            encryptedText
+            throw SecurityException("Decryption failed - stored credentials may be corrupted", e)
         }
     }
 }

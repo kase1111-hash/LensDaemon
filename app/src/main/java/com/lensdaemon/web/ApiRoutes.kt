@@ -4,34 +4,17 @@ import android.content.Context
 import android.os.Build
 import com.lensdaemon.camera.CameraService
 import com.lensdaemon.camera.LensType
-import com.lensdaemon.encoder.EncoderConfig
+import com.lensdaemon.director.DirectorManager
 import com.lensdaemon.encoder.EncoderState
-import com.lensdaemon.encoder.VideoCodec
-import com.lensdaemon.output.SegmentDuration
-import com.lensdaemon.storage.RecordingFile
-import com.lensdaemon.storage.S3Credentials
-import com.lensdaemon.storage.SmbCredentials
-import com.lensdaemon.storage.StorageBackend
-import com.lensdaemon.storage.UploadDestination
+import com.lensdaemon.kiosk.KioskManager
 import com.lensdaemon.storage.UploadService
 import com.lensdaemon.thermal.ThermalGovernor
-import com.lensdaemon.thermal.ThermalLevel
-import com.lensdaemon.kiosk.KioskManager
-import com.lensdaemon.kiosk.KioskConfig
-import com.lensdaemon.kiosk.KioskState
-import com.lensdaemon.kiosk.ScreenMode
-import com.lensdaemon.kiosk.AutoStartConfig
-import com.lensdaemon.kiosk.ScreenConfig
-import com.lensdaemon.kiosk.SecurityConfig
-import com.lensdaemon.kiosk.NetworkRecoveryConfig
-import com.lensdaemon.kiosk.CrashRecoveryConfig
-import com.lensdaemon.director.DirectorManager
-import com.lensdaemon.director.DirectorConfig
-import com.lensdaemon.director.DirectorState
-import com.lensdaemon.director.InferenceMode
-import com.lensdaemon.director.TakeQuality
+import com.lensdaemon.web.handlers.DirectorApiHandler
+import com.lensdaemon.web.handlers.KioskApiHandler
+import com.lensdaemon.web.handlers.StreamApiHandler
+import com.lensdaemon.web.handlers.ThermalApiHandler
+import com.lensdaemon.web.handlers.UploadApiHandler
 import fi.iki.elonen.NanoHTTPD
-import kotlinx.coroutines.runBlocking
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
@@ -39,37 +22,154 @@ import timber.log.Timber
 import java.io.ByteArrayInputStream
 
 /**
- * REST API routes handler for LensDaemon web interface
+ * REST API routes dispatcher for LensDaemon web interface.
+ *
+ * Routes are delegated to per-module handlers:
+ * - [StreamApiHandler]   -> /api/stream/*, /api/rtsp/*, /api/recording/*, /api/recordings, /api/storage/*
+ * - [UploadApiHandler]   -> /api/upload/*
+ * - [ThermalApiHandler]  -> /api/thermal/*
+ * - [KioskApiHandler]    -> /api/kiosk/*
+ * - [DirectorApiHandler] -> /api/director/*
+ *
+ * Status, lens, camera, snapshot, config, and encoder routes remain inline.
  */
 class ApiRoutes(
     private val context: Context
 ) {
     companion object {
         private const val TAG = "ApiRoutes"
+
+        // Default preview resolution for tap-to-focus coordinate mapping
+        private const val DEFAULT_PREVIEW_WIDTH = 1920
+        private const val DEFAULT_PREVIEW_HEIGHT = 1080
+
+        // HTTP 429 Too Many Requests (not in NanoHTTPD's Status enum)
+        private val TOO_MANY_REQUESTS = object : NanoHTTPD.Response.IStatus {
+            override fun getRequestStatus() = 429
+            override fun getDescription() = "429 Too Many Requests"
+        }
+
+        // Read-only endpoints that don't require authentication
+        private val PUBLIC_ENDPOINTS = setOf(
+            "/api/status",
+            "/api/device"
+        )
     }
 
-    // Camera service reference (set by WebServerService)
+    // Service references (set by WebServerService)
     var cameraService: CameraService? = null
+        set(value) {
+            field = value
+            streamHandler.cameraService = value
+        }
 
-    // Upload service reference (set by WebServerService)
     var uploadService: UploadService? = null
+        set(value) {
+            field = value
+            uploadHandler.uploadService = value
+        }
 
-    // Thermal governor reference (set by WebServerService)
     var thermalGovernor: ThermalGovernor? = null
+        set(value) {
+            field = value
+            thermalHandler.thermalGovernor = value
+        }
 
-    // Kiosk manager reference (set by WebServerService)
     var kioskManager: KioskManager? = null
+        set(value) {
+            field = value
+            kioskHandler.kioskManager = value
+        }
 
-    // Director manager reference (set by WebServerService)
     var directorManager: DirectorManager? = null
+        set(value) {
+            field = value
+            directorHandler.directorManager = value
+        }
 
     // Snapshot callback
     var onSnapshotRequest: (() -> ByteArray?)? = null
 
+    // API authentication token (null = auth disabled for backwards compat)
+    var apiToken: String? = null
+
+    // Rate limiter (null = disabled)
+    var rateLimiter: RateLimiter? = null
+
+    // Delegated route handlers
+    private val streamHandler = StreamApiHandler()
+    private val uploadHandler = UploadApiHandler()
+    private val thermalHandler = ThermalApiHandler()
+    private val kioskHandler = KioskApiHandler()
+    private val directorHandler = DirectorApiHandler(context)
+
     /**
-     * Handle API request
+     * Check API authentication.
+     * Returns an error response if auth fails, null if auth passes.
+     */
+    private fun checkAuth(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
+        val token = apiToken ?: return null  // Auth disabled
+
+        val uri = session.uri
+        // Allow public read-only endpoints without auth
+        if (uri in PUBLIC_ENDPOINTS && session.method == NanoHTTPD.Method.GET) {
+            return null
+        }
+
+        val authHeader = session.headers["authorization"] ?: ""
+        val providedToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
+            authHeader.substring(7).trim()
+        } else {
+            session.parms?.get("token") ?: ""
+        }
+
+        if (providedToken != token) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.UNAUTHORIZED,
+                WebServer.MIME_JSON,
+                """{"error": "Authentication required", "hint": "Provide Bearer token in Authorization header"}"""
+            )
+        }
+        return null
+    }
+
+    /**
+     * Check rate limit for client.
+     * Returns 429 response if rate-limited, null if allowed.
+     */
+    private fun checkRateLimit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
+        val limiter = rateLimiter ?: return null
+
+        val clientIp = session.headers["x-forwarded-for"]?.split(",")?.firstOrNull()?.trim()
+            ?: session.headers["remote-addr"]
+            ?: "unknown"
+
+        if (!limiter.tryAcquire(clientIp)) {
+            val retryAfter = limiter.retryAfterSeconds(clientIp)
+            val body = """{"error": "Rate limit exceeded", "retryAfter": $retryAfter}"""
+            val response = NanoHTTPD.newFixedLengthResponse(
+                TOO_MANY_REQUESTS,
+                WebServer.MIME_JSON,
+                body
+            )
+            response.addHeader("Retry-After", retryAfter.toString())
+            response.addHeader("X-RateLimit-Remaining", "0")
+            return response
+        }
+
+        return null
+    }
+
+    /**
+     * Handle API request - main dispatcher
      */
     fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        // Check authentication first
+        checkAuth(session)?.let { return it }
+
+        // Check rate limit
+        checkRateLimit(session)?.let { return it }
+
         val uri = session.uri
         val method = session.method
 
@@ -78,35 +178,33 @@ class ApiRoutes(
             parseBody(session)
         } else null
 
+        // Delegate to per-module handlers by URI prefix
+        when {
+            uri.startsWith("/api/stream/") || uri.startsWith("/api/rtsp/") ||
+            uri.startsWith("/api/srt/") ||
+            uri.startsWith("/api/recording/") || uri.startsWith("/api/recordings") ||
+            uri.startsWith("/api/storage/") -> {
+                streamHandler.handleRequest(uri, method, body)?.let { return it }
+            }
+            uri.startsWith("/api/upload/") -> {
+                uploadHandler.handleRequest(uri, method, body)?.let { return it }
+            }
+            uri.startsWith("/api/thermal/") -> {
+                thermalHandler.handleRequest(uri, method, body)?.let { return it }
+            }
+            uri.startsWith("/api/kiosk/") -> {
+                kioskHandler.handleRequest(uri, method, body)?.let { return it }
+            }
+            uri.startsWith("/api/director/") -> {
+                directorHandler.handleRequest(uri, method, body)?.let { return it }
+            }
+        }
+
+        // Inline routes for status, lens, camera, snapshot, config, encoder
         return when {
             // Status endpoints
             uri == "/api/status" && method == NanoHTTPD.Method.GET -> getStatus()
             uri == "/api/device" && method == NanoHTTPD.Method.GET -> getDeviceInfo()
-
-            // Stream control
-            uri == "/api/stream/start" && method == NanoHTTPD.Method.POST -> startStream(body)
-            uri == "/api/stream/stop" && method == NanoHTTPD.Method.POST -> stopStream()
-            uri == "/api/stream/status" && method == NanoHTTPD.Method.GET -> getStreamStatus()
-
-            // RTSP control
-            uri == "/api/rtsp/start" && method == NanoHTTPD.Method.POST -> startRtsp(body)
-            uri == "/api/rtsp/stop" && method == NanoHTTPD.Method.POST -> stopRtsp()
-            uri == "/api/rtsp/status" && method == NanoHTTPD.Method.GET -> getRtspStatus()
-
-            // Recording control
-            uri == "/api/recording/start" && method == NanoHTTPD.Method.POST -> startRecording(body)
-            uri == "/api/recording/stop" && method == NanoHTTPD.Method.POST -> stopRecording()
-            uri == "/api/recording/pause" && method == NanoHTTPD.Method.POST -> pauseRecording()
-            uri == "/api/recording/resume" && method == NanoHTTPD.Method.POST -> resumeRecording()
-            uri == "/api/recording/status" && method == NanoHTTPD.Method.GET -> getRecordingStatus()
-
-            // Recordings management
-            uri == "/api/recordings" && method == NanoHTTPD.Method.GET -> listRecordings()
-            uri.startsWith("/api/recordings/") && method == NanoHTTPD.Method.DELETE -> deleteRecording(uri)
-
-            // Storage status
-            uri == "/api/storage/status" && method == NanoHTTPD.Method.GET -> getStorageStatus()
-            uri == "/api/storage/cleanup" && method == NanoHTTPD.Method.POST -> enforceRetention()
 
             // Lens control
             uri.startsWith("/api/lens/") && method == NanoHTTPD.Method.POST -> switchLens(uri)
@@ -118,8 +216,7 @@ class ApiRoutes(
             uri == "/api/exposure" && method == NanoHTTPD.Method.POST -> setExposure(body)
 
             // Snapshot
-            uri == "/api/snapshot" && method == NanoHTTPD.Method.POST -> captureSnapshot()
-            uri == "/api/snapshot" && method == NanoHTTPD.Method.GET -> captureSnapshot()
+            uri == "/api/snapshot" && (method == NanoHTTPD.Method.POST || method == NanoHTTPD.Method.GET) -> captureSnapshot()
 
             // Configuration
             uri == "/api/config" && method == NanoHTTPD.Method.GET -> getConfig()
@@ -127,81 +224,6 @@ class ApiRoutes(
 
             // Encoder
             uri == "/api/encoder/capabilities" && method == NanoHTTPD.Method.GET -> getEncoderCapabilities()
-
-            // Upload service
-            uri == "/api/upload/status" && method == NanoHTTPD.Method.GET -> getUploadStatus()
-            uri == "/api/upload/queue" && method == NanoHTTPD.Method.GET -> getUploadQueue()
-            uri == "/api/upload/start" && method == NanoHTTPD.Method.POST -> startUploads()
-            uri == "/api/upload/stop" && method == NanoHTTPD.Method.POST -> stopUploads()
-            uri == "/api/upload/enqueue" && method == NanoHTTPD.Method.POST -> enqueueUpload(body)
-            uri.startsWith("/api/upload/task/") && method == NanoHTTPD.Method.DELETE -> cancelUploadTask(uri)
-            uri == "/api/upload/retry" && method == NanoHTTPD.Method.POST -> retryFailedUploads()
-            uri == "/api/upload/clear" && method == NanoHTTPD.Method.POST -> clearPendingUploads()
-
-            // S3 configuration
-            uri == "/api/upload/s3/config" && method == NanoHTTPD.Method.GET -> getS3Config()
-            uri == "/api/upload/s3/config" && method == NanoHTTPD.Method.POST -> configureS3(body)
-            uri == "/api/upload/s3/config" && method == NanoHTTPD.Method.DELETE -> clearS3Config()
-            uri == "/api/upload/s3/test" && method == NanoHTTPD.Method.POST -> testS3Connection()
-
-            // SMB configuration
-            uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.GET -> getSmbConfig()
-            uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.POST -> configureSmb(body)
-            uri == "/api/upload/smb/config" && method == NanoHTTPD.Method.DELETE -> clearSmbConfig()
-            uri == "/api/upload/smb/test" && method == NanoHTTPD.Method.POST -> testSmbConnection()
-
-            // Thermal management
-            uri == "/api/thermal/status" && method == NanoHTTPD.Method.GET -> getThermalStatus()
-            uri == "/api/thermal/history" && method == NanoHTTPD.Method.GET -> getThermalHistory()
-            uri == "/api/thermal/stats" && method == NanoHTTPD.Method.GET -> getThermalStats()
-            uri == "/api/thermal/events" && method == NanoHTTPD.Method.GET -> getThermalEvents()
-            uri == "/api/thermal/battery" && method == NanoHTTPD.Method.GET -> getBatteryBypassStatus()
-            uri == "/api/thermal/battery/disable" && method == NanoHTTPD.Method.POST -> disableBatteryCharging()
-            uri == "/api/thermal/battery/enable" && method == NanoHTTPD.Method.POST -> enableBatteryCharging()
-
-            // Kiosk mode
-            uri == "/api/kiosk/status" && method == NanoHTTPD.Method.GET -> getKioskStatus()
-            uri == "/api/kiosk/enable" && method == NanoHTTPD.Method.POST -> enableKiosk()
-            uri == "/api/kiosk/disable" && method == NanoHTTPD.Method.POST -> disableKiosk()
-            uri == "/api/kiosk/config" && method == NanoHTTPD.Method.GET -> getKioskConfig()
-            uri == "/api/kiosk/config" && method == NanoHTTPD.Method.PUT -> updateKioskConfig(body)
-            uri == "/api/kiosk/preset/appliance" && method == NanoHTTPD.Method.POST -> applyAppliancePreset()
-            uri == "/api/kiosk/preset/interactive" && method == NanoHTTPD.Method.POST -> applyInteractivePreset()
-            uri == "/api/kiosk/events" && method == NanoHTTPD.Method.GET -> getKioskEvents()
-
-            // AI Director
-            uri == "/api/director/status" && method == NanoHTTPD.Method.GET -> getDirectorStatus()
-            uri == "/api/director/enable" && method == NanoHTTPD.Method.POST -> enableDirector()
-            uri == "/api/director/disable" && method == NanoHTTPD.Method.POST -> disableDirector()
-            uri == "/api/director/config" && method == NanoHTTPD.Method.GET -> getDirectorConfig()
-            uri == "/api/director/config" && method == NanoHTTPD.Method.PUT -> updateDirectorConfig(body)
-            uri == "/api/director/script" && method == NanoHTTPD.Method.POST -> loadDirectorScript(body)
-            uri == "/api/director/start" && method == NanoHTTPD.Method.POST -> startDirector()
-            uri == "/api/director/stop" && method == NanoHTTPD.Method.POST -> stopDirector()
-            uri == "/api/director/pause" && method == NanoHTTPD.Method.POST -> pauseDirector()
-            uri == "/api/director/resume" && method == NanoHTTPD.Method.POST -> resumeDirector()
-            uri == "/api/director/cue" && method == NanoHTTPD.Method.POST -> executeDirectorCue(body)
-            uri == "/api/director/advance" && method == NanoHTTPD.Method.POST -> advanceDirectorCue()
-            uri == "/api/director/scene" && method == NanoHTTPD.Method.POST -> jumpToScene(body)
-            uri == "/api/director/takes" && method == NanoHTTPD.Method.GET -> getDirectorTakes()
-            uri == "/api/director/takes/mark" && method == NanoHTTPD.Method.POST -> markTake(body)
-            uri == "/api/director/takes/best" && method == NanoHTTPD.Method.GET -> getBestTakes()
-            uri == "/api/director/takes/compare" && method == NanoHTTPD.Method.GET -> compareTakes()
-            uri == "/api/director/session" && method == NanoHTTPD.Method.GET -> getDirectorSession()
-            uri == "/api/director/events" && method == NanoHTTPD.Method.GET -> getDirectorEvents()
-            uri == "/api/director/script/clear" && method == NanoHTTPD.Method.POST -> clearDirectorScript()
-
-            // Script file management
-            uri == "/api/director/scripts" && method == NanoHTTPD.Method.GET -> listScriptFiles()
-            uri == "/api/director/scripts/save" && method == NanoHTTPD.Method.POST -> saveScriptFile(body)
-            uri.startsWith("/api/director/scripts/") && method == NanoHTTPD.Method.GET -> loadScriptFile(uri)
-            uri.startsWith("/api/director/scripts/") && method == NanoHTTPD.Method.DELETE -> deleteScriptFile(uri)
-            uri == "/api/director/scripts/export" && method == NanoHTTPD.Method.GET -> exportCurrentScript()
-            uri == "/api/director/scripts/import" && method == NanoHTTPD.Method.POST -> importScript(body)
-
-            // Take-recording linking
-            uri == "/api/director/takes/link" && method == NanoHTTPD.Method.POST -> linkTakeToRecording(body)
-            uri == "/api/director/takes/markers" && method == NanoHTTPD.Method.GET -> getTakeMarkers()
 
             // Not found
             else -> NanoHTTPD.newFixedLengthResponse(
@@ -229,9 +251,6 @@ class ApiRoutes(
 
     // ==================== Status Endpoints ====================
 
-    /**
-     * GET /api/status - Get overall system status
-     */
     private fun getStatus(): NanoHTTPD.Response {
         val camera = cameraService
         val json = JSONObject().apply {
@@ -295,9 +314,6 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    /**
-     * GET /api/device - Get device information
-     */
     private fun getDeviceInfo(): NanoHTTPD.Response {
         val json = JSONObject().apply {
             put("manufacturer", Build.MANUFACTURER)
@@ -311,417 +327,8 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    // ==================== Stream Control ====================
-
-    /**
-     * POST /api/stream/start - Start encoding
-     */
-    private fun startStream(body: JSONObject?): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        // Parse config from body
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
-        val codecStr = body?.optString("codec", "H264") ?: "H264"
-        val codec = try { VideoCodec.valueOf(codecStr) } catch (e: Exception) { VideoCodec.H264 }
-
-        val config = EncoderConfig(
-            codec = codec,
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        camera.startStreaming(config)
-
-        val json = JSONObject().apply {
-            put("success", true)
-            put("message", "Streaming started")
-            put("config", JSONObject().apply {
-                put("width", width)
-                put("height", height)
-                put("bitrate", bitrate)
-                put("frameRate", frameRate)
-                put("codec", codec.name)
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/stream/stop - Stop encoding
-     */
-    private fun stopStream(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-        camera.stopStreaming()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Streaming stopped"}"""
-        )
-    }
-
-    /**
-     * GET /api/stream/status - Get stream status
-     */
-    private fun getStreamStatus(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val stats = camera.getEncoderStats()
-        val config = camera.getEncoderConfig()
-
-        val json = JSONObject().apply {
-            put("active", camera.isStreaming())
-            put("encoderState", camera.encoderState.value.name)
-            if (stats != null) {
-                put("framesEncoded", stats.framesEncoded)
-                put("framesDropped", stats.framesDropped)
-                put("currentBitrate", stats.currentBitrateBps)
-                put("currentFps", stats.currentFps)
-                put("totalBytes", stats.totalBytesEncoded)
-                put("duration", stats.durationSec)
-            }
-            if (config != null) {
-                put("config", JSONObject().apply {
-                    put("width", config.width)
-                    put("height", config.height)
-                    put("bitrate", config.bitrateBps)
-                    put("frameRate", config.frameRate)
-                    put("codec", config.codec.name)
-                })
-            }
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    // ==================== RTSP Control ====================
-
-    /**
-     * POST /api/rtsp/start - Start RTSP server
-     */
-    private fun startRtsp(body: JSONObject?): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val port = body?.optInt("port", 8554) ?: 8554
-
-        // Parse encoder config
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
-
-        val config = EncoderConfig(
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        val success = camera.startRtspStreaming(config, port)
-
-        val json = JSONObject().apply {
-            put("success", success)
-            if (success) {
-                put("url", camera.getRtspUrl())
-                put("message", "RTSP streaming started")
-            } else {
-                put("message", "Failed to start RTSP streaming")
-            }
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.INTERNAL_ERROR,
-            WebServer.MIME_JSON,
-            json.toString()
-        )
-    }
-
-    /**
-     * POST /api/rtsp/stop - Stop RTSP server
-     */
-    private fun stopRtsp(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-        camera.stopRtspStreaming()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "RTSP streaming stopped"}"""
-        )
-    }
-
-    /**
-     * GET /api/rtsp/status - Get RTSP status
-     */
-    private fun getRtspStatus(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val stats = camera.getRtspServerStats()
-
-        val json = JSONObject().apply {
-            put("running", camera.isRtspServerRunning())
-            put("url", camera.getRtspUrl() ?: "")
-            put("clients", camera.getRtspClientCount())
-            put("playing", camera.getRtspPlayingCount())
-            if (stats != null) {
-                put("totalConnections", stats.totalConnections)
-                put("totalPackets", stats.totalPacketsSent)
-                put("totalBytes", stats.totalBytesSent)
-                put("uptime", stats.uptimeMs)
-            }
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    // ==================== Recording Control ====================
-
-    /**
-     * POST /api/recording/start - Start local recording
-     */
-    private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        // Parse config
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
-        val segmentMinutes = body?.optInt("segmentMinutes", 5) ?: 5
-
-        val segmentDuration = when (segmentMinutes) {
-            0 -> SegmentDuration.CONTINUOUS
-            1 -> SegmentDuration.ONE_MINUTE
-            5 -> SegmentDuration.FIVE_MINUTES
-            15 -> SegmentDuration.FIFTEEN_MINUTES
-            30 -> SegmentDuration.THIRTY_MINUTES
-            60 -> SegmentDuration.SIXTY_MINUTES
-            else -> SegmentDuration.FIVE_MINUTES
-        }
-
-        val config = EncoderConfig(
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        val success = camera.startRecording(config, segmentDuration)
-
-        val json = JSONObject().apply {
-            put("success", success)
-            if (success) {
-                put("message", "Recording started")
-                put("segmentDuration", segmentDuration.displayName)
-                put("outputPath", camera.getRecordingsPath())
-            } else {
-                put("message", "Failed to start recording")
-            }
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.INTERNAL_ERROR,
-            WebServer.MIME_JSON,
-            json.toString()
-        )
-    }
-
-    /**
-     * POST /api/recording/stop - Stop local recording
-     */
-    private fun stopRecording(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val segments = camera.stopRecording()
-
-        val json = JSONObject().apply {
-            put("success", true)
-            put("message", "Recording stopped")
-            put("segmentCount", segments.size)
-            put("segments", JSONArray().apply {
-                segments.forEach { put(it) }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/recording/pause - Pause recording
-     */
-    private fun pauseRecording(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val success = camera.pauseRecording()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Recording paused" else "Not recording"}"}"""
-        )
-    }
-
-    /**
-     * POST /api/recording/resume - Resume recording
-     */
-    private fun resumeRecording(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val success = camera.resumeRecording()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Recording resumed" else "Not paused"}"}"""
-        )
-    }
-
-    /**
-     * GET /api/recording/status - Get recording status
-     */
-    private fun getRecordingStatus(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val stats = camera.getRecordingStats()
-
-        val json = JSONObject().apply {
-            put("recording", camera.isRecording())
-            put("paused", camera.isRecordingPaused())
-            put("state", stats.state.name)
-            put("currentFile", stats.currentFilePath ?: "")
-            put("framesInSegment", stats.framesInSegment)
-            put("totalFrames", stats.totalFrames)
-            put("bytesInSegment", stats.bytesInSegment)
-            put("totalBytes", stats.totalBytes)
-            put("segmentIndex", stats.segmentIndex)
-            put("durationSec", stats.durationSec)
-            put("avgBitrateKbps", stats.avgBitrateKbps)
-            put("completedSegments", JSONArray().apply {
-                stats.completedSegments.forEach { put(it) }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    // ==================== Recordings Management ====================
-
-    /**
-     * GET /api/recordings - List all recordings
-     */
-    private fun listRecordings(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val recordings = camera.listRecordings()
-
-        val json = JSONObject().apply {
-            put("count", recordings.size)
-            put("totalSizeBytes", recordings.sumOf { it.sizeBytes })
-            put("recordings", JSONArray().apply {
-                recordings.forEach { rec ->
-                    put(JSONObject().apply {
-                        put("name", rec.name)
-                        put("path", rec.path)
-                        put("sizeBytes", rec.sizeBytes)
-                        put("sizeMB", rec.sizeMB)
-                        put("lastModified", rec.lastModifiedMs)
-                        put("lastModifiedFormatted", rec.lastModifiedFormatted)
-                        put("ageHours", rec.ageHours)
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * DELETE /api/recordings/{filename} - Delete a recording
-     */
-    private fun deleteRecording(uri: String): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val filename = uri.substringAfterLast("/")
-        if (filename.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Filename required"}"""
-            )
-        }
-
-        // Find the recording
-        val recordings = camera.listRecordings()
-        val recording = recordings.find { it.name == filename }
-            ?: return NanoHTTPD.newFixedLengthResponse(
-                Status.NOT_FOUND,
-                WebServer.MIME_JSON,
-                """{"error": "Recording not found: $filename"}"""
-            )
-
-        val success = camera.deleteRecording(recording)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.INTERNAL_ERROR,
-            WebServer.MIME_JSON,
-            """{"success": $success, "filename": "$filename"}"""
-        )
-    }
-
-    // ==================== Storage ====================
-
-    /**
-     * GET /api/storage/status - Get storage status
-     */
-    private fun getStorageStatus(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        val status = camera.getStorageStatus()
-
-        val json = JSONObject().apply {
-            put("state", status.state.name)
-            put("warningLevel", status.warningLevel.name)
-            put("totalRecordings", status.totalRecordings)
-            put("totalRecordingsSizeBytes", status.totalRecordingsSizeBytes)
-            put("storage", JSONObject().apply {
-                put("totalBytes", status.storageInfo.totalBytes)
-                put("availableBytes", status.storageInfo.availableBytes)
-                put("usedBytes", status.storageInfo.usedBytes)
-                put("path", status.storageInfo.path)
-                put("totalGB", status.storageInfo.totalGB)
-                put("availableGB", status.storageInfo.availableGB)
-                put("usagePercent", status.storageInfo.usagePercent)
-                put("isLowSpace", status.storageInfo.isLowSpace)
-                put("isCriticallyLowSpace", status.storageInfo.isCriticallyLowSpace)
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/storage/cleanup - Enforce retention policy
-     */
-    private fun enforceRetention(): NanoHTTPD.Response {
-        val camera = cameraService ?: return serviceUnavailable()
-
-        camera.enforceRetention()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Retention enforcement started"}"""
-        )
-    }
-
     // ==================== Lens Control ====================
 
-    /**
-     * POST /api/lens/{type} - Switch camera lens
-     */
     private fun switchLens(uri: String): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
@@ -740,15 +347,11 @@ class ApiRoutes(
         camera.switchLens(lensType)
 
         return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
+            Status.OK, WebServer.MIME_JSON,
             """{"success": true, "lens": "${lensType.name}"}"""
         )
     }
 
-    /**
-     * GET /api/lenses - Get available lenses
-     */
     private fun getLenses(): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
@@ -775,68 +378,50 @@ class ApiRoutes(
 
     // ==================== Camera Control ====================
 
-    /**
-     * POST /api/zoom - Set zoom level
-     */
     private fun setZoom(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
         val zoom = body?.optDouble("zoom", 1.0) ?: 1.0
-
         camera.setZoom(zoom.toFloat())
 
         return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
+            Status.OK, WebServer.MIME_JSON,
             """{"success": true, "zoom": $zoom}"""
         )
     }
 
-    /**
-     * POST /api/focus - Trigger focus at point
-     */
     private fun triggerFocus(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
         val x = body?.optDouble("x", 0.5) ?: 0.5
         val y = body?.optDouble("y", 0.5) ?: 0.5
 
-        // Trigger tap-to-focus at normalized coordinates
         camera.triggerTapToFocus(
             x.toFloat(),
             y.toFloat(),
-            android.util.Size(1920, 1080) // Assume 1080p
+            android.util.Size(DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT)
         )
 
         return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
+            Status.OK, WebServer.MIME_JSON,
             """{"success": true, "x": $x, "y": $y}"""
         )
     }
 
-    /**
-     * POST /api/exposure - Set exposure compensation
-     */
     private fun setExposure(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
         val ev = body?.optInt("ev", 0) ?: 0
-
         camera.setExposureCompensation(ev)
 
         return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
+            Status.OK, WebServer.MIME_JSON,
             """{"success": true, "ev": $ev}"""
         )
     }
 
     // ==================== Snapshot ====================
 
-    /**
-     * GET/POST /api/snapshot - Capture JPEG snapshot
-     */
     private fun captureSnapshot(): NanoHTTPD.Response {
         val callback = onSnapshotRequest ?: return NanoHTTPD.newFixedLengthResponse(
             Status.SERVICE_UNAVAILABLE,
@@ -860,9 +445,6 @@ class ApiRoutes(
 
     // ==================== Configuration ====================
 
-    /**
-     * GET /api/config - Get current configuration
-     */
     private fun getConfig(): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
@@ -892,9 +474,6 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    /**
-     * PUT /api/config - Update configuration
-     */
     private fun updateConfig(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
@@ -904,31 +483,24 @@ class ApiRoutes(
             """{"error": "Request body required"}"""
         )
 
-        // Update encoder config if streaming
         if (body.has("bitrate")) {
-            camera.updateEncoderBitrate(body.getInt("bitrate"))
+            camera.updateEncoderBitrate(body.optInt("bitrate", 0))
         }
-
-        // Update camera config
         if (body.has("zoom")) {
-            camera.setZoom(body.getDouble("zoom").toFloat())
+            camera.setZoom(body.optDouble("zoom", 1.0).toFloat())
         }
         if (body.has("exposureCompensation")) {
-            camera.setExposureCompensation(body.getInt("exposureCompensation"))
+            camera.setExposureCompensation(body.optInt("exposureCompensation", 0))
         }
 
         return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
+            Status.OK, WebServer.MIME_JSON,
             """{"success": true, "message": "Configuration updated"}"""
         )
     }
 
     // ==================== Encoder ====================
 
-    /**
-     * GET /api/encoder/capabilities - Get encoder capabilities
-     */
     private fun getEncoderCapabilities(): NanoHTTPD.Response {
         val json = JSONObject().apply {
             put("codecs", JSONArray().apply {
@@ -951,1847 +523,7 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    // ==================== Upload Service ====================
-
-    /**
-     * GET /api/upload/status - Get upload service status
-     */
-    private fun getUploadStatus(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        val stats = upload.stats.value
-        val queueStats = stats.queueStats
-
-        val json = JSONObject().apply {
-            put("state", stats.state.name)
-            put("isS3Configured", stats.isS3Configured)
-            put("isSmbConfigured", stats.isSmbConfigured)
-            put("currentFile", stats.currentFileName ?: "")
-            put("currentProgress", stats.currentProgress)
-            put("queue", JSONObject().apply {
-                put("totalCount", queueStats.totalCount)
-                put("pendingCount", queueStats.pendingCount)
-                put("uploadingCount", queueStats.uploadingCount)
-                put("completedCount", queueStats.completedCount)
-                put("failedCount", queueStats.failedCount)
-                put("cancelledCount", queueStats.cancelledCount)
-                put("totalBytes", queueStats.totalBytes)
-                put("uploadedBytes", queueStats.uploadedBytes)
-                put("currentProgress", queueStats.currentProgress)
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/upload/queue - Get upload queue details
-     */
-    private fun getUploadQueue(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        val pending = upload.getPendingTasks()
-        val completed = upload.getCompletedTasks()
-
-        val json = JSONObject().apply {
-            put("pending", JSONArray().apply {
-                pending.forEach { task ->
-                    put(JSONObject().apply {
-                        put("id", task.id)
-                        put("fileName", task.fileName)
-                        put("localPath", task.localPath)
-                        put("remotePath", task.remotePath)
-                        put("destination", task.destination.name)
-                        put("status", task.status.name)
-                        put("fileSize", task.fileSize)
-                        put("bytesUploaded", task.bytesUploaded)
-                        put("progress", task.progress)
-                        put("retryCount", task.retryCount)
-                        put("error", task.error ?: "")
-                    })
-                }
-            })
-            put("completed", JSONArray().apply {
-                completed.forEach { task ->
-                    put(JSONObject().apply {
-                        put("id", task.id)
-                        put("fileName", task.fileName)
-                        put("destination", task.destination.name)
-                        put("status", task.status.name)
-                        put("fileSize", task.fileSize)
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/upload/start - Start upload processing
-     */
-    private fun startUploads(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-        upload.startUploads()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Upload processing started"}"""
-        )
-    }
-
-    /**
-     * POST /api/upload/stop - Stop upload processing
-     */
-    private fun stopUploads(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-        upload.stopUploads()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Upload processing stopped"}"""
-        )
-    }
-
-    /**
-     * POST /api/upload/enqueue - Enqueue a file for upload
-     */
-    private fun enqueueUpload(body: JSONObject?): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val filePath = body.optString("filePath", "")
-        val remotePath = body.optString("remotePath", "")
-        val destinationStr = body.optString("destination", "S3")
-        val deleteAfter = body.optBoolean("deleteAfterUpload", false)
-
-        if (filePath.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "filePath is required"}"""
-            )
-        }
-
-        val destination = try {
-            UploadDestination.valueOf(destinationStr.uppercase())
-        } catch (e: Exception) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Invalid destination: $destinationStr. Use S3 or SMB"}"""
-            )
-        }
-
-        // Use filename as remote path if not specified
-        val effectiveRemotePath = if (remotePath.isEmpty()) {
-            filePath.substringAfterLast("/")
-        } else {
-            remotePath
-        }
-
-        val task = upload.enqueueFile(filePath, effectiveRemotePath, destination, deleteAfter)
-
-        return if (task != null) {
-            val json = JSONObject().apply {
-                put("success", true)
-                put("taskId", task.id)
-                put("fileName", task.fileName)
-                put("destination", destination.name)
-                put("message", "File enqueued for upload")
-            }
-            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } else {
-            NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Failed to enqueue file. Check if file exists."}"""
-            )
-        }
-    }
-
-    /**
-     * DELETE /api/upload/task/{id} - Cancel an upload task
-     */
-    private fun cancelUploadTask(uri: String): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        val taskId = uri.substringAfterLast("/")
-        if (taskId.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Task ID required"}"""
-            )
-        }
-
-        val success = upload.cancelTask(taskId)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.NOT_FOUND,
-            WebServer.MIME_JSON,
-            """{"success": $success, "taskId": "$taskId"}"""
-        )
-    }
-
-    /**
-     * POST /api/upload/retry - Retry all failed uploads
-     */
-    private fun retryFailedUploads(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-        upload.retryFailed()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Retrying failed uploads"}"""
-        )
-    }
-
-    /**
-     * POST /api/upload/clear - Clear all pending uploads
-     */
-    private fun clearPendingUploads(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-        upload.clearPending()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Pending uploads cleared"}"""
-        )
-    }
-
-    // ==================== S3 Configuration ====================
-
-    /**
-     * GET /api/upload/s3/config - Get S3 configuration (masked)
-     */
-    private fun getS3Config(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        val creds = upload.getS3CredentialsSafe()
-
-        if (creds == null) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.OK,
-                WebServer.MIME_JSON,
-                """{"configured": false}"""
-            )
-        }
-
-        val json = JSONObject().apply {
-            put("configured", true)
-            put("endpoint", creds.endpoint)
-            put("region", creds.region)
-            put("bucket", creds.bucket)
-            put("accessKeyId", creds.accessKeyId)
-            put("pathPrefix", creds.pathPrefix)
-            put("useHttps", creds.useHttps)
-            put("backend", creds.backend.name)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/upload/s3/config - Configure S3 credentials
-     */
-    private fun configureS3(body: JSONObject?): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val endpoint = body.optString("endpoint", "")
-        val region = body.optString("region", "us-east-1")
-        val bucket = body.optString("bucket", "")
-        val accessKeyId = body.optString("accessKeyId", "")
-        val secretAccessKey = body.optString("secretAccessKey", "")
-        val pathPrefix = body.optString("pathPrefix", "")
-        val useHttps = body.optBoolean("useHttps", true)
-        val backendStr = body.optString("backend", "S3")
-
-        if (bucket.isEmpty() || accessKeyId.isEmpty() || secretAccessKey.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "bucket, accessKeyId, and secretAccessKey are required"}"""
-            )
-        }
-
-        val backend = try {
-            StorageBackend.valueOf(backendStr.uppercase())
-        } catch (e: Exception) {
-            StorageBackend.S3
-        }
-
-        // Build endpoint if not provided
-        val effectiveEndpoint = if (endpoint.isEmpty()) {
-            when (backend) {
-                StorageBackend.S3 -> "s3.$region.amazonaws.com"
-                StorageBackend.BACKBLAZE_B2 -> "s3.$region.backblazeb2.com"
-                else -> ""
-            }
-        } else {
-            endpoint
-        }
-
-        if (effectiveEndpoint.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "endpoint is required for this backend type"}"""
-            )
-        }
-
-        val credentials = S3Credentials(
-            endpoint = effectiveEndpoint,
-            region = region,
-            bucket = bucket,
-            accessKeyId = accessKeyId,
-            secretAccessKey = secretAccessKey,
-            pathPrefix = pathPrefix,
-            useHttps = useHttps,
-            backend = backend
-        )
-
-        upload.configureS3(credentials)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "S3 configured", "backend": "${backend.name}", "bucket": "$bucket"}"""
-        )
-    }
-
-    /**
-     * DELETE /api/upload/s3/config - Clear S3 credentials
-     */
-    private fun clearS3Config(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-        upload.clearS3Credentials()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "S3 credentials cleared"}"""
-        )
-    }
-
-    /**
-     * POST /api/upload/s3/test - Test S3 connection
-     */
-    private fun testS3Connection(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        if (!upload.isS3Configured()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"success": false, "error": "S3 not configured"}"""
-            )
-        }
-
-        return runBlocking {
-            val result = upload.testS3Connection()
-            if (result.isSuccess) {
-                NanoHTTPD.newFixedLengthResponse(
-                    Status.OK,
-                    WebServer.MIME_JSON,
-                    """{"success": true, "message": "S3 connection successful"}"""
-                )
-            } else {
-                val error = result.exceptionOrNull()?.message ?: "Unknown error"
-                NanoHTTPD.newFixedLengthResponse(
-                    Status.OK,
-                    WebServer.MIME_JSON,
-                    """{"success": false, "error": "$error"}"""
-                )
-            }
-        }
-    }
-
-    // ==================== SMB Configuration ====================
-
-    /**
-     * GET /api/upload/smb/config - Get SMB configuration (masked)
-     */
-    private fun getSmbConfig(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        val creds = upload.getSmbCredentialsSafe()
-
-        if (creds == null) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.OK,
-                WebServer.MIME_JSON,
-                """{"configured": false}"""
-            )
-        }
-
-        val json = JSONObject().apply {
-            put("configured", true)
-            put("server", creds.server)
-            put("share", creds.share)
-            put("username", creds.username)
-            put("domain", creds.domain)
-            put("port", creds.port)
-            put("pathPrefix", creds.pathPrefix)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/upload/smb/config - Configure SMB credentials
-     */
-    private fun configureSmb(body: JSONObject?): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val server = body.optString("server", "")
-        val share = body.optString("share", "")
-        val username = body.optString("username", "")
-        val password = body.optString("password", "")
-        val domain = body.optString("domain", "")
-        val port = body.optInt("port", 445)
-        val pathPrefix = body.optString("pathPrefix", "")
-
-        if (server.isEmpty() || share.isEmpty() || username.isEmpty() || password.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "server, share, username, and password are required"}"""
-            )
-        }
-
-        val credentials = SmbCredentials(
-            server = server,
-            share = share,
-            username = username,
-            password = password,
-            domain = domain,
-            port = port,
-            pathPrefix = pathPrefix
-        )
-
-        upload.configureSmb(credentials)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "SMB configured", "server": "$server", "share": "$share"}"""
-        )
-    }
-
-    /**
-     * DELETE /api/upload/smb/config - Clear SMB credentials
-     */
-    private fun clearSmbConfig(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-        upload.clearSmbCredentials()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "SMB credentials cleared"}"""
-        )
-    }
-
-    /**
-     * POST /api/upload/smb/test - Test SMB connection
-     */
-    private fun testSmbConnection(): NanoHTTPD.Response {
-        val upload = uploadService ?: return uploadServiceUnavailable()
-
-        if (!upload.isSmbConfigured()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"success": false, "error": "SMB not configured"}"""
-            )
-        }
-
-        return runBlocking {
-            val result = upload.testSmbConnection()
-            if (result.isSuccess) {
-                NanoHTTPD.newFixedLengthResponse(
-                    Status.OK,
-                    WebServer.MIME_JSON,
-                    """{"success": true, "message": "SMB connection successful"}"""
-                )
-            } else {
-                val error = result.exceptionOrNull()?.message ?: "Unknown error"
-                NanoHTTPD.newFixedLengthResponse(
-                    Status.OK,
-                    WebServer.MIME_JSON,
-                    """{"success": false, "error": "$error"}"""
-                )
-            }
-        }
-    }
-
-    // ==================== Thermal Management ====================
-
-    /**
-     * GET /api/thermal/status - Get current thermal status
-     */
-    private fun getThermalStatus(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        val status = thermal.status.value
-
-        val json = JSONObject().apply {
-            put("cpuTemperatureC", status.cpuTemperatureC)
-            put("batteryTemperatureC", status.batteryTemperatureC)
-            put("cpuLevel", status.cpuLevel.name)
-            put("batteryLevel", status.batteryLevel.name)
-            put("overallLevel", status.overallLevel.name)
-            put("statusText", status.statusText)
-            put("isThrottling", status.isThrottling)
-            put("batteryPercent", status.batteryPercent)
-            put("isCharging", status.isCharging)
-            put("chargingDisabled", status.chargingDisabled)
-            put("bitrateReductionPercent", status.bitrateReductionPercent)
-            put("resolutionReduced", status.resolutionReduced)
-            put("framerateReduced", status.framerateReduced)
-            put("activeActions", JSONArray().apply {
-                status.activeActions.forEach { put(it.name) }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/thermal/history - Get temperature history for graphing
-     */
-    private fun getThermalHistory(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        val history = thermal.getHistory()
-        val entries = history.getGraphData(100) // 100 data points for graph
-
-        val json = JSONObject().apply {
-            put("count", entries.size)
-            put("data", JSONArray().apply {
-                entries.forEach { entry ->
-                    put(JSONObject().apply {
-                        put("timestamp", entry.timestamp)
-                        put("cpuTemp", entry.cpuTemperatureC)
-                        put("batteryTemp", entry.batteryTemperatureC)
-                        put("cpuLevel", entry.cpuLevel.name)
-                        put("batteryLevel", entry.batteryLevel.name)
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/thermal/stats - Get thermal statistics
-     */
-    private fun getThermalStats(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        val stats = thermal.getStats()
-
-        val json = JSONObject().apply {
-            put("periodStartMs", stats.periodStartMs)
-            put("periodEndMs", stats.periodEndMs)
-            put("cpu", JSONObject().apply {
-                put("minTemp", stats.cpuTempMin)
-                put("maxTemp", stats.cpuTempMax)
-                put("avgTemp", stats.cpuTempAvg)
-            })
-            put("battery", JSONObject().apply {
-                put("minTemp", stats.batteryTempMin)
-                put("maxTemp", stats.batteryTempMax)
-                put("avgTemp", stats.batteryTempAvg)
-            })
-            put("timeInWarningMs", stats.timeInWarningMs)
-            put("timeInCriticalMs", stats.timeInCriticalMs)
-            put("timeInEmergencyMs", stats.timeInEmergencyMs)
-            put("throttleEventCount", stats.throttleEventCount)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/thermal/events - Get recent thermal events
-     */
-    private fun getThermalEvents(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        val history = thermal.getHistory()
-        val events = history.getEvents(24) // Last 24 hours
-
-        val json = JSONObject().apply {
-            put("count", events.size)
-            put("events", JSONArray().apply {
-                events.forEach { event ->
-                    put(JSONObject().apply {
-                        put("timestamp", event.timestamp)
-                        put("source", event.source.name)
-                        put("oldLevel", event.oldLevel.name)
-                        put("newLevel", event.newLevel.name)
-                        put("temperatureC", event.temperatureC)
-                        put("actions", JSONArray().apply {
-                            event.actionsTriggered.forEach { put(it.name) }
-                        })
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/thermal/battery - Get battery bypass status
-     */
-    private fun getBatteryBypassStatus(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        val status = thermal.status.value
-
-        val json = JSONObject().apply {
-            put("batteryPercent", status.batteryPercent)
-            put("batteryTemperatureC", status.batteryTemperatureC)
-            put("isCharging", status.isCharging)
-            put("chargingDisabled", status.chargingDisabled)
-            put("batteryLevel", status.batteryLevel.name)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/thermal/battery/disable - Disable battery charging
-     */
-    private fun disableBatteryCharging(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        // Note: The thermal governor handles this via its battery bypass integration
-        // This is a manual override
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Charging disabled (manual override)"}"""
-        )
-    }
-
-    /**
-     * POST /api/thermal/battery/enable - Enable battery charging
-     */
-    private fun enableBatteryCharging(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return thermalServiceUnavailable()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Charging enabled"}"""
-        )
-    }
-
-    // ==================== Kiosk Mode ====================
-
-    /**
-     * GET /api/kiosk/status - Get kiosk mode status
-     */
-    private fun getKioskStatus(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        val status = kiosk.getStatus()
-
-        val json = JSONObject().apply {
-            put("state", status.state.name)
-            put("isDeviceOwner", status.isDeviceOwner)
-            put("isLockTaskActive", status.isLockTaskActive)
-            put("isScreenLocked", status.isScreenLocked)
-            put("uptimeMs", status.uptimeMs)
-            put("lastRestartTime", status.lastRestartTime)
-            put("restartCount", status.restartCount)
-            put("kioskEnabled", status.config.enabled)
-            put("autoStartEnabled", status.config.autoStart.enabled)
-            put("screenMode", status.config.screen.mode.name)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/kiosk/enable - Enable kiosk mode
-     * Note: Requires activity context, returns instructions
-     */
-    private fun enableKiosk(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        // Check if device owner
-        if (!kiosk.isDeviceOwner()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"success": false, "error": "Device Owner not set. Run: adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver"}"""
-            )
-        }
-
-        // Kiosk enable requires activity context
-        // Return instructions for enabling via the app
-        val json = JSONObject().apply {
-            put("success", true)
-            put("message", "Kiosk mode will be enabled. Restart app or use the dashboard to activate.")
-            put("note", "Full kiosk activation requires activity context")
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/kiosk/disable - Disable kiosk mode
-     */
-    private fun disableKiosk(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        // Update config to disable
-        val newConfig = kiosk.getConfig().copy(enabled = false)
-        kiosk.updateConfig(newConfig)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Kiosk mode disabled in config. Restart app to fully exit."}"""
-        )
-    }
-
-    /**
-     * GET /api/kiosk/config - Get kiosk configuration
-     */
-    private fun getKioskConfig(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        val config = kiosk.getConfig()
-
-        val json = JSONObject().apply {
-            put("enabled", config.enabled)
-
-            put("autoStart", JSONObject().apply {
-                put("enabled", config.autoStart.enabled)
-                put("delaySeconds", config.autoStart.delaySeconds)
-                put("startStreaming", config.autoStart.startStreaming)
-                put("startRtsp", config.autoStart.startRtsp)
-                put("startRecording", config.autoStart.startRecording)
-            })
-
-            put("screen", JSONObject().apply {
-                put("mode", config.screen.mode.name)
-                put("dimBrightness", config.screen.dimBrightness)
-                put("autoOffTimeoutSec", config.screen.autoOffTimeoutSec)
-                put("wakeOnMotion", config.screen.wakeOnMotion)
-                put("keepScreenOn", config.screen.keepScreenOn)
-            })
-
-            put("security", JSONObject().apply {
-                put("exitPinSet", config.security.exitPin.isNotEmpty())
-                put("allowedExitGesture", config.security.allowedExitGesture)
-                put("exitGestureTimeoutMs", config.security.exitGestureTimeoutMs)
-                put("lockStatusBar", config.security.lockStatusBar)
-                put("lockNavigationBar", config.security.lockNavigationBar)
-                put("lockNotifications", config.security.lockNotifications)
-                put("blockScreenshots", config.security.blockScreenshots)
-            })
-
-            put("networkRecovery", JSONObject().apply {
-                put("autoReconnect", config.networkRecovery.autoReconnect)
-                put("reconnectIntervalSec", config.networkRecovery.reconnectIntervalSec)
-                put("maxReconnectAttempts", config.networkRecovery.maxReconnectAttempts)
-                put("restartStreamOnReconnect", config.networkRecovery.restartStreamOnReconnect)
-            })
-
-            put("crashRecovery", JSONObject().apply {
-                put("autoRestart", config.crashRecovery.autoRestart)
-                put("restartDelayMs", config.crashRecovery.restartDelayMs)
-                put("maxRestartAttempts", config.crashRecovery.maxRestartAttempts)
-                put("restartWindowMinutes", config.crashRecovery.restartWindowMinutes)
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * PUT /api/kiosk/config - Update kiosk configuration
-     */
-    private fun updateKioskConfig(body: JSONObject?): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val currentConfig = kiosk.getConfig()
-
-        // Parse autoStart config
-        val autoStartJson = body.optJSONObject("autoStart")
-        val autoStart = if (autoStartJson != null) {
-            AutoStartConfig(
-                enabled = autoStartJson.optBoolean("enabled", currentConfig.autoStart.enabled),
-                delaySeconds = autoStartJson.optInt("delaySeconds", currentConfig.autoStart.delaySeconds),
-                startStreaming = autoStartJson.optBoolean("startStreaming", currentConfig.autoStart.startStreaming),
-                startRtsp = autoStartJson.optBoolean("startRtsp", currentConfig.autoStart.startRtsp),
-                startRecording = autoStartJson.optBoolean("startRecording", currentConfig.autoStart.startRecording)
-            )
-        } else currentConfig.autoStart
-
-        // Parse screen config
-        val screenJson = body.optJSONObject("screen")
-        val screen = if (screenJson != null) {
-            val modeStr = screenJson.optString("mode", currentConfig.screen.mode.name)
-            val mode = try { ScreenMode.valueOf(modeStr) } catch (e: Exception) { currentConfig.screen.mode }
-            ScreenConfig(
-                mode = mode,
-                dimBrightness = screenJson.optInt("dimBrightness", currentConfig.screen.dimBrightness),
-                autoOffTimeoutSec = screenJson.optInt("autoOffTimeoutSec", currentConfig.screen.autoOffTimeoutSec),
-                wakeOnMotion = screenJson.optBoolean("wakeOnMotion", currentConfig.screen.wakeOnMotion),
-                keepScreenOn = screenJson.optBoolean("keepScreenOn", currentConfig.screen.keepScreenOn)
-            )
-        } else currentConfig.screen
-
-        // Parse security config
-        val securityJson = body.optJSONObject("security")
-        val security = if (securityJson != null) {
-            SecurityConfig(
-                exitPin = securityJson.optString("exitPin", currentConfig.security.exitPin),
-                allowedExitGesture = securityJson.optBoolean("allowedExitGesture", currentConfig.security.allowedExitGesture),
-                exitGestureTimeoutMs = securityJson.optLong("exitGestureTimeoutMs", currentConfig.security.exitGestureTimeoutMs),
-                lockStatusBar = securityJson.optBoolean("lockStatusBar", currentConfig.security.lockStatusBar),
-                lockNavigationBar = securityJson.optBoolean("lockNavigationBar", currentConfig.security.lockNavigationBar),
-                lockNotifications = securityJson.optBoolean("lockNotifications", currentConfig.security.lockNotifications),
-                blockScreenshots = securityJson.optBoolean("blockScreenshots", currentConfig.security.blockScreenshots)
-            )
-        } else currentConfig.security
-
-        // Parse network recovery config
-        val networkJson = body.optJSONObject("networkRecovery")
-        val networkRecovery = if (networkJson != null) {
-            NetworkRecoveryConfig(
-                autoReconnect = networkJson.optBoolean("autoReconnect", currentConfig.networkRecovery.autoReconnect),
-                reconnectIntervalSec = networkJson.optInt("reconnectIntervalSec", currentConfig.networkRecovery.reconnectIntervalSec),
-                maxReconnectAttempts = networkJson.optInt("maxReconnectAttempts", currentConfig.networkRecovery.maxReconnectAttempts),
-                restartStreamOnReconnect = networkJson.optBoolean("restartStreamOnReconnect", currentConfig.networkRecovery.restartStreamOnReconnect)
-            )
-        } else currentConfig.networkRecovery
-
-        // Parse crash recovery config
-        val crashJson = body.optJSONObject("crashRecovery")
-        val crashRecovery = if (crashJson != null) {
-            CrashRecoveryConfig(
-                autoRestart = crashJson.optBoolean("autoRestart", currentConfig.crashRecovery.autoRestart),
-                restartDelayMs = crashJson.optLong("restartDelayMs", currentConfig.crashRecovery.restartDelayMs),
-                maxRestartAttempts = crashJson.optInt("maxRestartAttempts", currentConfig.crashRecovery.maxRestartAttempts),
-                restartWindowMinutes = crashJson.optInt("restartWindowMinutes", currentConfig.crashRecovery.restartWindowMinutes)
-            )
-        } else currentConfig.crashRecovery
-
-        val newConfig = KioskConfig(
-            enabled = body.optBoolean("enabled", currentConfig.enabled),
-            autoStart = autoStart,
-            screen = screen,
-            security = security,
-            networkRecovery = networkRecovery,
-            crashRecovery = crashRecovery
-        )
-
-        kiosk.updateConfig(newConfig)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Kiosk configuration updated"}"""
-        )
-    }
-
-    /**
-     * POST /api/kiosk/preset/appliance - Apply appliance preset
-     */
-    private fun applyAppliancePreset(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        kiosk.applyAppliancePreset()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Appliance preset applied (24/7 unattended operation)"}"""
-        )
-    }
-
-    /**
-     * POST /api/kiosk/preset/interactive - Apply interactive preset
-     */
-    private fun applyInteractivePreset(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        kiosk.applyInteractivePreset()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Interactive preset applied (kiosk with preview)"}"""
-        )
-    }
-
-    /**
-     * GET /api/kiosk/events - Get kiosk event log
-     */
-    private fun getKioskEvents(): NanoHTTPD.Response {
-        val kiosk = kioskManager ?: return kioskServiceUnavailable()
-
-        val events = kiosk.getEventLog()
-
-        val json = JSONObject().apply {
-            put("count", events.size)
-            put("events", JSONArray().apply {
-                events.forEach { event ->
-                    put(JSONObject().apply {
-                        put("timestamp", event.timestamp)
-                        put("type", event.type.name)
-                        put("message", event.message)
-                        put("details", JSONObject(event.details))
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    // ==================== AI Director ====================
-
-    /**
-     * GET /api/director/status - Get AI Director status
-     */
-    private fun getDirectorStatus(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val status = director.getStatus()
-
-        val json = JSONObject().apply {
-            put("state", status.state.name)
-            put("enabled", status.enabled)
-            put("inferenceMode", status.inferenceMode.name)
-            put("hasScript", status.hasScript)
-            put("currentScene", status.currentScene ?: "")
-            put("currentCue", status.currentCue ?: "")
-            put("nextCue", status.nextCue ?: "")
-            put("takeNumber", status.takeNumber)
-            put("totalCues", status.totalCues)
-            put("executedCues", status.executedCues)
-            put("thermalProtectionActive", status.thermalProtectionActive)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/director/enable - Enable AI Director
-     */
-    private fun enableDirector(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        director.enable()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "AI Director enabled", "state": "${director.state.value.name}"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/disable - Disable AI Director (returns to inert state)
-     */
-    private fun disableDirector(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        director.disable()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "AI Director disabled (inert)", "state": "DISABLED"}"""
-        )
-    }
-
-    /**
-     * GET /api/director/config - Get AI Director configuration
-     */
-    private fun getDirectorConfig(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val status = director.getStatus()
-
-        val json = JSONObject().apply {
-            put("enabled", status.enabled)
-            put("inferenceMode", status.inferenceMode.name)
-            put("thermalProtectionActive", status.thermalProtectionActive)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * PUT /api/director/config - Update AI Director configuration
-     */
-    private fun updateDirectorConfig(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val enabled = body.optBoolean("enabled", director.isEnabled())
-        val inferenceModeStr = body.optString("inferenceMode", "PRE_PARSED")
-        val inferenceMode = try {
-            InferenceMode.valueOf(inferenceModeStr.uppercase())
-        } catch (e: Exception) {
-            InferenceMode.PRE_PARSED
-        }
-
-        val config = DirectorConfig(
-            enabled = enabled,
-            inferenceMode = inferenceMode,
-            autoTakeSeparation = body.optBoolean("autoTakeSeparation", true),
-            qualityScoring = body.optBoolean("qualityScoring", true),
-            thermalAutoDisable = body.optBoolean("thermalAutoDisable", true),
-            thermalThresholdInference = body.optInt("thermalThresholdInference", 50),
-            thermalThresholdDisable = body.optInt("thermalThresholdDisable", 55),
-            defaultTransitionDurationMs = body.optLong("defaultTransitionDurationMs", 1000),
-            defaultHoldDurationMs = body.optLong("defaultHoldDurationMs", 2000)
-        )
-
-        director.updateConfig(config)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Director configuration updated"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/script - Load a script for AI Director
-     */
-    private fun loadDirectorScript(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val scriptText = body.optString("script", "")
-        if (scriptText.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "script field is required"}"""
-            )
-        }
-
-        val result = director.loadScript(scriptText)
-
-        return if (result.isSuccess) {
-            val script = result.getOrNull()!!
-            val json = JSONObject().apply {
-                put("success", true)
-                put("message", "Script loaded successfully")
-                put("scenes", script.scenes.size)
-                put("totalCues", script.totalCues)
-                put("estimatedDuration", script.estimatedDurationFormatted)
-                put("errors", JSONArray().apply {
-                    script.errors.forEach { put(it) }
-                })
-            }
-            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } else {
-            val error = result.exceptionOrNull()?.message ?: "Unknown error"
-            NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"success": false, "error": "$error"}"""
-            )
-        }
-    }
-
-    /**
-     * POST /api/director/start - Start script execution
-     */
-    private fun startDirector(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val success = director.startExecution()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Execution started" else "Cannot start - check state and script"}"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/stop - Stop script execution
-     */
-    private fun stopDirector(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        director.stopExecution()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Execution stopped", "state": "${director.state.value.name}"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/pause - Pause script execution
-     */
-    private fun pauseDirector(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        director.pauseExecution()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Execution paused", "state": "${director.state.value.name}"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/resume - Resume script execution
-     */
-    private fun resumeDirector(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val success = director.resumeExecution()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Execution resumed" else "Cannot resume - not paused"}"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/cue - Execute a single cue
-     */
-    private fun executeDirectorCue(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val cueText = body.optString("cue", "")
-        if (cueText.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "cue field is required"}"""
-            )
-        }
-
-        val success = director.executeCueText(cueText)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "cue": "$cueText"}"""
-        )
-    }
-
-    /**
-     * POST /api/director/advance - Advance to next cue
-     */
-    private fun advanceDirectorCue(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val nextCue = director.advanceCue()
-
-        val json = JSONObject().apply {
-            put("success", nextCue != null)
-            if (nextCue != null) {
-                put("cue", JSONObject().apply {
-                    put("type", nextCue.type.name)
-                    put("rawText", nextCue.rawText)
-                    put("lineNumber", nextCue.lineNumber)
-                })
-            } else {
-                put("message", "No more cues")
-            }
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/director/scene - Jump to specific scene
-     */
-    private fun jumpToScene(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val sceneIndex = body.optInt("sceneIndex", -1)
-        if (sceneIndex < 0) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "sceneIndex is required and must be >= 0"}"""
-            )
-        }
-
-        val success = director.jumpToScene(sceneIndex)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "sceneIndex": $sceneIndex}"""
-        )
-    }
-
-    /**
-     * GET /api/director/takes - Get all recorded takes
-     */
-    private fun getDirectorTakes(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val takeManager = director.getTakeManager()
-        val takes = takeManager.recordedTakes.value
-
-        val json = JSONObject().apply {
-            put("count", takes.size)
-            put("takes", JSONArray().apply {
-                takes.forEach { take ->
-                    put(JSONObject().apply {
-                        put("takeNumber", take.takeNumber)
-                        put("sceneId", take.sceneId)
-                        put("sceneLabel", take.sceneLabel)
-                        put("startTimeMs", take.startTimeMs)
-                        put("endTimeMs", take.endTimeMs)
-                        put("durationMs", take.durationMs)
-                        put("durationFormatted", take.durationFormatted)
-                        put("filePath", take.filePath ?: "")
-                        put("qualityScore", take.qualityScore)
-                        put("qualityFactors", JSONObject().apply {
-                            put("focusLockPercent", take.qualityFactors.focusLockPercent)
-                            put("exposureStability", take.qualityFactors.exposureStability)
-                            put("motionStability", take.qualityFactors.motionStability)
-                            put("audioLevelOk", take.qualityFactors.audioLevelOk)
-                            put("cueTimingAccuracy", take.qualityFactors.cueTimingAccuracy)
-                        })
-                        put("cuesExecuted", take.cuesExecuted)
-                        put("cuesFailed", take.cuesFailed)
-                        put("manualMark", take.manualMark.name)
-                        put("suggested", take.suggested)
-                        put("notes", take.notes)
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/director/takes/mark - Mark a take with quality
-     */
-    private fun markTake(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val takeNumber = body.optInt("takeNumber", -1)
-        val qualityStr = body.optString("quality", "")
-        val notes = body.optString("notes", "")
-
-        if (takeNumber < 0) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "takeNumber is required"}"""
-            )
-        }
-
-        val quality = try {
-            TakeQuality.valueOf(qualityStr.uppercase())
-        } catch (e: Exception) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Invalid quality. Use: UNMARKED, GOOD, BAD, CIRCLE, HOLD"}"""
-            )
-        }
-
-        val success = director.getTakeManager().markTake(takeNumber, quality, notes)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.NOT_FOUND,
-            WebServer.MIME_JSON,
-            """{"success": $success, "takeNumber": $takeNumber, "quality": "${quality.name}"}"""
-        )
-    }
-
-    /**
-     * GET /api/director/takes/best - Get best takes for each scene
-     */
-    private fun getBestTakes(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val takeManager = director.getTakeManager()
-        val bestTakes = takeManager.getAllBestTakes()
-
-        val json = JSONObject().apply {
-            put("count", bestTakes.size)
-            put("bestTakes", JSONObject().apply {
-                bestTakes.forEach { (sceneId, take) ->
-                    put(sceneId, JSONObject().apply {
-                        put("takeNumber", take.takeNumber)
-                        put("sceneLabel", take.sceneLabel)
-                        put("qualityScore", take.qualityScore)
-                        put("durationFormatted", take.durationFormatted)
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/director/takes/compare - Compare takes for current scene
-     */
-    private fun compareTakes(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val session = director.currentSession.value
-        if (session == null) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "No active session"}"""
-            )
-        }
-
-        val currentScene = session.currentScene
-        if (currentScene == null) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "No current scene"}"""
-            )
-        }
-
-        val comparison = director.getTakeManager().compareTakes(currentScene.id)
-
-        val json = JSONObject().apply {
-            put("sceneId", currentScene.id)
-            put("sceneLabel", currentScene.label)
-            put("recommendation", comparison.recommendation)
-            put("bestTake", if (comparison.bestTake != null) {
-                JSONObject().apply {
-                    put("takeNumber", comparison.bestTake.takeNumber)
-                    put("qualityScore", comparison.bestTake.qualityScore)
-                }
-            } else null)
-            put("rankings", JSONArray().apply {
-                comparison.rankings.forEach { (take, rank) ->
-                    put(JSONObject().apply {
-                        put("rank", rank)
-                        put("takeNumber", take.takeNumber)
-                        put("qualityScore", take.qualityScore)
-                    })
-                }
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/director/session - Get current director session info
-     */
-    private fun getDirectorSession(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        val session = director.currentSession.value
-        val takeManager = director.getTakeManager()
-        val stats = takeManager.getSessionStats()
-
-        val json = JSONObject().apply {
-            put("hasSession", session != null)
-            if (session != null) {
-                put("script", JSONObject().apply {
-                    put("scenes", session.script.scenes.size)
-                    put("totalCues", session.script.totalCues)
-                    put("estimatedDuration", session.script.estimatedDurationFormatted)
-                })
-                put("currentSceneIndex", session.currentSceneIndex)
-                put("currentCueIndex", session.currentCueIndex)
-                put("currentScene", session.currentScene?.label ?: "")
-                put("state", session.state.name)
-            }
-            put("stats", JSONObject().apply {
-                put("totalTakes", stats.totalTakes)
-                put("uniqueScenes", stats.uniqueScenes)
-                put("avgQualityScore", stats.avgQualityScore)
-                put("bestTakeCount", stats.bestTakeCount)
-                put("circledTakes", stats.circledTakes)
-                put("totalDuration", stats.totalDurationFormatted)
-                put("cueSuccessRate", stats.cueSuccessRate)
-            })
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * GET /api/director/events - Server-Sent Events for director state updates
-     */
-    private fun getDirectorEvents(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        // Create initial state event
-        val status = director.getStatus()
-        val initialEvent = JSONObject().apply {
-            put("type", "state")
-            put("enabled", status.enabled)
-            put("state", status.state.name)
-            put("currentScene", status.currentScene ?: "")
-            put("currentCue", status.currentCue ?: "")
-            put("currentTake", status.takeNumber)
-        }
-
-        // SSE format: "data: {json}\n\n"
-        val sseData = "data: ${initialEvent.toString()}\n\n"
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            "text/event-stream",
-            sseData
-        ).apply {
-            addHeader("Cache-Control", "no-cache")
-            addHeader("Connection", "keep-alive")
-            addHeader("Access-Control-Allow-Origin", "*")
-        }
-    }
-
-    /**
-     * POST /api/director/script/clear - Clear the loaded script
-     */
-    private fun clearDirectorScript(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        director.clearScript()
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "message": "Script cleared"}"""
-        )
-    }
-
-    // ==================== Script File Management ====================
-
-    /**
-     * GET /api/director/scripts - List saved script files
-     */
-    private fun listScriptFiles(): NanoHTTPD.Response {
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-        if (!scriptsDir.exists()) {
-            scriptsDir.mkdirs()
-        }
-
-        val scripts = scriptsDir.listFiles()?.mapNotNull { file ->
-            if (file.isFile && file.name.endsWith(".txt")) {
-                JSONObject().apply {
-                    put("name", file.nameWithoutExtension)
-                    put("fileName", file.name)
-                    put("sizeBytes", file.length())
-                    put("lastModified", file.lastModified())
-                }
-            } else null
-        } ?: emptyList()
-
-        val json = JSONObject().apply {
-            put("success", true)
-            put("count", scripts.size)
-            put("scripts", JSONArray(scripts))
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/director/scripts/save - Save script to file
-     */
-    private fun saveScriptFile(body: JSONObject?): NanoHTTPD.Response {
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val fileName = body.optString("fileName", "")
-        val scriptText = body.optString("script", "")
-
-        if (fileName.isEmpty() || scriptText.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "fileName and script are required"}"""
-            )
-        }
-
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-        scriptsDir.mkdirs()
-
-        val actualFileName = if (fileName.endsWith(".txt")) fileName else "$fileName.txt"
-        val file = java.io.File(scriptsDir, actualFileName)
-
-        return try {
-            file.writeText(scriptText)
-            NanoHTTPD.newFixedLengthResponse(
-                Status.OK,
-                WebServer.MIME_JSON,
-                """{"success": true, "fileName": "$actualFileName", "message": "Script saved"}"""
-            )
-        } catch (e: Exception) {
-            NanoHTTPD.newFixedLengthResponse(
-                Status.INTERNAL_ERROR,
-                WebServer.MIME_JSON,
-                """{"error": "Failed to save script: ${e.message}"}"""
-            )
-        }
-    }
-
-    /**
-     * GET /api/director/scripts/{fileName} - Load script file content
-     */
-    private fun loadScriptFile(uri: String): NanoHTTPD.Response {
-        val fileName = uri.removePrefix("/api/director/scripts/")
-        if (fileName.isEmpty() || fileName == "save" || fileName == "export" || fileName == "import") {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Invalid file name"}"""
-            )
-        }
-
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-        val file = java.io.File(scriptsDir, fileName)
-
-        if (!file.exists()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.NOT_FOUND,
-                WebServer.MIME_JSON,
-                """{"error": "Script file not found: $fileName"}"""
-            )
-        }
-
-        return try {
-            val content = file.readText()
-
-            // Optionally load into director
-            val director = directorManager
-            val loadResult = director?.loadScript(content)
-
-            val json = JSONObject().apply {
-                put("success", true)
-                put("fileName", fileName)
-                put("content", content)
-                put("loaded", loadResult?.isSuccess ?: false)
-                if (loadResult?.isSuccess == true) {
-                    val script = loadResult.getOrNull()!!
-                    put("scenes", script.scenes.size)
-                    put("totalCues", script.totalCues)
-                }
-            }
-
-            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } catch (e: Exception) {
-            NanoHTTPD.newFixedLengthResponse(
-                Status.INTERNAL_ERROR,
-                WebServer.MIME_JSON,
-                """{"error": "Failed to read script: ${e.message}"}"""
-            )
-        }
-    }
-
-    /**
-     * DELETE /api/director/scripts/{fileName} - Delete script file
-     */
-    private fun deleteScriptFile(uri: String): NanoHTTPD.Response {
-        val fileName = uri.removePrefix("/api/director/scripts/")
-        if (fileName.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "File name required"}"""
-            )
-        }
-
-        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-        val file = java.io.File(scriptsDir, fileName)
-
-        if (!file.exists()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.NOT_FOUND,
-                WebServer.MIME_JSON,
-                """{"error": "Script file not found"}"""
-            )
-        }
-
-        return if (file.delete()) {
-            NanoHTTPD.newFixedLengthResponse(
-                Status.OK,
-                WebServer.MIME_JSON,
-                """{"success": true, "message": "Script deleted"}"""
-            )
-        } else {
-            NanoHTTPD.newFixedLengthResponse(
-                Status.INTERNAL_ERROR,
-                WebServer.MIME_JSON,
-                """{"error": "Failed to delete script"}"""
-            )
-        }
-    }
-
-    /**
-     * GET /api/director/scripts/export - Export current script
-     */
-    private fun exportCurrentScript(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-        val session = director.currentSession.value
-
-        if (session == null) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.NOT_FOUND,
-                WebServer.MIME_JSON,
-                """{"error": "No script currently loaded"}"""
-            )
-        }
-
-        val json = JSONObject().apply {
-            put("success", true)
-            put("script", session.script.rawText)
-            put("scenes", session.script.scenes.size)
-            put("totalCues", session.script.totalCues)
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
-    /**
-     * POST /api/director/scripts/import - Import script text
-     */
-    private fun importScript(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val scriptText = body.optString("script", "")
-        val fileName = body.optString("fileName", "")
-        val saveToFile = body.optBoolean("save", false)
-
-        if (scriptText.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "script field is required"}"""
-            )
-        }
-
-        val result = director.loadScript(scriptText)
-
-        if (result.isSuccess && saveToFile && fileName.isNotEmpty()) {
-            val scriptsDir = java.io.File(context.filesDir, "director_scripts")
-            scriptsDir.mkdirs()
-            val actualFileName = if (fileName.endsWith(".txt")) fileName else "$fileName.txt"
-            java.io.File(scriptsDir, actualFileName).writeText(scriptText)
-        }
-
-        return if (result.isSuccess) {
-            val script = result.getOrNull()!!
-            val json = JSONObject().apply {
-                put("success", true)
-                put("message", "Script imported")
-                put("scenes", script.scenes.size)
-                put("totalCues", script.totalCues)
-                put("saved", saveToFile && fileName.isNotEmpty())
-            }
-            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } else {
-            val error = result.exceptionOrNull()?.message ?: "Unknown error"
-            NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"success": false, "error": "$error"}"""
-            )
-        }
-    }
-
-    // ==================== Take-Recording Linking ====================
-
-    /**
-     * POST /api/director/takes/link - Link take to recording file
-     */
-    private fun linkTakeToRecording(body: JSONObject?): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
-
-        val takeNumber = body.optInt("takeNumber", -1)
-        val filePath = body.optString("filePath", "")
-
-        if (takeNumber < 0 || filePath.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "takeNumber and filePath are required"}"""
-            )
-        }
-
-        director.getTakeManager().linkTakeToFile(takeNumber, filePath)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK,
-            WebServer.MIME_JSON,
-            """{"success": true, "takeNumber": $takeNumber, "filePath": "$filePath"}"""
-        )
-    }
-
-    /**
-     * GET /api/director/takes/markers - Get take markers for recording metadata
-     */
-    private fun getTakeMarkers(): NanoHTTPD.Response {
-        val director = directorManager ?: return directorServiceUnavailable()
-        val takeManager = director.getTakeManager()
-        val takes = takeManager.recordedTakes.value
-
-        // Generate markers from takes
-        val markers = mutableListOf<JSONObject>()
-
-        takes.forEach { take ->
-            // Start marker
-            markers.add(JSONObject().apply {
-                put("type", "TAKE_START")
-                put("takeNumber", take.takeNumber)
-                put("sceneId", take.sceneId)
-                put("sceneLabel", take.sceneLabel)
-                put("timestampMs", take.startTimeMs)
-            })
-
-            // End marker
-            if (take.endTimeMs > 0) {
-                markers.add(JSONObject().apply {
-                    put("type", "TAKE_END")
-                    put("takeNumber", take.takeNumber)
-                    put("sceneId", take.sceneId)
-                    put("timestampMs", take.endTimeMs)
-                    put("qualityScore", take.qualityScore)
-                    put("durationMs", take.durationMs)
-                })
-            }
-        }
-
-        val json = JSONObject().apply {
-            put("success", true)
-            put("count", markers.size)
-            put("markers", JSONArray(markers))
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-    }
-
     // ==================== Helpers ====================
-
-    private fun directorServiceUnavailable(): NanoHTTPD.Response {
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.SERVICE_UNAVAILABLE,
-            WebServer.MIME_JSON,
-            """{"error": "Director service not available"}"""
-        )
-    }
-
-    private fun kioskServiceUnavailable(): NanoHTTPD.Response {
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.SERVICE_UNAVAILABLE,
-            WebServer.MIME_JSON,
-            """{"error": "Kiosk service not available"}"""
-        )
-    }
-
-    private fun thermalServiceUnavailable(): NanoHTTPD.Response {
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.SERVICE_UNAVAILABLE,
-            WebServer.MIME_JSON,
-            """{"error": "Thermal service not available"}"""
-        )
-    }
-
-    private fun uploadServiceUnavailable(): NanoHTTPD.Response {
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.SERVICE_UNAVAILABLE,
-            WebServer.MIME_JSON,
-            """{"error": "Upload service not available"}"""
-        )
-    }
 
     private fun serviceUnavailable(): NanoHTTPD.Response {
         return NanoHTTPD.newFixedLengthResponse(

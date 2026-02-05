@@ -35,7 +35,7 @@ import java.io.File
  */
 class BatteryBypass(
     private val context: Context,
-    private val config: BatteryBypassConfig = BatteryBypassConfig()
+    private var config: BatteryBypassConfig = BatteryBypassConfig()
 ) {
     companion object {
         private const val TAG = "BatteryBypass"
@@ -122,6 +122,8 @@ class BatteryBypass(
         val isCharging: Boolean = false,
         val chargingBlocked: Boolean = false,
         val hasHardwareControl: Boolean = false,
+        val softwareOnly: Boolean = false,
+        val recommendation: String = "",
         val reason: String = ""
     )
 
@@ -373,11 +375,37 @@ class BatteryBypass(
                 Timber.tag(TAG).e(e, "Failed to control charging via sysfs")
             }
         } else {
-            // Software-only mode - just track state and notify
-            Timber.tag(TAG).d("Charging control (software): ${if (enabled) "enabled" else "disabled"}")
+            // Software-only mode - track state and generate recommendations
+            val action = if (enabled) "enabled" else "disabled"
+            Timber.tag(TAG).d("Charging control (software-only): $action")
+            if (!enabled && isCharging) {
+                Timber.tag(TAG).i("Software-only: charging should be $action but device is still charging. User action required.")
+            }
         }
 
         listeners.forEach { it.onChargingControlChanged(enabled) }
+    }
+
+    /**
+     * Generate recommendation based on current state for software-only mode
+     */
+    private fun generateRecommendation(): String {
+        if (hasHardwareControl) return ""
+
+        val state = _bypassState.value
+        return when {
+            state == BypassState.THERMAL_HOLD && isCharging ->
+                "Unplug charger to reduce battery temperature (${currentTempC}°C)"
+            state == BypassState.HOLDING && isCharging ->
+                "Unplug charger — battery at ${currentPercent}% (target: ${config.targetChargePercent}%)"
+            currentTempC >= config.maxBatteryTempC - 3f && isCharging ->
+                "Battery warming (${currentTempC}°C). Consider unplugging charger soon"
+            currentPercent >= config.targetChargePercent && isCharging ->
+                "Battery at ${currentPercent}%. Unplug charger to preserve battery health"
+            !isCharging && currentPercent <= config.resumeChargePercent ->
+                "Battery low (${currentPercent}%). Plug in charger"
+            else -> ""
+        }
     }
 
     /**
@@ -393,6 +421,8 @@ class BatteryBypass(
             isCharging = isCharging,
             chargingBlocked = !_chargingEnabled.value,
             hasHardwareControl = hasHardwareControl,
+            softwareOnly = !hasHardwareControl,
+            recommendation = generateRecommendation(),
             reason = reason
         )
 
@@ -405,10 +435,10 @@ class BatteryBypass(
     fun getStatus(): BatteryBypassStatus = _status.value
 
     /**
-     * Update configuration
+     * Update configuration (applied immediately on next evaluation cycle)
      */
     fun updateConfig(newConfig: BatteryBypassConfig) {
-        // Note: Would need to restart to apply new config
-        Timber.tag(TAG).d("Config update requested: $newConfig")
+        Timber.tag(TAG).d("Config updated: $newConfig")
+        config = newConfig
     }
 }

@@ -26,6 +26,9 @@ import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.RtspServer
 import com.lensdaemon.output.RtspServerState
 import com.lensdaemon.output.RtspServerStats
+import com.lensdaemon.output.SrtConfig
+import com.lensdaemon.output.SrtPublisher
+import com.lensdaemon.output.SrtStats
 import com.lensdaemon.output.RecordingEvent
 import com.lensdaemon.output.RecordingListener
 import com.lensdaemon.output.RecordingStats
@@ -53,6 +56,7 @@ class CameraService : Service() {
         private const val ACTION_START_STREAMING = "com.lensdaemon.action.START_STREAMING"
         private const val ACTION_STOP_STREAMING = "com.lensdaemon.action.STOP_STREAMING"
         private const val EXTRA_LENS_TYPE = "lens_type"
+        private const val DEFAULT_CPU_TEMP_FALLBACK = 40
 
         fun startPreviewIntent(context: Context, lensType: LensType = LensType.MAIN): Intent {
             return Intent(context, CameraService::class.java).apply {
@@ -124,6 +128,16 @@ class CameraService : Service() {
     // Frame listener for RTSP server
     private val rtspFrameListener: (EncodedFrame) -> Unit = { frame ->
         rtspServer?.sendFrame(frame)
+    }
+
+    // SRT publisher
+    private var srtPublisher: SrtPublisher? = null
+    private val _srtRunning = MutableStateFlow(false)
+    val srtRunning: StateFlow<Boolean> = _srtRunning
+
+    // Frame listener for SRT publisher
+    private val srtFrameListener: (EncodedFrame) -> Unit = { frame ->
+        srtPublisher?.sendFrame(frame)
     }
 
     private val encoderConnection = object : ServiceConnection {
@@ -1052,6 +1066,96 @@ class CameraService : Service() {
         Timber.i("RTSP streaming stopped")
     }
 
+    // ==================== SRT Publisher ====================
+
+    /**
+     * Start SRT publisher with given config.
+     */
+    fun startSrtPublisher(config: SrtConfig = SrtConfig()): Boolean {
+        if (srtPublisher?.isRunning() == true) {
+            Timber.w("SRT publisher already running")
+            return true
+        }
+
+        val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
+        srtPublisher = SrtPublisher(config, codec)
+
+        addEncodedFrameListener(srtFrameListener)
+
+        val success = srtPublisher?.start() ?: false
+        if (success) {
+            _srtRunning.value = true
+            Timber.i("SRT publisher started on port ${config.port}")
+        } else {
+            _srtRunning.value = false
+            removeEncodedFrameListener(srtFrameListener)
+            Timber.e("Failed to start SRT publisher")
+        }
+        return success
+    }
+
+    /**
+     * Stop SRT publisher.
+     */
+    fun stopSrtPublisher() {
+        removeEncodedFrameListener(srtFrameListener)
+        srtPublisher?.stop()
+        srtPublisher = null
+        _srtRunning.value = false
+        Timber.i("SRT publisher stopped")
+    }
+
+    /**
+     * Check if SRT publisher is running.
+     */
+    fun isSrtRunning(): Boolean = srtPublisher?.isRunning() ?: false
+
+    /**
+     * Get SRT publisher statistics.
+     */
+    fun getSrtStats(): SrtStats? = srtPublisher?.getStats()
+
+    /**
+     * Start SRT streaming (encoder + SRT publisher).
+     */
+    fun startSrtStreaming(
+        encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
+        srtConfig: SrtConfig = SrtConfig()
+    ): Boolean {
+        if (!isPreviewActive) {
+            Timber.w("Preview not active, starting with main lens")
+            startPreview(LensType.MAIN)
+        }
+
+        if (!initializeEncoder(encoderConfig)) {
+            Timber.e("Failed to initialize encoder for SRT")
+            return false
+        }
+
+        encoderService?.startEncoding()
+        isStreamingActive = true
+
+        val srtStarted = startSrtPublisher(srtConfig)
+        if (!srtStarted) {
+            Timber.e("Failed to start SRT publisher")
+            stopStreaming()
+            return false
+        }
+
+        updateNotification()
+        Timber.i("SRT streaming started on port ${srtConfig.port}")
+        return true
+    }
+
+    /**
+     * Stop SRT streaming.
+     */
+    fun stopSrtStreaming() {
+        stopSrtPublisher()
+        stopStreaming()
+        Timber.i("SRT streaming stopped")
+    }
+
     // ==================== Local Recording (Phase 7) ====================
 
     /**
@@ -1407,20 +1511,49 @@ class CameraService : Service() {
 
     /**
      * Get current CPU temperature for thermal monitoring.
+     * Uses device-agnostic discovery of thermal zones.
      */
     fun getCurrentCpuTemperature(): Int {
-        // Try to read CPU temperature from thermal zones
         return try {
-            val thermalFile = java.io.File("/sys/class/thermal/thermal_zone0/temp")
-            if (thermalFile.exists()) {
-                val temp = thermalFile.readText().trim().toIntOrNull() ?: 0
-                temp / 1000 // Convert from millidegrees to degrees
-            } else {
-                40 // Default fallback
+            // Discover all thermal zones dynamically
+            val thermalDir = java.io.File("/sys/class/thermal")
+            if (!thermalDir.exists()) return DEFAULT_CPU_TEMP_FALLBACK
+
+            val zones = thermalDir.listFiles()?.filter {
+                it.name.startsWith("thermal_zone")
+            } ?: return DEFAULT_CPU_TEMP_FALLBACK
+
+            // Try to find a CPU-specific zone by type
+            for (zone in zones) {
+                val typeFile = java.io.File(zone, "type")
+                val type = try { typeFile.readText().trim().lowercase() } catch (_: Exception) { continue }
+                if (type.contains("cpu") || type.contains("soc") || type.contains("tsens")) {
+                    readThermalZoneTemp(zone)?.let { return it }
+                }
             }
+
+            // Fallback: read first available zone
+            for (zone in zones) {
+                readThermalZoneTemp(zone)?.let { return it }
+            }
+
+            DEFAULT_CPU_TEMP_FALLBACK
         } catch (e: Exception) {
-            40 // Default fallback
+            DEFAULT_CPU_TEMP_FALLBACK
         }
     }
+
+    private fun readThermalZoneTemp(zoneDir: java.io.File): Int? {
+        return try {
+            val tempFile = java.io.File(zoneDir, "temp")
+            if (!tempFile.exists()) return null
+            val raw = tempFile.readText().trim().toIntOrNull() ?: return null
+            // Normalize: values > 1000 are in millidegrees
+            if (raw > 1000) raw / 1000 else raw
+        } catch (_: Exception) {
+            null
+        }
+    }
+
 }
 

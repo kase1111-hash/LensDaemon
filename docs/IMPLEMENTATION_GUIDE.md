@@ -9,13 +9,13 @@ A 10-phase roadmap for building LensDaemon in manageable, codable sections.
 **Goal:** Create the Android project skeleton with all required dependencies and permissions.
 
 **Deliverables:**
-- [ ] Gradle project structure (root + app module)
-- [ ] `settings.gradle.kts` and `build.gradle.kts` files
-- [ ] `AndroidManifest.xml` with all required permissions
-- [ ] `LensDaemonApp.kt` - Application class
-- [ ] `MainActivity.kt` - Main entry point with basic UI
-- [ ] `AdminReceiver.kt` - Device admin receiver stub
-- [ ] Base package structure for all modules
+- [x] Gradle project structure (root + app module)
+- [x] `settings.gradle.kts` and `build.gradle.kts` files
+- [x] `AndroidManifest.xml` with all required permissions
+- [x] `LensDaemonApp.kt` - Application class
+- [x] `MainActivity.kt` - Main entry point with basic UI
+- [x] `AdminReceiver.kt` - Device admin receiver stub
+- [x] Base package structure for all modules
 
 **Key Dependencies:**
 - Kotlin 1.9+
@@ -46,12 +46,12 @@ gradle.properties
 **Goal:** Establish the Camera2 capture pipeline with preview capability.
 
 **Deliverables:**
-- [ ] `CameraService.kt` - Foreground service for camera operations
-- [ ] Camera enumeration (list available cameras/lenses)
-- [ ] Camera session management (open/close/configure)
-- [ ] SurfaceView/TextureView for preview display
-- [ ] Basic frame callback infrastructure
-- [ ] Camera lifecycle handling (pause/resume)
+- [x] `CameraService.kt` - Foreground service for camera operations
+- [x] Camera enumeration (list available cameras/lenses)
+- [x] Camera session management (open/close/configure)
+- [x] SurfaceView/TextureView for preview display
+- [x] Basic frame callback infrastructure
+- [x] Camera lifecycle handling (pause/resume)
 
 **Key APIs:**
 - `CameraManager`, `CameraDevice`, `CameraCaptureSession`
@@ -74,13 +74,13 @@ camera/
 **Goal:** Full camera control including multi-lens switching and manual parameters.
 
 **Deliverables:**
-- [ ] `LensController.kt` - Multi-lens detection and switching
-- [ ] Camera capability detection (zoom ranges, OIS, etc.)
-- [ ] Zoom control (optical + digital)
-- [ ] Focus control (auto/manual/tap-to-focus)
-- [ ] Exposure compensation control
-- [ ] White balance control
-- [ ] Lens switch without stream interruption
+- [x] `LensController.kt` - Multi-lens detection and switching
+- [x] Camera capability detection (zoom ranges, OIS, etc.)
+- [x] Zoom control (optical + digital)
+- [x] Focus control (auto/manual/tap-to-focus)
+- [x] Exposure compensation control
+- [x] White balance control
+- [x] Lens switch without stream interruption
 
 **Key APIs:**
 - `CameraCharacteristics` for capability queries
@@ -103,13 +103,13 @@ camera/
 **Goal:** Encode camera frames to H.264/H.265 using hardware MediaCodec.
 
 **Deliverables:**
-- [ ] `EncoderService.kt` - MediaCodec-based encoder
-- [ ] `FrameProcessor.kt` - Camera → Encoder bridge
-- [ ] H.264 baseline profile encoding
-- [ ] H.265 encoding (device-dependent)
-- [ ] Configurable resolution/bitrate/framerate
-- [ ] Keyframe interval control
-- [ ] NAL unit extraction for streaming
+- [x] `EncoderService.kt` - MediaCodec-based encoder
+- [x] `FrameProcessor.kt` - Camera → Encoder bridge
+- [x] H.264 baseline profile encoding
+- [x] H.265 encoding (device-dependent)
+- [x] Configurable resolution/bitrate/framerate
+- [x] Keyframe interval control
+- [x] NAL unit extraction for streaming
 
 **Key APIs:**
 - `MediaCodec` (encoder mode)
@@ -133,13 +133,13 @@ encoder/
 **Goal:** Serve encoded video stream over RTSP protocol.
 
 **Deliverables:**
-- [ ] `RtspServer.kt` - RTSP protocol implementation
-- [ ] RTSP session handling (DESCRIBE, SETUP, PLAY, TEARDOWN)
-- [ ] SDP generation for stream description
-- [ ] RTP packetization for H.264/H.265
-- [ ] Multi-client support
-- [ ] RTSP interleaved (TCP) and UDP modes
-- [ ] Connection timeout handling
+- [x] `RtspServer.kt` - RTSP protocol implementation
+- [x] RTSP session handling (DESCRIBE, SETUP, PLAY, TEARDOWN)
+- [x] SDP generation for stream description
+- [x] RTP packetization for H.264/H.265
+- [x] Multi-client support
+- [x] RTSP interleaved (TCP) and UDP modes
+- [x] Connection timeout handling
 
 **Protocol Details:**
 - Port: 8554
@@ -163,15 +163,15 @@ output/
 **Goal:** HTTP-based control interface with live preview and REST API.
 
 **Deliverables:**
-- [ ] `WebServer.kt` - NanoHTTPD-based HTTP server
-- [ ] `ApiRoutes.kt` - REST endpoint handlers
-- [ ] `/api/status` - Device and stream status
-- [ ] `/api/stream/start|stop` - Stream control
-- [ ] `/api/lens/{lens}` - Lens control
-- [ ] `/api/config` - Configuration get/set
-- [ ] `/api/snapshot` - JPEG snapshot capture
-- [ ] MJPEG live preview endpoint
-- [ ] Dashboard HTML/CSS/JS (single-page app)
+- [x] `WebServer.kt` - NanoHTTPD-based HTTP server
+- [x] `ApiRoutes.kt` - REST endpoint handlers
+- [x] `/api/status` - Device and stream status
+- [x] `/api/stream/start|stop` - Stream control
+- [x] `/api/lens/{lens}` - Lens control
+- [x] `/api/config` - Configuration get/set
+- [x] `/api/snapshot` - JPEG snapshot capture
+- [x] MJPEG live preview endpoint
+- [x] Dashboard HTML/CSS/JS (single-page app)
 
 **Web Interface Features:**
 - Live MJPEG preview
@@ -199,13 +199,13 @@ web/
 **Goal:** Record video to local MP4 files with segmentation.
 
 **Deliverables:**
-- [ ] `FileWriter.kt` - MP4 muxer for local recording
-- [ ] `StorageManager.kt` - Storage coordination
-- [ ] Configurable segment duration (1/5/15/60 min)
-- [ ] Filename pattern: `LensDaemon_{device}_{timestamp}.mp4`
-- [ ] Disk space monitoring
-- [ ] Retention policy (max age/size)
-- [ ] Recording state management (start/stop/pause)
+- [x] `FileWriter.kt` - MP4 muxer for local recording
+- [x] `StorageManager.kt` - Storage coordination
+- [x] Configurable segment duration (1/5/15/60 min)
+- [x] Filename pattern: `LensDaemon_{device}_{timestamp}.mp4`
+- [x] Disk space monitoring
+- [x] Retention policy (max age/size)
+- [x] Recording state management (start/stop/pause)
 
 **Key APIs:**
 - `MediaMuxer` for MP4 container
@@ -229,14 +229,14 @@ storage/
 **Goal:** Upload recordings to network shares and cloud storage.
 
 **Deliverables:**
-- [ ] `SmbClient.kt` - SMB/CIFS share client
-- [ ] `S3Client.kt` - S3-compatible upload client
-- [ ] Background upload service
-- [ ] Upload queue with retry logic
-- [ ] Network failure buffering
-- [ ] Multipart upload for large files
-- [ ] Credential storage (encrypted)
-- [ ] Upload progress reporting
+- [x] `SmbClient.kt` - SMB/CIFS share client
+- [x] `S3Client.kt` - S3-compatible upload client
+- [x] Background upload service
+- [x] Upload queue with retry logic
+- [x] Network failure buffering
+- [x] Multipart upload for large files
+- [x] Credential storage (encrypted)
+- [x] Upload progress reporting
 
 **Supported Backends:**
 - SMB/NFS network shares
@@ -259,14 +259,14 @@ storage/
 **Goal:** Monitor device thermals and implement protective measures.
 
 **Deliverables:**
-- [ ] `ThermalMonitor.kt` - CPU/battery temperature reading
-- [ ] `ThermalGovernor.kt` - Automatic throttling logic
-- [ ] `BatteryBypass.kt` - Charge limiting for longevity
-- [ ] `AdaptiveBitrate.kt` - Dynamic bitrate adjustment
-- [ ] Thermal history logging (24-hour)
-- [ ] Dashboard thermal display
-- [ ] Configurable thresholds
-- [ ] Emergency shutdown protection
+- [x] `ThermalMonitor.kt` - CPU/battery temperature reading
+- [x] `ThermalGovernor.kt` - Automatic throttling logic
+- [x] `BatteryBypass.kt` - Charge limiting for longevity
+- [x] `AdaptiveBitrate.kt` - Dynamic bitrate adjustment
+- [x] Thermal history logging (24-hour)
+- [x] Dashboard thermal display
+- [x] Configurable thresholds
+- [x] Emergency shutdown protection
 
 **Thermal Thresholds:**
 - CPU > 45°C → Reduce bitrate 20%
@@ -294,14 +294,14 @@ encoder/
 **Goal:** Lock device to single-purpose appliance mode with boot persistence.
 
 **Deliverables:**
-- [ ] `KioskManager.kt` - Device Owner API integration
-- [ ] `BootReceiver.kt` - Auto-start on boot
-- [ ] Lock task mode (no home/recent escape)
-- [ ] Status bar/navigation bar hiding
-- [ ] Physical button override (Vol+Vol+Power)
-- [ ] Screen control (off/dim/preview)
-- [ ] Crash recovery and auto-restart
-- [ ] Network reconnection handling
+- [x] `KioskManager.kt` - Device Owner API integration
+- [x] `BootReceiver.kt` - Auto-start on boot
+- [x] Lock task mode (no home/recent escape)
+- [x] Status bar/navigation bar hiding
+- [x] Physical button override (Vol+Vol+Power)
+- [x] Screen control (off/dim/preview)
+- [x] Crash recovery and auto-restart
+- [x] Network reconnection handling
 - [ ] Setup wizard for initial configuration
 
 **Device Owner Setup:**
