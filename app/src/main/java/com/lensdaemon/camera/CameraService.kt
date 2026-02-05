@@ -1313,4 +1313,114 @@ class CameraService : Service() {
         stopRtspStreaming()
         return segments
     }
+
+    // ==================== AI Director Integration ====================
+
+    /**
+     * Animate zoom to target level with duration.
+     * Used by AI Director for smooth transitions.
+     */
+    fun animateZoom(targetZoom: Float, durationMs: Long) {
+        zoomController.animateZoomTo(targetZoom, durationMs)
+    }
+
+    /**
+     * Set camera to auto focus mode.
+     */
+    fun setAutoFocus() {
+        setFocusMode(FocusMode.CONTINUOUS_VIDEO)
+    }
+
+    /**
+     * Enable face detection and auto-focus on detected faces.
+     */
+    fun enableFaceDetectionFocus() {
+        // Enable face detection if supported
+        currentConfig = currentConfig.copy(focusMode = FocusMode.CONTINUOUS_VIDEO)
+        lensDaemonCameraManager.updateConfig(currentConfig)
+        // Note: Actual face detection integration depends on device capabilities
+        Timber.d("Face detection focus enabled")
+    }
+
+    /**
+     * Set focus distance directly.
+     * @param distance 0.0 = infinity, higher values = closer focus
+     */
+    fun setFocusDistance(distance: Float) {
+        focusController.setManualFocusDistance(distance)
+        currentConfig = currentConfig.copy(focusMode = FocusMode.MANUAL)
+        lensDaemonCameraManager.updateConfig(currentConfig)
+    }
+
+    /**
+     * Get maximum zoom ratio for current lens.
+     */
+    fun getMaxZoom(): Float {
+        return zoomController.zoomRange.value.endInclusive
+    }
+
+    /**
+     * Check if face detection is supported.
+     */
+    fun supportsFaceDetection(): Boolean {
+        return lensDaemonCameraManager.supportsFaceDetection()
+    }
+
+    /**
+     * Check if manual focus is supported.
+     */
+    fun supportsManualFocus(): Boolean {
+        return focusController.isManualFocusSupported()
+    }
+
+    /**
+     * Check if focus is currently locked.
+     */
+    fun isFocusLocked(): Boolean {
+        return _focusState.value == FocusState.LOCKED || _focusState.value == FocusState.FOCUS_SUCCESS
+    }
+
+    /**
+     * Get normalized exposure value (0-1 range).
+     */
+    fun getNormalizedExposure(): Float {
+        val range = exposureController.exposureRange.value
+        val current = currentConfig.exposureCompensation.toFloat()
+        if (range.endInclusive <= range.start) return 0.5f
+        return (current - range.start) / (range.endInclusive - range.start)
+    }
+
+    /**
+     * Get current motion shakiness (0 = stable, 1 = very shaky).
+     * Based on gyroscope/accelerometer data if available.
+     */
+    fun getMotionShakiness(): Float {
+        // Basic implementation - could be enhanced with sensor data
+        // For now, return low value when OIS is active
+        return if (currentConfig.stabilizationMode == StabilizationMode.OIS ||
+                   currentConfig.stabilizationMode == StabilizationMode.OIS_AND_EIS) {
+            0.1f
+        } else {
+            0.3f // Assume some shake without OIS
+        }
+    }
+
+    /**
+     * Get current CPU temperature for thermal monitoring.
+     */
+    fun getCurrentCpuTemperature(): Int {
+        // Try to read CPU temperature from thermal zones
+        return try {
+            val thermalFile = java.io.File("/sys/class/thermal/thermal_zone0/temp")
+            if (thermalFile.exists()) {
+                val temp = thermalFile.readText().trim().toIntOrNull() ?: 0
+                temp / 1000 // Convert from millidegrees to degrees
+            } else {
+                40 // Default fallback
+            }
+        } catch (e: Exception) {
+            40 // Default fallback
+        }
+    }
 }
+

@@ -25,6 +25,11 @@ import com.lensdaemon.kiosk.ScreenConfig
 import com.lensdaemon.kiosk.SecurityConfig
 import com.lensdaemon.kiosk.NetworkRecoveryConfig
 import com.lensdaemon.kiosk.CrashRecoveryConfig
+import com.lensdaemon.director.DirectorManager
+import com.lensdaemon.director.DirectorConfig
+import com.lensdaemon.director.DirectorState
+import com.lensdaemon.director.InferenceMode
+import com.lensdaemon.director.TakeQuality
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.runBlocking
 import fi.iki.elonen.NanoHTTPD.Response.Status
@@ -54,6 +59,9 @@ class ApiRoutes(
 
     // Kiosk manager reference (set by WebServerService)
     var kioskManager: KioskManager? = null
+
+    // Director manager reference (set by WebServerService)
+    var directorManager: DirectorManager? = null
 
     // Snapshot callback
     var onSnapshotRequest: (() -> ByteArray?)? = null
@@ -161,6 +169,28 @@ class ApiRoutes(
             uri == "/api/kiosk/preset/interactive" && method == NanoHTTPD.Method.POST -> applyInteractivePreset()
             uri == "/api/kiosk/events" && method == NanoHTTPD.Method.GET -> getKioskEvents()
 
+            // AI Director
+            uri == "/api/director/status" && method == NanoHTTPD.Method.GET -> getDirectorStatus()
+            uri == "/api/director/enable" && method == NanoHTTPD.Method.POST -> enableDirector()
+            uri == "/api/director/disable" && method == NanoHTTPD.Method.POST -> disableDirector()
+            uri == "/api/director/config" && method == NanoHTTPD.Method.GET -> getDirectorConfig()
+            uri == "/api/director/config" && method == NanoHTTPD.Method.PUT -> updateDirectorConfig(body)
+            uri == "/api/director/script" && method == NanoHTTPD.Method.POST -> loadDirectorScript(body)
+            uri == "/api/director/start" && method == NanoHTTPD.Method.POST -> startDirector()
+            uri == "/api/director/stop" && method == NanoHTTPD.Method.POST -> stopDirector()
+            uri == "/api/director/pause" && method == NanoHTTPD.Method.POST -> pauseDirector()
+            uri == "/api/director/resume" && method == NanoHTTPD.Method.POST -> resumeDirector()
+            uri == "/api/director/cue" && method == NanoHTTPD.Method.POST -> executeDirectorCue(body)
+            uri == "/api/director/advance" && method == NanoHTTPD.Method.POST -> advanceDirectorCue()
+            uri == "/api/director/scene" && method == NanoHTTPD.Method.POST -> jumpToScene(body)
+            uri == "/api/director/takes" && method == NanoHTTPD.Method.GET -> getDirectorTakes()
+            uri == "/api/director/takes/mark" && method == NanoHTTPD.Method.POST -> markTake(body)
+            uri == "/api/director/takes/best" && method == NanoHTTPD.Method.GET -> getBestTakes()
+            uri == "/api/director/takes/compare" && method == NanoHTTPD.Method.GET -> compareTakes()
+            uri == "/api/director/session" && method == NanoHTTPD.Method.GET -> getDirectorSession()
+            uri == "/api/director/events" && method == NanoHTTPD.Method.GET -> getDirectorEvents()
+            uri == "/api/director/script/clear" && method == NanoHTTPD.Method.POST -> clearDirectorScript()
+
             // Not found
             else -> NanoHTTPD.newFixedLengthResponse(
                 Status.NOT_FOUND,
@@ -224,6 +254,30 @@ class ApiRoutes(
                 put("clients", camera?.getRtspClientCount() ?: 0)
                 put("playing", camera?.getRtspPlayingCount() ?: 0)
             })
+
+            // Director status
+            directorManager?.let { director ->
+                put("director", JSONObject().apply {
+                    val status = director.getStatus()
+                    put("enabled", status.enabled)
+                    put("state", status.state.name)
+                    put("currentScene", status.currentScene ?: "")
+                    put("currentCue", status.currentCue ?: "")
+                    put("currentTake", status.takeNumber)
+                    put("stats", JSONObject().apply {
+                        val takeManager = director.getTakeManager()
+                        val takes = takeManager.recordedTakes.value
+                        val goodTakes = takes.count { it.qualityScore >= 7.0f }
+                        val avgScore = if (takes.isNotEmpty()) {
+                            takes.map { it.qualityScore }.average().toFloat()
+                        } else 0f
+                        put("totalTakes", takes.size)
+                        put("goodTakes", goodTakes)
+                        put("averageScore", avgScore)
+                        put("sessionTime", director.getSessionDuration())
+                    })
+                })
+            }
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -1822,7 +1876,565 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    // ==================== AI Director ====================
+
+    /**
+     * GET /api/director/status - Get AI Director status
+     */
+    private fun getDirectorStatus(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val status = director.getStatus()
+
+        val json = JSONObject().apply {
+            put("state", status.state.name)
+            put("enabled", status.enabled)
+            put("inferenceMode", status.inferenceMode.name)
+            put("hasScript", status.hasScript)
+            put("currentScene", status.currentScene ?: "")
+            put("currentCue", status.currentCue ?: "")
+            put("nextCue", status.nextCue ?: "")
+            put("takeNumber", status.takeNumber)
+            put("totalCues", status.totalCues)
+            put("executedCues", status.executedCues)
+            put("thermalProtectionActive", status.thermalProtectionActive)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/director/enable - Enable AI Director
+     */
+    private fun enableDirector(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        director.enable()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "AI Director enabled", "state": "${director.state.value.name}"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/disable - Disable AI Director (returns to inert state)
+     */
+    private fun disableDirector(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        director.disable()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "AI Director disabled (inert)", "state": "DISABLED"}"""
+        )
+    }
+
+    /**
+     * GET /api/director/config - Get AI Director configuration
+     */
+    private fun getDirectorConfig(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val status = director.getStatus()
+
+        val json = JSONObject().apply {
+            put("enabled", status.enabled)
+            put("inferenceMode", status.inferenceMode.name)
+            put("thermalProtectionActive", status.thermalProtectionActive)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * PUT /api/director/config - Update AI Director configuration
+     */
+    private fun updateDirectorConfig(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val enabled = body.optBoolean("enabled", director.isEnabled())
+        val inferenceModeStr = body.optString("inferenceMode", "PRE_PARSED")
+        val inferenceMode = try {
+            InferenceMode.valueOf(inferenceModeStr.uppercase())
+        } catch (e: Exception) {
+            InferenceMode.PRE_PARSED
+        }
+
+        val config = DirectorConfig(
+            enabled = enabled,
+            inferenceMode = inferenceMode,
+            autoTakeSeparation = body.optBoolean("autoTakeSeparation", true),
+            qualityScoring = body.optBoolean("qualityScoring", true),
+            thermalAutoDisable = body.optBoolean("thermalAutoDisable", true),
+            thermalThresholdInference = body.optInt("thermalThresholdInference", 50),
+            thermalThresholdDisable = body.optInt("thermalThresholdDisable", 55),
+            defaultTransitionDurationMs = body.optLong("defaultTransitionDurationMs", 1000),
+            defaultHoldDurationMs = body.optLong("defaultHoldDurationMs", 2000)
+        )
+
+        director.updateConfig(config)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Director configuration updated"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/script - Load a script for AI Director
+     */
+    private fun loadDirectorScript(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val scriptText = body.optString("script", "")
+        if (scriptText.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "script field is required"}"""
+            )
+        }
+
+        val result = director.loadScript(scriptText)
+
+        return if (result.isSuccess) {
+            val script = result.getOrNull()!!
+            val json = JSONObject().apply {
+                put("success", true)
+                put("message", "Script loaded successfully")
+                put("scenes", script.scenes.size)
+                put("totalCues", script.totalCues)
+                put("estimatedDuration", script.estimatedDurationFormatted)
+                put("errors", JSONArray().apply {
+                    script.errors.forEach { put(it) }
+                })
+            }
+            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        } else {
+            val error = result.exceptionOrNull()?.message ?: "Unknown error"
+            NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"success": false, "error": "$error"}"""
+            )
+        }
+    }
+
+    /**
+     * POST /api/director/start - Start script execution
+     */
+    private fun startDirector(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val success = director.startExecution()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"success": $success, "message": "${if (success) "Execution started" else "Cannot start - check state and script"}"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/stop - Stop script execution
+     */
+    private fun stopDirector(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        director.stopExecution()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Execution stopped", "state": "${director.state.value.name}"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/pause - Pause script execution
+     */
+    private fun pauseDirector(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        director.pauseExecution()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Execution paused", "state": "${director.state.value.name}"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/resume - Resume script execution
+     */
+    private fun resumeDirector(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val success = director.resumeExecution()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"success": $success, "message": "${if (success) "Execution resumed" else "Cannot resume - not paused"}"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/cue - Execute a single cue
+     */
+    private fun executeDirectorCue(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val cueText = body.optString("cue", "")
+        if (cueText.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "cue field is required"}"""
+            )
+        }
+
+        val success = director.executeCueText(cueText)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"success": $success, "cue": "$cueText"}"""
+        )
+    }
+
+    /**
+     * POST /api/director/advance - Advance to next cue
+     */
+    private fun advanceDirectorCue(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val nextCue = director.advanceCue()
+
+        val json = JSONObject().apply {
+            put("success", nextCue != null)
+            if (nextCue != null) {
+                put("cue", JSONObject().apply {
+                    put("type", nextCue.type.name)
+                    put("rawText", nextCue.rawText)
+                    put("lineNumber", nextCue.lineNumber)
+                })
+            } else {
+                put("message", "No more cues")
+            }
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/director/scene - Jump to specific scene
+     */
+    private fun jumpToScene(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val sceneIndex = body.optInt("sceneIndex", -1)
+        if (sceneIndex < 0) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "sceneIndex is required and must be >= 0"}"""
+            )
+        }
+
+        val success = director.jumpToScene(sceneIndex)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"success": $success, "sceneIndex": $sceneIndex}"""
+        )
+    }
+
+    /**
+     * GET /api/director/takes - Get all recorded takes
+     */
+    private fun getDirectorTakes(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val takeManager = director.getTakeManager()
+        val takes = takeManager.recordedTakes.value
+
+        val json = JSONObject().apply {
+            put("count", takes.size)
+            put("takes", JSONArray().apply {
+                takes.forEach { take ->
+                    put(JSONObject().apply {
+                        put("takeNumber", take.takeNumber)
+                        put("sceneId", take.sceneId)
+                        put("sceneLabel", take.sceneLabel)
+                        put("startTimeMs", take.startTimeMs)
+                        put("endTimeMs", take.endTimeMs)
+                        put("durationMs", take.durationMs)
+                        put("durationFormatted", take.durationFormatted)
+                        put("filePath", take.filePath ?: "")
+                        put("qualityScore", take.qualityScore)
+                        put("qualityFactors", JSONObject().apply {
+                            put("focusLockPercent", take.qualityFactors.focusLockPercent)
+                            put("exposureStability", take.qualityFactors.exposureStability)
+                            put("motionStability", take.qualityFactors.motionStability)
+                            put("audioLevelOk", take.qualityFactors.audioLevelOk)
+                            put("cueTimingAccuracy", take.qualityFactors.cueTimingAccuracy)
+                        })
+                        put("cuesExecuted", take.cuesExecuted)
+                        put("cuesFailed", take.cuesFailed)
+                        put("manualMark", take.manualMark.name)
+                        put("suggested", take.suggested)
+                        put("notes", take.notes)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/director/takes/mark - Mark a take with quality
+     */
+    private fun markTake(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val takeNumber = body.optInt("takeNumber", -1)
+        val qualityStr = body.optString("quality", "")
+        val notes = body.optString("notes", "")
+
+        if (takeNumber < 0) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "takeNumber is required"}"""
+            )
+        }
+
+        val quality = try {
+            TakeQuality.valueOf(qualityStr.uppercase())
+        } catch (e: Exception) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Invalid quality. Use: UNMARKED, GOOD, BAD, CIRCLE, HOLD"}"""
+            )
+        }
+
+        val success = director.getTakeManager().markTake(takeNumber, quality, notes)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.NOT_FOUND,
+            WebServer.MIME_JSON,
+            """{"success": $success, "takeNumber": $takeNumber, "quality": "${quality.name}"}"""
+        )
+    }
+
+    /**
+     * GET /api/director/takes/best - Get best takes for each scene
+     */
+    private fun getBestTakes(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val takeManager = director.getTakeManager()
+        val bestTakes = takeManager.getAllBestTakes()
+
+        val json = JSONObject().apply {
+            put("count", bestTakes.size)
+            put("bestTakes", JSONObject().apply {
+                bestTakes.forEach { (sceneId, take) ->
+                    put(sceneId, JSONObject().apply {
+                        put("takeNumber", take.takeNumber)
+                        put("sceneLabel", take.sceneLabel)
+                        put("qualityScore", take.qualityScore)
+                        put("durationFormatted", take.durationFormatted)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/director/takes/compare - Compare takes for current scene
+     */
+    private fun compareTakes(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val session = director.currentSession.value
+        if (session == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "No active session"}"""
+            )
+        }
+
+        val currentScene = session.currentScene
+        if (currentScene == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "No current scene"}"""
+            )
+        }
+
+        val comparison = director.getTakeManager().compareTakes(currentScene.id)
+
+        val json = JSONObject().apply {
+            put("sceneId", currentScene.id)
+            put("sceneLabel", currentScene.label)
+            put("recommendation", comparison.recommendation)
+            put("bestTake", if (comparison.bestTake != null) {
+                JSONObject().apply {
+                    put("takeNumber", comparison.bestTake.takeNumber)
+                    put("qualityScore", comparison.bestTake.qualityScore)
+                }
+            } else null)
+            put("rankings", JSONArray().apply {
+                comparison.rankings.forEach { (take, rank) ->
+                    put(JSONObject().apply {
+                        put("rank", rank)
+                        put("takeNumber", take.takeNumber)
+                        put("qualityScore", take.qualityScore)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/director/session - Get current director session info
+     */
+    private fun getDirectorSession(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        val session = director.currentSession.value
+        val takeManager = director.getTakeManager()
+        val stats = takeManager.getSessionStats()
+
+        val json = JSONObject().apply {
+            put("hasSession", session != null)
+            if (session != null) {
+                put("script", JSONObject().apply {
+                    put("scenes", session.script.scenes.size)
+                    put("totalCues", session.script.totalCues)
+                    put("estimatedDuration", session.script.estimatedDurationFormatted)
+                })
+                put("currentSceneIndex", session.currentSceneIndex)
+                put("currentCueIndex", session.currentCueIndex)
+                put("currentScene", session.currentScene?.label ?: "")
+                put("state", session.state.name)
+            }
+            put("stats", JSONObject().apply {
+                put("totalTakes", stats.totalTakes)
+                put("uniqueScenes", stats.uniqueScenes)
+                put("avgQualityScore", stats.avgQualityScore)
+                put("bestTakeCount", stats.bestTakeCount)
+                put("circledTakes", stats.circledTakes)
+                put("totalDuration", stats.totalDurationFormatted)
+                put("cueSuccessRate", stats.cueSuccessRate)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/director/events - Server-Sent Events for director state updates
+     */
+    private fun getDirectorEvents(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        // Create initial state event
+        val status = director.getStatus()
+        val initialEvent = JSONObject().apply {
+            put("type", "state")
+            put("enabled", status.enabled)
+            put("state", status.state.name)
+            put("currentScene", status.currentScene ?: "")
+            put("currentCue", status.currentCue ?: "")
+            put("currentTake", status.takeNumber)
+        }
+
+        // SSE format: "data: {json}\n\n"
+        val sseData = "data: ${initialEvent.toString()}\n\n"
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            "text/event-stream",
+            sseData
+        ).apply {
+            addHeader("Cache-Control", "no-cache")
+            addHeader("Connection", "keep-alive")
+            addHeader("Access-Control-Allow-Origin", "*")
+        }
+    }
+
+    /**
+     * POST /api/director/script/clear - Clear the loaded script
+     */
+    private fun clearDirectorScript(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        director.clearScript()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Script cleared"}"""
+        )
+    }
+
     // ==================== Helpers ====================
+
+    private fun directorServiceUnavailable(): NanoHTTPD.Response {
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.SERVICE_UNAVAILABLE,
+            WebServer.MIME_JSON,
+            """{"error": "Director service not available"}"""
+        )
+    }
 
     private fun kioskServiceUnavailable(): NanoHTTPD.Response {
         return NanoHTTPD.newFixedLengthResponse(

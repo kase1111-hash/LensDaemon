@@ -44,6 +44,48 @@ One APK. Plug in power. Point at thing. Stream forever.
 | **Kiosk Mode** | Locks device to LensDaemon — survives reboots, no escape without override |
 | **Web Control Panel** | Dashboard, live preview, full API at `http://{device-ip}:8080` |
 | **Zero Cloud Dependency** | Your footage stays on your network unless you decide otherwise |
+| **AI Director Mode** | Script-driven camera control — lens, zoom, focus respond to your scene cues |
+
+---
+
+## AI Director Mode (Experimental)
+
+**Let an LLM be your camera operator.**
+
+Feed LensDaemon a script or scene description, and the AI Director interprets your cues to control the camera in real-time:
+
+```
+[SCENE 1 - WIDE SHOT]
+Two people enter the frame from the left.
+
+[CUT TO: CLOSE-UP]
+Focus on speaker's face. Shallow depth of field.
+
+[PULL BACK - MEDIUM]
+Both subjects in frame. Auto-exposure for backlight.
+```
+
+**What it does:**
+- Parses scene/script markers to trigger camera actions
+- Switches lenses (wide → main → telephoto) based on shot descriptions
+- Adjusts zoom smoothly on cue ("PUSH IN", "PULL BACK")
+- Sets focus mode and depth based on scene context
+- Marks take boundaries automatically for post-production
+- Suggests "best takes" based on technical quality (focus lock, exposure, stability)
+
+**Thermal-Safe Design:**
+- **Completely inert when disabled** — No background processing, no API calls, zero thermal impact
+- AI processing runs on-demand only, not continuously
+- Scene cues are parsed locally or via configurable LLM endpoint
+- System automatically disables if thermal thresholds are exceeded
+
+**Use Cases:**
+- Solo content creators directing their own shots
+- Multi-camera setups with synchronized scene changes
+- Documentary/interview setups with intelligent reframing
+- Live streaming with automated shot variety
+
+See [AI Director Specification](spec.md#ai-director-mode) for implementation details.
 
 ---
 
@@ -156,14 +198,17 @@ See [API.md](docs/API.md) for full reference.
 - [x] Core streaming (RTSP)
 - [x] Web control panel
 - [x] Lens switching
+- [x] Local recording with segmentation
+- [x] SMB/NFS network storage
+- [x] S3-compatible upload (AWS, B2, MinIO, R2)
+- [x] Thermal governors with adaptive throttling
+- [x] Battery bypass charging
+- [x] Kiosk mode with Device Owner APIs
 - [ ] SRT protocol
-- [ ] SMB/NFS recording
-- [ ] S3-compatible upload
-- [ ] Thermal governors
-- [ ] Battery bypass charging
 - [ ] On-device motion detection
 - [ ] ONVIF compatibility
 - [ ] Multi-device management
+- [ ] **AI Director Mode** — Script-driven camera automation
 
 ---
 

@@ -15,6 +15,11 @@ import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
 import com.lensdaemon.camera.CameraService
+import com.lensdaemon.director.CameraControllerAdapter
+import com.lensdaemon.director.DirectorManager
+import com.lensdaemon.director.QualityMetricsCollector
+import com.lensdaemon.director.asMetricsSink
+import com.lensdaemon.director.asMetricsSource
 import com.lensdaemon.storage.UploadService
 import com.lensdaemon.thermal.ThermalService
 import kotlinx.coroutines.CoroutineScope
@@ -65,6 +70,11 @@ class WebServerService : Service() {
     private var apiRoutes: ApiRoutes? = null
     private var mjpegStreamer: MjpegStreamer? = null
 
+    // AI Director components
+    private var directorManager: DirectorManager? = null
+    private var cameraControllerAdapter: CameraControllerAdapter? = null
+    private var qualityMetricsCollector: QualityMetricsCollector? = null
+
     // Camera service connection
     private var cameraService: CameraService? = null
     private var cameraBound = false
@@ -78,6 +88,9 @@ class WebServerService : Service() {
             // Connect camera service to API routes
             apiRoutes?.cameraService = cameraService
 
+            // Set up AI Director integration
+            setupDirectorIntegration()
+
             Timber.i("$TAG: CameraService connected")
         }
 
@@ -85,6 +98,10 @@ class WebServerService : Service() {
             cameraService = null
             cameraBound = false
             apiRoutes?.cameraService = null
+
+            // Clean up director integration
+            cleanupDirectorIntegration()
+
             Timber.i("$TAG: CameraService disconnected")
         }
     }
@@ -177,11 +194,62 @@ class WebServerService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         stopServer()
+        cleanupDirectorIntegration()
         unbindCameraService()
         unbindUploadService()
         unbindThermalService()
         serviceScope.cancel()
         Timber.i("$TAG: Service destroyed")
+    }
+
+    /**
+     * Set up AI Director integration with camera service
+     */
+    private fun setupDirectorIntegration() {
+        val camera = cameraService ?: return
+
+        // Create director manager
+        directorManager = DirectorManager(this)
+
+        // Create camera controller adapter
+        cameraControllerAdapter = CameraControllerAdapter(camera)
+
+        // Connect director to camera controller
+        directorManager?.setCameraController(cameraControllerAdapter)
+
+        // Update shot mapper with camera capabilities
+        cameraControllerAdapter?.let { adapter ->
+            directorManager?.getShotMapper()?.updateCapabilities(adapter.getCameraCapabilities())
+        }
+
+        // Set up quality metrics collector
+        qualityMetricsCollector = QualityMetricsCollector().apply {
+            cameraControllerAdapter?.let { setSource(it.asMetricsSource()) }
+            directorManager?.getTakeManager()?.let { setSink(it.asMetricsSink()) }
+        }
+
+        // Connect director to API routes
+        apiRoutes?.directorManager = directorManager
+
+        Timber.i("$TAG: AI Director integration set up")
+    }
+
+    /**
+     * Clean up AI Director integration
+     */
+    private fun cleanupDirectorIntegration() {
+        qualityMetricsCollector?.destroy()
+        qualityMetricsCollector = null
+
+        directorManager?.destroy()
+        directorManager = null
+
+        cameraControllerAdapter?.reset()
+        cameraControllerAdapter = null
+
+        apiRoutes?.directorManager = null
+
+        Timber.i("$TAG: AI Director integration cleaned up")
     }
 
     /**
@@ -357,5 +425,36 @@ class WebServerService : Service() {
      */
     fun setSnapshotCallback(callback: () -> ByteArray?) {
         apiRoutes?.onSnapshotRequest = callback
+    }
+
+    // ==================== AI Director API ====================
+
+    /**
+     * Get director manager
+     */
+    fun getDirectorManager(): DirectorManager? = directorManager
+
+    /**
+     * Get quality metrics collector
+     */
+    fun getQualityMetricsCollector(): QualityMetricsCollector? = qualityMetricsCollector
+
+    /**
+     * Check if AI Director is enabled
+     */
+    fun isDirectorEnabled(): Boolean = directorManager?.isEnabled() ?: false
+
+    /**
+     * Start quality metrics collection (call when recording/streaming)
+     */
+    fun startQualityMetricsCollection() {
+        qualityMetricsCollector?.startCollection()
+    }
+
+    /**
+     * Stop quality metrics collection
+     */
+    fun stopQualityMetricsCollection() {
+        qualityMetricsCollector?.stopCollection()
     }
 }
