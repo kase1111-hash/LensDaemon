@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** AI Director Phase 1 complete - Script-driven camera automation with cue parsing, shot mapping, and take quality scoring.
+**Status:** AI Director Phase 2 complete - Camera integration, remote LLM support, transition animations, and quality metrics collection.
 
 ## Tech Stack
 
@@ -699,3 +699,78 @@ GET  /api/director/session       # Get session info and stats
 - **Clean separation** - Director does not directly manipulate camera hardware
 - **Observable state** - All state changes via StateFlow for reactive UIs
 - **Quality-driven** - Automatic take scoring helps identify best footage
+
+## AI Director Phase 2 Files (Camera Integration)
+
+```
+app/src/main/java/com/lensdaemon/director/
+├── CameraControllerAdapter.kt   # Bridge between DirectorManager and CameraService
+│                                # - Implements DirectorManager.CameraController interface
+│                                # - switchLens(), setZoom(), setFocusMode(), setExposurePreset()
+│                                # - getCurrentTemperature() for thermal monitoring
+│                                # - getCameraCapabilities() for shot mapper
+│                                # - State tracking for lens, zoom, focus
+├── RemoteLlmClient.kt           # External LLM API integration
+│                                # - Supports OpenAI, Anthropic (Claude), Ollama
+│                                # - Auto-detects provider from endpoint URL
+│                                # - LlmProvider enum (OPENAI, ANTHROPIC, OLLAMA, GENERIC_OPENAI)
+│                                # - interpretScript(), interpretLine() for cue generation
+│                                # - testConnection() for validation
+│                                # - Configurable timeout and token limits
+├── TransitionAnimator.kt        # Smooth camera transition animations
+│                                # - animateZoom() with easing curves
+│                                # - animateFocusDistance() for rack focus
+│                                # - animateExposure() for exposure changes
+│                                # - pushIn(), pullBack() convenience methods
+│                                # - hold() for timed pauses
+│                                # - TransitionCallback interface for camera control
+│                                # - pause(), resume(), cancelAll() controls
+└── QualityMetricsCollector.kt   # Real-time quality metrics collection
+                                 # - MetricsSource interface (from camera)
+                                 # - MetricsSink interface (to TakeManager)
+                                 # - Collects focus lock, exposure, motion, audio
+                                 # - Configurable sample interval (default 100ms)
+                                 # - CollectorStats for session analytics
+                                 # - asMetricsSource(), asMetricsSink() extensions
+
+app/src/main/java/com/lensdaemon/camera/
+└── CameraService.kt             # Updated with Director integration methods
+                                 # - animateZoom(targetZoom, durationMs)
+                                 # - setAutoFocus(), enableFaceDetectionFocus()
+                                 # - setFocusDistance() for manual focus
+                                 # - getMaxZoom(), supportsFaceDetection()
+                                 # - supportsManualFocus(), isFocusLocked()
+                                 # - getNormalizedExposure(), getMotionShakiness()
+                                 # - getCurrentCpuTemperature()
+
+app/src/main/java/com/lensdaemon/web/
+└── WebServerService.kt          # Updated with Director lifecycle management
+                                 # - DirectorManager creation on camera connect
+                                 # - CameraControllerAdapter setup
+                                 # - QualityMetricsCollector initialization
+                                 # - setupDirectorIntegration(), cleanupDirectorIntegration()
+                                 # - getDirectorManager(), getQualityMetricsCollector()
+                                 # - startQualityMetricsCollection(), stopQualityMetricsCollection()
+```
+
+## Remote LLM Configuration
+
+The AI Director supports external LLM APIs for dynamic script interpretation:
+
+```json
+{
+  "llmConfig": {
+    "endpoint": "https://api.openai.com",
+    "apiKey": "sk-...",
+    "model": "gpt-4",
+    "maxTokens": 1000,
+    "temperature": 0.3
+  }
+}
+```
+
+Supported providers:
+- **OpenAI**: `api.openai.com` - GPT-4, GPT-3.5
+- **Anthropic**: `api.anthropic.com` - Claude models
+- **Ollama**: `localhost:11434` - Local LLM (no API key needed)
+- **Generic**: Any OpenAI-compatible endpoint
