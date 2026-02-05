@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 10 complete - Full kiosk mode with Device Owner APIs, auto-boot, crash recovery, and network reconnection for reliable 24/7 appliance operation.
+**Status:** AI Director Phase 1 complete - Script-driven camera automation with cue parsing, shot mapping, and take quality scoring.
 
 ## Tech Stack
 
@@ -68,6 +68,7 @@ com.lensdaemon/
 5. **Storage Manager** - Local, SMB/NFS, S3-compatible uploads
 6. **Web Server** - Dashboard UI, REST API endpoints
 7. **Kiosk Manager** - Device Owner mode, boot autostart
+8. **Director Manager** - AI-powered script-driven camera automation
 
 ## REST API Endpoints
 
@@ -594,3 +595,107 @@ adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
 - Keep screen always on
 - Navigation bar accessible
 - Vol+Vol gesture to exit enabled
+
+## AI Director Module (Experimental)
+
+```
+app/src/main/java/com/lensdaemon/director/
+├── DirectorConfig.kt            # Configuration and data classes
+│                                # - DirectorState enum (DISABLED, IDLE, PARSING, READY, RUNNING, PAUSED, THERMAL_HOLD)
+│                                # - InferenceMode enum (OFF, PRE_PARSED, REMOTE)
+│                                # - ShotType enum (ESTABLISHING, WIDE, FULL_SHOT, MEDIUM, etc.)
+│                                # - TransitionType enum (CUT, PUSH_IN, PULL_BACK, RACK_FOCUS, HOLD)
+│                                # - FocusTarget enum (AUTO, FACE, HANDS, OBJECT, BACKGROUND, MANUAL)
+│                                # - ExposurePreset enum (AUTO, BRIGHT, DARK, BACKLIT, SILHOUETTE)
+│                                # - CueType enum (SCENE, SHOT, TRANSITION, FOCUS, EXPOSURE, etc.)
+│                                # - TakeQuality enum (UNMARKED, GOOD, BAD, CIRCLE, HOLD)
+│                                # - DirectorCue, ShotPreset, DirectorScene data classes
+│                                # - RecordedTake, TakeQualityFactors, ParsedScript
+│                                # - DirectorSession, DirectorStatus, LlmConfig
+│                                # - DirectorConfig with thermal thresholds
+│                                # - DirectorConfigStore for persistence
+├── ScriptParser.kt              # Script/scene cue parser
+│                                # - Regex patterns for cue detection
+│                                # - SCENE, SHOT, TRANSITION, FOCUS, EXPOSURE, DOF, BEAT, TAKE, CUT patterns
+│                                # - Natural language detection (wide shot, close-up, etc.)
+│                                # - parseScript() for full script processing
+│                                # - parseCuesFromLine() for line-by-line parsing
+│                                # - parseSingleCue() for ad-hoc cue execution
+│                                # - validateScript() for script validation
+├── ShotMapper.kt                # Shot-to-camera command mapping
+│                                # - CameraCapabilities (lenses, zoom, face detection)
+│                                # - CameraCommand (lens, zoom, focus, exposure, transition)
+│                                # - MappingResult with warnings and fallbacks
+│                                # - mapCue() for cue-to-command translation
+│                                # - selectLensAndZoom() for optimal hardware selection
+│                                # - Fallback handling when hardware unavailable
+│                                # - validateMapping() for capability validation
+├── TakeManager.kt               # Take recording and quality scoring
+│                                # - ActiveTake with quality metric samples
+│                                # - CueTiming for timing accuracy tracking
+│                                # - Quality scoring weights (focus 30%, exposure 20%, etc.)
+│                                # - startTake(), endTake() lifecycle
+│                                # - recordFocusSample(), recordExposureSample(), etc.
+│                                # - recordCueExecution() for timing accuracy
+│                                # - calculateQualityFactors(), calculateOverallScore()
+│                                # - markTake() for manual quality marking
+│                                # - compareTakes() with recommendations
+│                                # - getAllBestTakes() for post-production
+│                                # - SessionStats for session overview
+└── DirectorManager.kt           # Main coordinator
+                                 # - CameraController interface for hardware control
+                                 # - DirectorEvent sealed class for event emission
+                                 # - enable(), disable() for inert state management
+                                 # - loadScript() for script parsing
+                                 # - startExecution(), pauseExecution(), stopExecution()
+                                 # - executeCue(), executeCueText() for manual cues
+                                 # - advanceCue(), advanceScene(), jumpToScene()
+                                 # - Thermal monitoring integration
+                                 # - Take management forwarding
+                                 # - StateFlow for state observation
+```
+
+## AI Director API Endpoints
+
+```
+GET  /api/director/status        # Director state, current scene/cue
+POST /api/director/enable        # Enable AI Director
+POST /api/director/disable       # Disable (return to inert state)
+GET  /api/director/config        # Get configuration
+PUT  /api/director/config        # Update configuration
+POST /api/director/script        # Load script text
+POST /api/director/start         # Start script execution
+POST /api/director/stop          # Stop execution
+POST /api/director/pause         # Pause execution
+POST /api/director/resume        # Resume execution
+POST /api/director/cue           # Execute single cue
+POST /api/director/advance       # Advance to next cue
+POST /api/director/scene         # Jump to scene by index
+GET  /api/director/takes         # Get all recorded takes
+POST /api/director/takes/mark    # Mark take quality
+GET  /api/director/takes/best    # Get best takes per scene
+GET  /api/director/takes/compare # Compare takes for current scene
+GET  /api/director/session       # Get session info and stats
+```
+
+## Script Cue Format
+
+```
+[SCENE: Scene Label]           # Scene marker for organization
+[SHOT: WIDE|MEDIUM|CLOSE-UP]   # Shot type change
+[TRANSITION: PUSH IN] - 2s     # Animated zoom with duration
+[FOCUS: FACE|HANDS|BACKGROUND] # Focus target
+[EXPOSURE: AUTO|BRIGHT|DARK]   # Exposure preset
+[BEAT]                         # Timing marker (default hold)
+[HOLD: 3]                      # Hold for 3 seconds
+[TAKE: 1]                      # Take boundary marker
+[CUT TO: WIDE]                 # Hard cut to shot type
+```
+
+## AI Director Design Principles
+
+- **Completely inert when disabled** - No background processing, zero thermal impact
+- **Thermal-aware operation** - Auto-disables at configurable temperature thresholds
+- **Clean separation** - Director does not directly manipulate camera hardware
+- **Observable state** - All state changes via StateFlow for reactive UIs
+- **Quality-driven** - Automatic take scoring helps identify best footage
