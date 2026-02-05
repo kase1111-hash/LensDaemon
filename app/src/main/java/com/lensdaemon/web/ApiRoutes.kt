@@ -7,6 +7,8 @@ import com.lensdaemon.camera.LensType
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.encoder.VideoCodec
+import com.lensdaemon.output.SegmentDuration
+import com.lensdaemon.storage.RecordingFile
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
@@ -56,6 +58,21 @@ class ApiRoutes(
             uri == "/api/rtsp/start" && method == NanoHTTPD.Method.POST -> startRtsp(body)
             uri == "/api/rtsp/stop" && method == NanoHTTPD.Method.POST -> stopRtsp()
             uri == "/api/rtsp/status" && method == NanoHTTPD.Method.GET -> getRtspStatus()
+
+            // Recording control
+            uri == "/api/recording/start" && method == NanoHTTPD.Method.POST -> startRecording(body)
+            uri == "/api/recording/stop" && method == NanoHTTPD.Method.POST -> stopRecording()
+            uri == "/api/recording/pause" && method == NanoHTTPD.Method.POST -> pauseRecording()
+            uri == "/api/recording/resume" && method == NanoHTTPD.Method.POST -> resumeRecording()
+            uri == "/api/recording/status" && method == NanoHTTPD.Method.GET -> getRecordingStatus()
+
+            // Recordings management
+            uri == "/api/recordings" && method == NanoHTTPD.Method.GET -> listRecordings()
+            uri.startsWith("/api/recordings/") && method == NanoHTTPD.Method.DELETE -> deleteRecording(uri)
+
+            // Storage status
+            uri == "/api/storage/status" && method == NanoHTTPD.Method.GET -> getStorageStatus()
+            uri == "/api/storage/cleanup" && method == NanoHTTPD.Method.POST -> enforceRetention()
 
             // Lens control
             uri.startsWith("/api/lens/") && method == NanoHTTPD.Method.POST -> switchLens(uri)
@@ -326,6 +343,245 @@ class ApiRoutes(
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Recording Control ====================
+
+    /**
+     * POST /api/recording/start - Start local recording
+     */
+    private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        // Parse config
+        val width = body?.optInt("width", 1920) ?: 1920
+        val height = body?.optInt("height", 1080) ?: 1080
+        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
+        val frameRate = body?.optInt("frameRate", 30) ?: 30
+        val segmentMinutes = body?.optInt("segmentMinutes", 5) ?: 5
+
+        val segmentDuration = when (segmentMinutes) {
+            0 -> SegmentDuration.CONTINUOUS
+            1 -> SegmentDuration.ONE_MINUTE
+            5 -> SegmentDuration.FIVE_MINUTES
+            15 -> SegmentDuration.FIFTEEN_MINUTES
+            30 -> SegmentDuration.THIRTY_MINUTES
+            60 -> SegmentDuration.SIXTY_MINUTES
+            else -> SegmentDuration.FIVE_MINUTES
+        }
+
+        val config = EncoderConfig(
+            resolution = android.util.Size(width, height),
+            bitrateBps = bitrate,
+            frameRate = frameRate
+        )
+
+        val success = camera.startRecording(config, segmentDuration)
+
+        val json = JSONObject().apply {
+            put("success", success)
+            if (success) {
+                put("message", "Recording started")
+                put("segmentDuration", segmentDuration.displayName)
+                put("outputPath", camera.getRecordingsPath())
+            } else {
+                put("message", "Failed to start recording")
+            }
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.INTERNAL_ERROR,
+            WebServer.MIME_JSON,
+            json.toString()
+        )
+    }
+
+    /**
+     * POST /api/recording/stop - Stop local recording
+     */
+    private fun stopRecording(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val segments = camera.stopRecording()
+
+        val json = JSONObject().apply {
+            put("success", true)
+            put("message", "Recording stopped")
+            put("segmentCount", segments.size)
+            put("segments", JSONArray().apply {
+                segments.forEach { put(it) }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/recording/pause - Pause recording
+     */
+    private fun pauseRecording(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val success = camera.pauseRecording()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"success": $success, "message": "${if (success) "Recording paused" else "Not recording"}"}"""
+        )
+    }
+
+    /**
+     * POST /api/recording/resume - Resume recording
+     */
+    private fun resumeRecording(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val success = camera.resumeRecording()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"success": $success, "message": "${if (success) "Recording resumed" else "Not paused"}"}"""
+        )
+    }
+
+    /**
+     * GET /api/recording/status - Get recording status
+     */
+    private fun getRecordingStatus(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val stats = camera.getRecordingStats()
+
+        val json = JSONObject().apply {
+            put("recording", camera.isRecording())
+            put("paused", camera.isRecordingPaused())
+            put("state", stats.state.name)
+            put("currentFile", stats.currentFilePath ?: "")
+            put("framesInSegment", stats.framesInSegment)
+            put("totalFrames", stats.totalFrames)
+            put("bytesInSegment", stats.bytesInSegment)
+            put("totalBytes", stats.totalBytes)
+            put("segmentIndex", stats.segmentIndex)
+            put("durationSec", stats.durationSec)
+            put("avgBitrateKbps", stats.avgBitrateKbps)
+            put("completedSegments", JSONArray().apply {
+                stats.completedSegments.forEach { put(it) }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Recordings Management ====================
+
+    /**
+     * GET /api/recordings - List all recordings
+     */
+    private fun listRecordings(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val recordings = camera.listRecordings()
+
+        val json = JSONObject().apply {
+            put("count", recordings.size)
+            put("totalSizeBytes", recordings.sumOf { it.sizeBytes })
+            put("recordings", JSONArray().apply {
+                recordings.forEach { rec ->
+                    put(JSONObject().apply {
+                        put("name", rec.name)
+                        put("path", rec.path)
+                        put("sizeBytes", rec.sizeBytes)
+                        put("sizeMB", rec.sizeMB)
+                        put("lastModified", rec.lastModifiedMs)
+                        put("lastModifiedFormatted", rec.lastModifiedFormatted)
+                        put("ageHours", rec.ageHours)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * DELETE /api/recordings/{filename} - Delete a recording
+     */
+    private fun deleteRecording(uri: String): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val filename = uri.substringAfterLast("/")
+        if (filename.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Filename required"}"""
+            )
+        }
+
+        // Find the recording
+        val recordings = camera.listRecordings()
+        val recording = recordings.find { it.name == filename }
+            ?: return NanoHTTPD.newFixedLengthResponse(
+                Status.NOT_FOUND,
+                WebServer.MIME_JSON,
+                """{"error": "Recording not found: $filename"}"""
+            )
+
+        val success = camera.deleteRecording(recording)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.INTERNAL_ERROR,
+            WebServer.MIME_JSON,
+            """{"success": $success, "filename": "$filename"}"""
+        )
+    }
+
+    // ==================== Storage ====================
+
+    /**
+     * GET /api/storage/status - Get storage status
+     */
+    private fun getStorageStatus(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val status = camera.getStorageStatus()
+
+        val json = JSONObject().apply {
+            put("state", status.state.name)
+            put("warningLevel", status.warningLevel.name)
+            put("totalRecordings", status.totalRecordings)
+            put("totalRecordingsSizeBytes", status.totalRecordingsSizeBytes)
+            put("storage", JSONObject().apply {
+                put("totalBytes", status.storageInfo.totalBytes)
+                put("availableBytes", status.storageInfo.availableBytes)
+                put("usedBytes", status.storageInfo.usedBytes)
+                put("path", status.storageInfo.path)
+                put("totalGB", status.storageInfo.totalGB)
+                put("availableGB", status.storageInfo.availableGB)
+                put("usagePercent", status.storageInfo.usagePercent)
+                put("isLowSpace", status.storageInfo.isLowSpace)
+                put("isCriticallyLowSpace", status.storageInfo.isCriticallyLowSpace)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/storage/cleanup - Enforce retention policy
+     */
+    private fun enforceRetention(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        camera.enforceRetention()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Retention enforcement started"}"""
+        )
     }
 
     // ==================== Lens Control ====================

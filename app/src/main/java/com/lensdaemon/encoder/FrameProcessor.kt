@@ -1,5 +1,6 @@
 package com.lensdaemon.encoder
 
+import android.media.MediaFormat
 import android.util.Size
 import android.view.Surface
 import kotlinx.coroutines.CoroutineScope
@@ -306,6 +307,11 @@ class FrameProcessor(
      * Get encoder configuration
      */
     fun getConfig(): EncoderConfig = encoderConfig
+
+    /**
+     * Get encoder output format (for muxer)
+     */
+    fun getOutputFormat(): MediaFormat? = encoder?.getOutputFormat()
 
     /**
      * Get current bitrate

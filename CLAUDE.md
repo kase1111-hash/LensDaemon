@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 6 complete - Web interface with NanoHTTPD server, REST API, MJPEG live preview, and responsive dashboard.
+**Status:** Phase 7 complete - Local recording with MP4 muxing, file segmentation, retention policies, and storage management.
 
 ## Tech Stack
 
@@ -116,7 +116,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 4 | Video Encoding | Complete |
 | 5 | RTSP Server | Complete |
 | 6 | Web Interface | Complete |
-| 7 | Local Recording | Pending |
+| 7 | Local Recording | Complete |
 | 8 | Network Storage | Pending |
 | 9 | Thermal Management | Pending |
 | 10 | Kiosk Mode | Pending |
@@ -331,4 +331,59 @@ app/src/main/assets/web/
                                  # - Stream and RTSP control
                                  # - Lens and camera control handlers
                                  # - Configuration management
+```
+
+## Phase 7 Files (Local Recording & Storage)
+
+```
+app/src/main/java/com/lensdaemon/output/
+├── Mp4Muxer.kt                  # MediaMuxer wrapper for MP4 container
+│                                # - MuxerConfig, MuxerState, MuxerStats
+│                                # - Video track configuration from encoder format
+│                                # - Frame writing with timestamp handling
+│                                # - File finalization and cleanup
+│                                # - Mp4MuxerBuilder for configuration
+└── FileWriter.kt                # Local recording with segmentation
+                                 # - RecordingState, RecordingStats, RecordingEvent
+                                 # - SegmentDuration (1/5/15/30/60 min, continuous)
+                                 # - Filename pattern: LensDaemon_{device}_{timestamp}.mp4
+                                 # - Recording pause/resume support
+                                 # - FileWriterFactory for common configs
+
+app/src/main/java/com/lensdaemon/storage/
+├── RetentionPolicy.kt           # Storage retention and cleanup
+│                                # - RetentionType (KEEP_ALL, MAX_AGE, MAX_SIZE, MAX_AGE_AND_SIZE)
+│                                # - RetentionConfig presets (24h, 7d, 30d, 5GB, 10GB)
+│                                # - StorageStats with file enumeration
+│                                # - Preview and enforce methods
+│                                # - RetentionPolicyBuilder for configuration
+├── LocalStorage.kt              # Local storage operations
+│                                # - StorageLocation (INTERNAL, EXTERNAL_APP, EXTERNAL_PUBLIC, CUSTOM)
+│                                # - StorageSpaceInfo with disk monitoring
+│                                # - RecordingFile with metadata
+│                                # - Storage warning levels and events
+│                                # - Recording enumeration and deletion
+└── StorageManager.kt            # Storage coordination layer
+                                 # - StorageManagerState, StorageStatus
+                                 # - FileWriter lifecycle management
+                                 # - LocalStorage and RetentionPolicy integration
+                                 # - Automatic retention enforcement
+                                 # - Combined streaming and recording
+                                 # - StorageManagerBuilder for configuration
+
+app/src/main/java/com/lensdaemon/camera/
+└── CameraService.kt             # Updated with recording integration
+                                 # - initializeRecording, startRecording, stopRecording
+                                 # - pauseRecording, resumeRecording
+                                 # - getRecordingStats, getStorageStatus
+                                 # - listRecordings, deleteRecording
+                                 # - startStreamingAndRecording convenience method
+
+app/src/main/java/com/lensdaemon/web/
+└── ApiRoutes.kt                 # Updated with recording API endpoints
+                                 # - POST /api/recording/start|stop|pause|resume
+                                 # - GET /api/recording/status
+                                 # - GET /api/recordings, DELETE /api/recordings/{filename}
+                                 # - GET /api/storage/status
+                                 # - POST /api/storage/cleanup
 ```

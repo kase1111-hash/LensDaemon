@@ -390,6 +390,19 @@ class VideoEncoder(
     fun getConfigData(): ByteArray? = nalParser.getConfigData()
 
     /**
+     * Get encoder output format (for muxer configuration)
+     * Contains codec-specific data like SPS/PPS
+     */
+    fun getOutputFormat(): MediaFormat? {
+        return try {
+            mediaCodec?.outputFormat
+        } catch (e: Exception) {
+            Timber.w("$TAG: Output format not yet available")
+            null
+        }
+    }
+
+    /**
      * MediaCodec async callback
      */
     private val encoderCallback = object : MediaCodec.Callback() {

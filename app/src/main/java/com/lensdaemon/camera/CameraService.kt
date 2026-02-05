@@ -26,6 +26,15 @@ import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.RtspServer
 import com.lensdaemon.output.RtspServerState
 import com.lensdaemon.output.RtspServerStats
+import com.lensdaemon.output.RecordingEvent
+import com.lensdaemon.output.RecordingListener
+import com.lensdaemon.output.RecordingStats
+import com.lensdaemon.output.RecordingState
+import com.lensdaemon.output.SegmentDuration
+import com.lensdaemon.storage.RecordingFile
+import com.lensdaemon.storage.StorageManager
+import com.lensdaemon.storage.StorageManagerBuilder
+import com.lensdaemon.storage.StorageStatus
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -101,6 +110,16 @@ class CameraService : Service() {
     private var rtspServer: RtspServer? = null
     private val _rtspServerState = MutableStateFlow(RtspServerState.STOPPED)
     val rtspServerState: StateFlow<RtspServerState> = _rtspServerState
+
+    // Storage manager (Phase 7)
+    private var storageManager: StorageManager? = null
+    private val _recordingState = MutableStateFlow(RecordingState.IDLE)
+    val recordingState: StateFlow<RecordingState> = _recordingState
+
+    // Recording frame listener
+    private val recordingFrameListener: (EncodedFrame) -> Unit = { frame ->
+        storageManager?.writeFrame(frame)
+    }
 
     // Frame listener for RTSP server
     private val rtspFrameListener: (EncodedFrame) -> Unit = { frame ->
@@ -1031,5 +1050,267 @@ class CameraService : Service() {
         stopRtspServer()
         stopStreaming()
         Timber.i("RTSP streaming stopped")
+    }
+
+    // ==================== Local Recording (Phase 7) ====================
+
+    /**
+     * Initialize storage manager for recording.
+     * @param segmentDuration Segment duration for file splitting
+     */
+    fun initializeRecording(
+        encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
+        segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
+    ): Boolean {
+        if (storageManager != null) {
+            Timber.w("Storage manager already initialized")
+            return true
+        }
+
+        storageManager = StorageManagerBuilder(applicationContext)
+            .encoderConfig(encoderConfig)
+            .segmentDuration(segmentDuration)
+            .build()
+
+        // Add recording state listener
+        storageManager?.addListener(object : RecordingListener {
+            override fun onRecordingEvent(event: RecordingEvent) {
+                when (event) {
+                    is RecordingEvent.Started -> {
+                        _recordingState.value = RecordingState.RECORDING
+                        updateNotification()
+                    }
+                    is RecordingEvent.Stopped -> {
+                        _recordingState.value = RecordingState.IDLE
+                        updateNotification()
+                    }
+                    is RecordingEvent.Paused -> {
+                        _recordingState.value = RecordingState.PAUSED
+                    }
+                    is RecordingEvent.Resumed -> {
+                        _recordingState.value = RecordingState.RECORDING
+                    }
+                    is RecordingEvent.Error -> {
+                        _recordingState.value = RecordingState.ERROR
+                        Timber.e("Recording error: ${event.error}")
+                    }
+                    is RecordingEvent.SegmentCompleted -> {
+                        Timber.d("Recording segment completed: ${event.filePath}")
+                    }
+                    is RecordingEvent.NewSegmentStarted -> {
+                        Timber.d("New recording segment: ${event.filePath}")
+                    }
+                }
+            }
+        })
+
+        Timber.i("Storage manager initialized")
+        return true
+    }
+
+    /**
+     * Start local recording.
+     * Requires encoder to be initialized and running.
+     */
+    fun startRecording(): Boolean {
+        if (!isStreamingActive) {
+            Timber.e("Cannot start recording: encoder not active")
+            return false
+        }
+
+        // Initialize storage manager if needed
+        if (storageManager == null) {
+            val config = getEncoderConfig() ?: EncoderConfig.PRESET_1080P
+            initializeRecording(config)
+        }
+
+        // Set video format from encoder
+        val format = encoderService?.getOutputFormat()
+        if (format != null) {
+            storageManager?.setVideoFormat(format)
+        } else {
+            Timber.w("Encoder output format not available, will wait for first frame")
+        }
+
+        // Add frame listener for recording
+        addEncodedFrameListener(recordingFrameListener)
+
+        // Start recording
+        val success = storageManager?.startRecording() == true
+        if (!success) {
+            removeEncodedFrameListener(recordingFrameListener)
+            Timber.e("Failed to start recording")
+        } else {
+            Timber.i("Recording started")
+        }
+
+        return success
+    }
+
+    /**
+     * Start recording with specific configuration.
+     */
+    fun startRecording(
+        config: EncoderConfig,
+        segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
+    ): Boolean {
+        // Initialize encoder if needed
+        if (!isStreamingActive) {
+            if (!initializeEncoder(config)) {
+                return false
+            }
+            encoderService?.startEncoding()
+            isStreamingActive = true
+        }
+
+        // Initialize storage manager with config
+        if (storageManager == null) {
+            initializeRecording(config, segmentDuration)
+        }
+
+        return startRecording()
+    }
+
+    /**
+     * Stop local recording.
+     * @return List of recorded segment file paths
+     */
+    fun stopRecording(): List<String> {
+        if (_recordingState.value == RecordingState.IDLE) {
+            Timber.w("Not recording")
+            return emptyList()
+        }
+
+        // Remove frame listener
+        removeEncodedFrameListener(recordingFrameListener)
+
+        // Stop recording
+        val segments = storageManager?.stopRecording() ?: emptyList()
+        Timber.i("Recording stopped: ${segments.size} segments")
+
+        return segments
+    }
+
+    /**
+     * Pause recording.
+     */
+    fun pauseRecording(): Boolean {
+        return storageManager?.pauseRecording() == true
+    }
+
+    /**
+     * Resume recording.
+     */
+    fun resumeRecording(): Boolean {
+        return storageManager?.resumeRecording() == true
+    }
+
+    /**
+     * Check if recording is active.
+     */
+    fun isRecording(): Boolean = _recordingState.value == RecordingState.RECORDING
+
+    /**
+     * Check if recording is paused.
+     */
+    fun isRecordingPaused(): Boolean = _recordingState.value == RecordingState.PAUSED
+
+    /**
+     * Get recording statistics.
+     */
+    fun getRecordingStats(): RecordingStats {
+        return storageManager?.getRecordingStats() ?: RecordingStats()
+    }
+
+    /**
+     * Get storage status.
+     */
+    fun getStorageStatus(): StorageStatus {
+        return storageManager?.status?.value ?: StorageStatus()
+    }
+
+    /**
+     * List all recorded files.
+     */
+    fun listRecordings(): List<RecordingFile> {
+        return storageManager?.listRecordings() ?: emptyList()
+    }
+
+    /**
+     * Delete a recording file.
+     */
+    fun deleteRecording(file: RecordingFile): Boolean {
+        return storageManager?.deleteRecording(file) == true
+    }
+
+    /**
+     * Get recordings directory path.
+     */
+    fun getRecordingsPath(): String {
+        return storageManager?.getRecordingsDirectory()?.absolutePath ?: ""
+    }
+
+    /**
+     * Set segment duration for recording.
+     */
+    fun setSegmentDuration(duration: SegmentDuration) {
+        storageManager?.updateSegmentDuration(duration)
+    }
+
+    /**
+     * Enforce retention policy (manual cleanup).
+     */
+    fun enforceRetention() {
+        serviceScope.launch {
+            storageManager?.enforceRetention()
+        }
+    }
+
+    /**
+     * Release storage manager resources.
+     */
+    fun releaseStorageManager() {
+        removeEncodedFrameListener(recordingFrameListener)
+        storageManager?.release()
+        storageManager = null
+        _recordingState.value = RecordingState.IDLE
+    }
+
+    /**
+     * Start combined streaming and recording.
+     */
+    fun startStreamingAndRecording(
+        config: EncoderConfig = EncoderConfig.PRESET_1080P,
+        segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES,
+        rtspPort: Int = 8554
+    ): Boolean {
+        // Start RTSP streaming
+        if (!startRtspStreaming(config, rtspPort)) {
+            return false
+        }
+
+        // Start recording
+        if (storageManager == null) {
+            initializeRecording(config, segmentDuration)
+        }
+
+        // Small delay to let encoder start
+        serviceScope.launch {
+            delay(500)
+            if (!startRecording()) {
+                Timber.e("Failed to start recording alongside streaming")
+            }
+        }
+
+        return true
+    }
+
+    /**
+     * Stop combined streaming and recording.
+     */
+    fun stopStreamingAndRecording(): List<String> {
+        val segments = stopRecording()
+        stopRtspStreaming()
+        return segments
     }
 }
