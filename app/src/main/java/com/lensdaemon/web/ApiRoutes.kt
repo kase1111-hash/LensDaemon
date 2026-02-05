@@ -39,6 +39,16 @@ class ApiRoutes(
     companion object {
         private const val TAG = "ApiRoutes"
 
+        // Default preview resolution for tap-to-focus coordinate mapping
+        private const val DEFAULT_PREVIEW_WIDTH = 1920
+        private const val DEFAULT_PREVIEW_HEIGHT = 1080
+
+        // HTTP 429 Too Many Requests (not in NanoHTTPD's Status enum)
+        private val TOO_MANY_REQUESTS = object : NanoHTTPD.Response.IStatus {
+            override fun getRequestStatus() = 429
+            override fun getDescription() = "429 Too Many Requests"
+        }
+
         // Read-only endpoints that don't require authentication
         private val PUBLIC_ENDPOINTS = setOf(
             "/api/status",
@@ -83,6 +93,9 @@ class ApiRoutes(
     // API authentication token (null = auth disabled for backwards compat)
     var apiToken: String? = null
 
+    // Rate limiter (null = disabled)
+    var rateLimiter: RateLimiter? = null
+
     // Delegated route handlers
     private val streamHandler = StreamApiHandler()
     private val uploadHandler = UploadApiHandler()
@@ -121,11 +134,41 @@ class ApiRoutes(
     }
 
     /**
+     * Check rate limit for client.
+     * Returns 429 response if rate-limited, null if allowed.
+     */
+    private fun checkRateLimit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
+        val limiter = rateLimiter ?: return null
+
+        val clientIp = session.headers["x-forwarded-for"]?.split(",")?.firstOrNull()?.trim()
+            ?: session.headers["remote-addr"]
+            ?: "unknown"
+
+        if (!limiter.tryAcquire(clientIp)) {
+            val retryAfter = limiter.retryAfterSeconds(clientIp)
+            val body = """{"error": "Rate limit exceeded", "retryAfter": $retryAfter}"""
+            val response = NanoHTTPD.newFixedLengthResponse(
+                TOO_MANY_REQUESTS,
+                WebServer.MIME_JSON,
+                body
+            )
+            response.addHeader("Retry-After", retryAfter.toString())
+            response.addHeader("X-RateLimit-Remaining", "0")
+            return response
+        }
+
+        return null
+    }
+
+    /**
      * Handle API request - main dispatcher
      */
     fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
         // Check authentication first
         checkAuth(session)?.let { return it }
+
+        // Check rate limit
+        checkRateLimit(session)?.let { return it }
 
         val uri = session.uri
         val method = session.method
@@ -355,7 +398,7 @@ class ApiRoutes(
         camera.triggerTapToFocus(
             x.toFloat(),
             y.toFloat(),
-            android.util.Size(1920, 1080)
+            android.util.Size(DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT)
         )
 
         return NanoHTTPD.newFixedLengthResponse(

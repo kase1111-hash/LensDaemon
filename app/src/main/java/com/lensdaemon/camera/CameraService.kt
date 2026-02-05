@@ -53,6 +53,7 @@ class CameraService : Service() {
         private const val ACTION_START_STREAMING = "com.lensdaemon.action.START_STREAMING"
         private const val ACTION_STOP_STREAMING = "com.lensdaemon.action.STOP_STREAMING"
         private const val EXTRA_LENS_TYPE = "lens_type"
+        private const val DEFAULT_CPU_TEMP_FALLBACK = 40
 
         fun startPreviewIntent(context: Context, lensType: LensType = LensType.MAIN): Intent {
             return Intent(context, CameraService::class.java).apply {
@@ -1407,20 +1408,49 @@ class CameraService : Service() {
 
     /**
      * Get current CPU temperature for thermal monitoring.
+     * Uses device-agnostic discovery of thermal zones.
      */
     fun getCurrentCpuTemperature(): Int {
-        // Try to read CPU temperature from thermal zones
         return try {
-            val thermalFile = java.io.File("/sys/class/thermal/thermal_zone0/temp")
-            if (thermalFile.exists()) {
-                val temp = thermalFile.readText().trim().toIntOrNull() ?: 0
-                temp / 1000 // Convert from millidegrees to degrees
-            } else {
-                40 // Default fallback
+            // Discover all thermal zones dynamically
+            val thermalDir = java.io.File("/sys/class/thermal")
+            if (!thermalDir.exists()) return DEFAULT_CPU_TEMP_FALLBACK
+
+            val zones = thermalDir.listFiles()?.filter {
+                it.name.startsWith("thermal_zone")
+            } ?: return DEFAULT_CPU_TEMP_FALLBACK
+
+            // Try to find a CPU-specific zone by type
+            for (zone in zones) {
+                val typeFile = java.io.File(zone, "type")
+                val type = try { typeFile.readText().trim().lowercase() } catch (_: Exception) { continue }
+                if (type.contains("cpu") || type.contains("soc") || type.contains("tsens")) {
+                    readThermalZoneTemp(zone)?.let { return it }
+                }
             }
+
+            // Fallback: read first available zone
+            for (zone in zones) {
+                readThermalZoneTemp(zone)?.let { return it }
+            }
+
+            DEFAULT_CPU_TEMP_FALLBACK
         } catch (e: Exception) {
-            40 // Default fallback
+            DEFAULT_CPU_TEMP_FALLBACK
         }
     }
+
+    private fun readThermalZoneTemp(zoneDir: java.io.File): Int? {
+        return try {
+            val tempFile = java.io.File(zoneDir, "temp")
+            if (!tempFile.exists()) return null
+            val raw = tempFile.readText().trim().toIntOrNull() ?: return null
+            // Normalize: values > 1000 are in millidegrees
+            if (raw > 1000) raw / 1000 else raw
+        } catch (_: Exception) {
+            null
+        }
+    }
+
 }
 
