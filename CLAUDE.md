@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 9 complete - Thermal management with CPU/battery monitoring, automatic throttling governors, and battery bypass for sustainable operation.
+**Status:** Phase 10 complete - Full kiosk mode with Device Owner APIs, auto-boot, crash recovery, and network reconnection for reliable 24/7 appliance operation.
 
 ## Tech Stack
 
@@ -119,7 +119,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 7 | Local Recording | Complete |
 | 8 | Network Storage | Complete |
 | 9 | Thermal Management | Complete |
-| 10 | Kiosk Mode | Pending |
+| 10 | Kiosk Mode | Complete |
 
 ## Contribution Areas
 
@@ -505,3 +505,92 @@ app/src/main/java/com/lensdaemon/web/
                                  # - ThermalService connection management
                                  # - thermalGovernor reference for ApiRoutes
 ```
+
+## Phase 10 Files (Kiosk Mode & Reliability)
+
+```
+app/src/main/java/com/lensdaemon/kiosk/
+├── KioskConfig.kt               # Kiosk configuration data classes
+│                                # - KioskState enum (DISABLED, ENABLED, SETUP_REQUIRED, NOT_DEVICE_OWNER)
+│                                # - ScreenMode enum (PREVIEW, OFF, DIM, BLACK)
+│                                # - AutoStartConfig (delay, start streaming/RTSP/recording)
+│                                # - ScreenConfig (mode, brightness, auto-off timeout)
+│                                # - SecurityConfig (exit PIN, gesture, status bar lock)
+│                                # - NetworkRecoveryConfig (auto-reconnect, retry attempts)
+│                                # - CrashRecoveryConfig (auto-restart, max attempts)
+│                                # - KioskConfig presets (APPLIANCE, INTERACTIVE)
+│                                # - KioskConfigStore with JSON persistence
+├── KioskManager.kt              # Device Owner API integration
+│                                # - Device Owner detection and validation
+│                                # - Lock Task Mode (no home/recents escape)
+│                                # - setLockTaskPackages for allowlist
+│                                # - System UI hiding (status bar, navigation bar)
+│                                # - User restrictions (factory reset, safe boot, USB transfer)
+│                                # - Kiosk state tracking via StateFlow
+│                                # - Event logging for kiosk actions
+│                                # - Configuration presets (APPLIANCE, INTERACTIVE)
+├── ScreenController.kt          # Screen management
+│                                # - Screen modes: PREVIEW, OFF, DIM, BLACK
+│                                # - Brightness control via WindowManager
+│                                # - Black overlay for display-on-but-black mode
+│                                # - Screen lock via DevicePolicyManager
+│                                # - Auto-off timeout with activity detection
+│                                # - Wake lock management
+│                                # - Screen state tracking
+├── ButtonOverrideHandler.kt     # Physical button override
+│                                # - Vol Up + Vol Down gesture detection
+│                                # - Configurable hold duration (default 5s)
+│                                # - Progress callbacks during gesture
+│                                # - PinEntryHandler for secure exit
+│                                # - Lockout after 5 failed PIN attempts
+│                                # - Key event consumption to block volume changes
+└── BootReceiver.kt              # Auto-start on boot
+                                 # - ACTION_BOOT_COMPLETED handling
+                                 # - QUICKBOOT_POWERON for some devices
+                                 # - Configurable startup delay
+                                 # - Auto-start streaming/RTSP/recording
+                                 # - CrashRecoveryManager integration
+                                 # - Uncaught exception handler
+                                 # - NetworkRecoveryHandler for reconnection
+                                 # - Boot event logging
+
+app/src/main/java/com/lensdaemon/web/
+└── ApiRoutes.kt                 # Updated with kiosk API endpoints
+                                 # - GET /api/kiosk/status - state and config summary
+                                 # - POST /api/kiosk/enable - enable kiosk mode
+                                 # - POST /api/kiosk/disable - disable kiosk mode
+                                 # - GET /api/kiosk/config - full configuration
+                                 # - PUT /api/kiosk/config - update configuration
+                                 # - POST /api/kiosk/preset/appliance - 24/7 mode
+                                 # - POST /api/kiosk/preset/interactive - preview mode
+                                 # - GET /api/kiosk/events - event log
+```
+
+## Kiosk Mode Setup
+
+```bash
+# Set device owner (required for kiosk mode)
+# Must be done on factory reset device or via ADB with no accounts
+adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
+
+# Verify device owner status
+adb shell dumpsys device_policy | grep "Device Owner"
+
+# Remove device owner (to allow normal device use)
+adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
+```
+
+## Kiosk Mode Presets
+
+**APPLIANCE Preset** (24/7 unattended operation):
+- Screen OFF to save power
+- Auto-start streaming and RTSP on boot
+- Lock all system UI
+- Auto-restart on crash (up to 10 attempts)
+- Network auto-reconnect enabled
+
+**INTERACTIVE Preset** (kiosk with preview):
+- Screen shows camera preview
+- Keep screen always on
+- Navigation bar accessible
+- Vol+Vol gesture to exit enabled
