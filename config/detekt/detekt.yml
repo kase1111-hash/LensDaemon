@@ -1,0 +1,168 @@
+build:
+  maxIssues: 0
+  excludeCorrectable: false
+
+complexity:
+  LongMethod:
+    threshold: 80
+  LongParameterList:
+    functionThreshold: 8
+    constructorThreshold: 10
+  CyclomaticComplexMethod:
+    threshold: 20
+  TooManyFunctions:
+    thresholdInFiles: 30
+    thresholdInClasses: 30
+    thresholdInInterfaces: 15
+    thresholdInObjects: 20
+    thresholdInEnums: 10
+  NestedBlockDepth:
+    threshold: 5
+  LargeClass:
+    threshold: 600
+
+coroutines:
+  active: true
+  GlobalCoroutineUsage:
+    active: true
+  SuspendFunWithFlowReturnType:
+    active: true
+
+empty-blocks:
+  active: true
+  EmptyCatchBlock:
+    active: true
+    allowedExceptionNameRegex: '_|ignore|expected'
+  EmptyClassBlock:
+    active: false
+  EmptyDefaultConstructor:
+    active: false
+  EmptyDoWhileBlock:
+    active: true
+  EmptyElseBlock:
+    active: true
+  EmptyFinallyBlock:
+    active: true
+  EmptyForBlock:
+    active: true
+  EmptyFunctionBlock:
+    active: true
+    ignoreOverridden: true
+  EmptyIfBlock:
+    active: true
+  EmptyInitBlock:
+    active: true
+  EmptyKtFile:
+    active: true
+  EmptySecondaryConstructor:
+    active: true
+  EmptyTryBlock:
+    active: true
+  EmptyWhenBlock:
+    active: true
+  EmptyWhileBlock:
+    active: true
+
+exceptions:
+  active: true
+  ExceptionRaisedInUnexpectedLocation:
+    active: true
+  InstanceOfCheckForException:
+    active: true
+  SwallowedException:
+    active: true
+    ignoredExceptionTypes:
+      - InterruptedException
+      - MalformedURLException
+      - NumberFormatException
+      - ParseException
+  TooGenericExceptionCaught:
+    active: true
+    exceptionNames:
+      - ArrayIndexOutOfBoundsException
+      - Error
+      - IllegalMonitorStateException
+      - IndexOutOfBoundsException
+      - NullPointerException
+    allowedExceptionNameRegex: '_|(ignore|expected).*'
+  TooGenericExceptionThrown:
+    active: true
+    exceptionNames:
+      - Error
+      - Exception
+      - RuntimeException
+      - Throwable
+
+naming:
+  active: true
+  FunctionNaming:
+    active: true
+    excludes: ['**/test/**', '**/androidTest/**']
+  TopLevelPropertyNaming:
+    active: true
+    constantPattern: '[A-Z][_A-Z0-9]*'
+    propertyPattern: '[A-Za-z][_A-Za-z0-9]*'
+  VariableNaming:
+    active: true
+    variablePattern: '[a-z][A-Za-z0-9]*'
+    privateVariablePattern: '(_)?[a-z][A-Za-z0-9]*'
+
+performance:
+  active: true
+  SpreadOperator:
+    active: false
+  UnnecessaryTemporaryInstantiation:
+    active: true
+
+potential-bugs:
+  active: true
+  CastToNullableType:
+    active: true
+  Deprecation:
+    active: false
+  DoubleMutabilityForCollection:
+    active: true
+  EqualsAlwaysReturnsTrueOrFalse:
+    active: true
+  ExplicitGarbageCollectionCall:
+    active: true
+  HasPlatformType:
+    active: false
+  IteratorNotThrowingNoSuchElementException:
+    active: true
+  UnconditionalJumpStatementInLoop:
+    active: true
+  UnnecessaryNotNullOperator:
+    active: true
+  UnnecessarySafeCall:
+    active: true
+  UselessPostfixExpression:
+    active: true
+
+style:
+  active: true
+  DataClassContainsFunctions:
+    active: false
+  ForbiddenComment:
+    active: false
+  MagicNumber:
+    active: false
+  MaxLineLength:
+    maxLineLength: 140
+    excludePackageStatements: true
+    excludeImportStatements: true
+    excludeCommentStatements: true
+  ReturnCount:
+    max: 5
+    excludeGuardClauses: true
+  ThrowsCount:
+    max: 3
+  UnnecessaryAbstractClass:
+    active: true
+  UnusedImports:
+    active: true
+  UnusedPrivateMember:
+    active: true
+    allowedNames: '(_|ignored|expected|serialVersionUID)'
+  WildcardImport:
+    active: false
