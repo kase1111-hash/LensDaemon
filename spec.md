@@ -309,6 +309,248 @@ adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 
 ---
 
+## AI Director Mode
+
+An optional LLM-powered camera direction layer that interprets script cues and controls the camera accordingly. Designed for content creators who need intelligent shot automation without a dedicated camera operator.
+
+### Core Philosophy
+
+1. **Script-first workflow** — The scene description drives the camera, not manual intervention
+2. **Completely inert when off** — Zero thermal impact, no background processing, no API calls
+3. **Fail-safe defaults** — If AI processing fails, camera maintains last known good state
+4. **Local-first option** — Can run with on-device inference or external LLM endpoint
+
+### Input Format
+
+The AI Director accepts scene/script input in a flexible markup format:
+
+```
+[SCENE: Kitchen - Morning]
+Wide establishing shot. Natural light from window.
+
+[SHOT: WIDE]
+Sarah enters from the left, walks to counter.
+
+[TRANSITION: PUSH IN - 3s]
+Move to medium shot as she picks up the coffee.
+
+[SHOT: CLOSE-UP]
+Focus on hands. Shallow depth of field.
+Expose for the steam rising from the cup.
+
+[SHOT: OVER-SHOULDER]
+Switch to telephoto. Sarah's perspective looking at phone.
+
+[BEAT]
+Hold for 2 seconds. Auto-adjust exposure.
+
+[CUT TO: WIDE]
+Return to establishing. End scene.
+```
+
+### Supported Cue Types
+
+| Cue Type | Syntax | Camera Action |
+|----------|--------|---------------|
+| Shot Type | `[SHOT: WIDE\|MEDIUM\|CLOSE-UP\|ECU]` | Switch lens, set zoom level |
+| Transition | `[TRANSITION: PUSH IN\|PULL BACK\|PAN\|TRACK] - {duration}` | Animated zoom/focus change |
+| Focus | `[FOCUS: FACE\|HANDS\|OBJECT\|BACKGROUND]` | Tap-to-focus on detected region |
+| Exposure | `[EXPOSURE: AUTO\|BRIGHT\|DARK\|BACKLIT]` | Adjust EV compensation |
+| Depth | `[DOF: SHALLOW\|DEEP\|AUTO]` | Aperture hint (device-dependent) |
+| Beat | `[BEAT]` or `[HOLD: {seconds}]` | Mark timing, maintain current state |
+| Take | `[TAKE: {number}]` or auto-detected | Segment marker for post-production |
+| Scene | `[SCENE: {description}]` | Metadata for organization |
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    AI Director Layer                         │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │ Script Parser │ → │ LLM Inference│ → │Camera Commands│  │
+│  │              │    │              │    │              │  │
+│  │ Cue Detection│    │ Local/Remote │    │ Lens Switch  │  │
+│  │ Timing Marks │    │ Configurable │    │ Zoom Animate │  │
+│  │ Scene Context│    │ Prompt Chain │    │ Focus Region │  │
+│  └──────────────┘    └──────────────┘    │ Exposure Set │  │
+│                                          └──────────────┘  │
+│                                                 ↓           │
+│  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐  │
+│  │  Take Marker │ ← │Quality Scorer│ ← │ Camera Output │  │
+│  │              │    │              │    │              │  │
+│  │ Auto-segment │    │ Focus Lock % │    │ From existing│  │
+│  │ Best Take ID │    │ Stability    │    │ camera layer │  │
+│  │ Metadata Tag │    │ Exposure OK  │    │              │  │
+│  └──────────────┘    └──────────────┘    └──────────────┘  │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+                              ↓
+              Outputs to: RTSP / File / Storage
+              (existing LensDaemon pipeline)
+```
+
+### Shot Mapping
+
+The AI Director translates abstract shot descriptions to concrete camera settings:
+
+| Shot Description | Lens | Zoom | Focus Mode | Notes |
+|------------------|------|------|------------|-------|
+| ESTABLISHING / WIDE | Wide (0.5x) | 1.0 | Auto | Maximum coverage |
+| FULL SHOT | Wide (0.5x) | 1.2 | Auto | Subject head-to-toe |
+| MEDIUM / WAIST | Main (1x) | 1.0 | Auto | Standard conversation |
+| MEDIUM CLOSE-UP | Main (1x) | 1.5 | Face detect | Chest-up framing |
+| CLOSE-UP | Main (1x) | 2.0 | Face detect | Head and shoulders |
+| EXTREME CLOSE-UP | Telephoto (3x) | 1.0 | Manual tap | Detail shots |
+| OVER-SHOULDER | Telephoto (3x) | 1.2 | Auto | Perspective shots |
+
+### Take Management
+
+Automatic take separation and quality scoring:
+
+```json
+{
+  "takes": [
+    {
+      "take_number": 1,
+      "scene": "Kitchen - Morning",
+      "start_time": "00:00:00.000",
+      "end_time": "00:01:23.456",
+      "quality_score": 0.87,
+      "quality_factors": {
+        "focus_lock_percent": 94,
+        "exposure_stability": 0.91,
+        "motion_stability": 0.82,
+        "audio_level_ok": true
+      },
+      "cues_executed": 12,
+      "cues_failed": 1,
+      "suggested": true,
+      "notes": "Best focus lock of all takes"
+    },
+    {
+      "take_number": 2,
+      "scene": "Kitchen - Morning",
+      "start_time": "00:01:30.000",
+      "end_time": "00:02:45.123",
+      "quality_score": 0.72,
+      "quality_factors": {
+        "focus_lock_percent": 78,
+        "exposure_stability": 0.85,
+        "motion_stability": 0.65,
+        "audio_level_ok": true
+      },
+      "cues_executed": 12,
+      "cues_failed": 0,
+      "suggested": false,
+      "notes": "Motion blur on push-in"
+    }
+  ],
+  "best_take": 1,
+  "reason": "Highest overall quality score with best focus performance"
+}
+```
+
+### Inference Options
+
+| Mode | Description | Thermal Impact | Latency |
+|------|-------------|----------------|---------|
+| **Off** | AI Director completely disabled | Zero | N/A |
+| **Pre-parsed** | Cues parsed once at script load, no runtime inference | Minimal | <10ms |
+| **Local (future)** | On-device small model (TFLite/ONNX) | Moderate | 50-200ms |
+| **Remote** | External LLM API (OpenAI, Anthropic, local Ollama) | Minimal on-device | 200-2000ms |
+
+### Thermal Protection
+
+The AI Director integrates with the existing thermal governor:
+
+```kotlin
+interface DirectorThermalPolicy {
+    // When CPU > 50°C: Disable real-time inference, use pre-parsed only
+    // When CPU > 55°C: Disable AI Director entirely, manual control only
+    // When cooling: Re-enable after 60s below threshold
+
+    fun onThermalWarning() {
+        disableRealtimeInference()
+        notifyUser("AI Director using cached cues only")
+    }
+
+    fun onThermalCritical() {
+        disableDirector()
+        notifyUser("AI Director disabled - thermal protection")
+    }
+}
+```
+
+### API Endpoints
+
+```
+POST /api/director/script
+Body: { "script": "...", "parse_only": false }
+Response: { "scenes": [...], "total_cues": 42, "estimated_duration": "3:45" }
+
+POST /api/director/start
+Body: { "from_scene": "Kitchen - Morning" }
+Response: { "active": true, "current_scene": "...", "next_cue": "..." }
+
+POST /api/director/stop
+Response: { "active": false, "takes_recorded": 3 }
+
+GET /api/director/status
+Response: { "active": true, "current_cue": "CLOSE-UP", "next_cue": "BEAT", "take": 2 }
+
+POST /api/director/cue
+Body: { "cue": "[SHOT: WIDE]" }
+Response: { "executed": true, "lens": "wide", "zoom": 1.0 }
+
+GET /api/director/takes
+Response: { "takes": [...], "best_take": 1 }
+
+POST /api/director/mark-take
+Body: { "quality": "good" | "bad" | "circle" }
+Response: { "take": 3, "marked": "circle" }
+```
+
+### Configuration
+
+```json
+{
+  "director": {
+    "enabled": false,
+    "inference_mode": "pre-parsed",
+    "llm_endpoint": null,
+    "llm_api_key": null,
+    "auto_take_separation": true,
+    "quality_scoring": true,
+    "thermal_auto_disable": true,
+    "thermal_threshold_inference": 50,
+    "thermal_threshold_disable": 55,
+    "default_transition_duration_ms": 1000,
+    "shot_presets": {
+      "wide": { "lens": "wide", "zoom": 1.0 },
+      "medium": { "lens": "main", "zoom": 1.0 },
+      "closeup": { "lens": "main", "zoom": 2.0 },
+      "detail": { "lens": "telephoto", "zoom": 1.0 }
+    }
+  }
+}
+```
+
+### Implementation Status
+
+| Component | Status | Notes |
+|-----------|--------|-------|
+| Script parser | Planned | Regex + state machine for cue detection |
+| Shot mapping | Planned | Direct translation to camera API |
+| Transition animations | Planned | Leverage existing ZoomController |
+| Take segmentation | Planned | Extend FileWriter with markers |
+| Quality scoring | Planned | Analyze focus/exposure metadata |
+| Local inference | Future | Requires small on-device model |
+| Remote inference | Planned | HTTP client to LLM endpoints |
+
+---
+
 ## Hardware Requirements
 
 **Minimum:**
@@ -410,6 +652,17 @@ com.lensdaemon/
 - [ ] Device compatibility database
 - [ ] OTA config updates
 - [ ] Multi-device management (optional desktop app)
+
+### Phase 5: AI Director
+- [ ] Script parser with cue detection
+- [ ] Shot-to-camera mapping engine
+- [ ] Transition animations (zoom, focus)
+- [ ] Automatic take segmentation
+- [ ] Quality scoring (focus, exposure, stability)
+- [ ] Best take suggestion algorithm
+- [ ] Remote LLM integration (OpenAI, Anthropic, Ollama)
+- [ ] Thermal-safe inert mode when disabled
+- [ ] Local inference option (future)
 
 ---
 
