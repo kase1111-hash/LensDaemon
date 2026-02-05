@@ -90,6 +90,12 @@
             android:exported="false"
             android:foregroundServiceType="dataSync" />
 
+        <!-- AI Director Service -->
+        <service
+            android:name=".director.DirectorService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
         <!-- Device Admin Receiver for Kiosk Mode -->
         <receiver
             android:name=".AdminReceiver"
