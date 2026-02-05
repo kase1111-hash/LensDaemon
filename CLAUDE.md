@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 5 complete - RTSP server with RTP packetization, SDP generation, multi-client support, and UDP/TCP transport modes.
+**Status:** Phase 6 complete - Web interface with NanoHTTPD server, REST API, MJPEG live preview, and responsive dashboard.
 
 ## Tech Stack
 
@@ -115,7 +115,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 3 | Lens Control | Complete |
 | 4 | Video Encoding | Complete |
 | 5 | RTSP Server | Complete |
-| 6 | Web Interface | Pending |
+| 6 | Web Interface | Complete |
 | 7 | Local Recording | Pending |
 | 8 | Network Storage | Pending |
 | 9 | Thermal Management | Pending |
@@ -277,4 +277,58 @@ app/src/main/java/com/lensdaemon/camera/
                                  # - startRtspStreaming/stopRtspStreaming convenience methods
                                  # - RTSP URL getter
                                  # - Client count and statistics
+```
+
+## Phase 6 Files (Web Interface & Dashboard)
+
+```
+app/src/main/java/com/lensdaemon/web/
+├── WebServer.kt                 # NanoHTTPD-based HTTP server
+│                                # - Static asset serving from assets/web/
+│                                # - API routing to ApiRoutes handler
+│                                # - MJPEG stream endpoint (/mjpeg, /stream.mjpeg)
+│                                # - MIME type detection
+│                                # - Server statistics tracking
+├── ApiRoutes.kt                 # REST API endpoint handlers
+│                                # - GET /api/status - device info, temps, streaming state
+│                                # - POST /api/stream/start|stop - encoding control
+│                                # - POST /api/rtsp/start|stop - RTSP server control
+│                                # - POST /api/lens/{wide|main|tele} - lens switching
+│                                # - POST /api/zoom - set zoom level
+│                                # - POST /api/focus - tap-to-focus coordinates
+│                                # - POST /api/exposure - exposure compensation
+│                                # - POST /api/snapshot - capture JPEG
+│                                # - GET/PUT /api/config - encoder configuration
+├── MjpegStreamer.kt             # MJPEG live preview streaming
+│                                # - Motion JPEG multipart response
+│                                # - Multi-client support with ConcurrentHashMap
+│                                # - Frame rate limiting (configurable max FPS)
+│                                # - JpegFrameConverter for YUV/Bitmap conversion
+│                                # - Client connection/disconnection handling
+└── WebServerService.kt          # Foreground web server service
+                                 # - Service binding for activity integration
+                                 # - CameraService binding for API access
+                                 # - Notification management
+                                 # - MJPEG frame pushing API
+
+app/src/main/assets/web/
+├── index.html                   # Dashboard HTML
+│                                # - Live preview section with MJPEG display
+│                                # - Stream and RTSP control buttons
+│                                # - Lens selection (wide/main/tele)
+│                                # - Zoom and exposure sliders
+│                                # - Encoder settings panel
+│                                # - Real-time statistics display
+├── styles.css                   # Dashboard styles
+│                                # - Dark theme with CSS variables
+│                                # - Responsive grid layout
+│                                # - Control panel styling
+│                                # - Button states and animations
+└── dashboard.js                 # Dashboard JavaScript
+                                 # - API client functions
+                                 # - Status polling (1-second interval)
+                                 # - MJPEG preview start/stop
+                                 # - Stream and RTSP control
+                                 # - Lens and camera control handlers
+                                 # - Configuration management
 ```

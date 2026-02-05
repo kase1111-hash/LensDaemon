@@ -1,0 +1,574 @@
+package com.lensdaemon.web
+
+import android.content.Context
+import android.os.Build
+import com.lensdaemon.camera.CameraService
+import com.lensdaemon.camera.LensType
+import com.lensdaemon.encoder.EncoderConfig
+import com.lensdaemon.encoder.EncoderState
+import com.lensdaemon.encoder.VideoCodec
+import fi.iki.elonen.NanoHTTPD
+import fi.iki.elonen.NanoHTTPD.Response.Status
+import org.json.JSONArray
+import org.json.JSONObject
+import timber.log.Timber
+import java.io.ByteArrayInputStream
+
+/**
+ * REST API routes handler for LensDaemon web interface
+ */
+class ApiRoutes(
+    private val context: Context
+) {
+    companion object {
+        private const val TAG = "ApiRoutes"
+    }
+
+    // Camera service reference (set by WebServerService)
+    var cameraService: CameraService? = null
+
+    // Snapshot callback
+    var onSnapshotRequest: (() -> ByteArray?)? = null
+
+    /**
+     * Handle API request
+     */
+    fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        val uri = session.uri
+        val method = session.method
+
+        // Parse request body for POST/PUT
+        val body = if (method == NanoHTTPD.Method.POST || method == NanoHTTPD.Method.PUT) {
+            parseBody(session)
+        } else null
+
+        return when {
+            // Status endpoints
+            uri == "/api/status" && method == NanoHTTPD.Method.GET -> getStatus()
+            uri == "/api/device" && method == NanoHTTPD.Method.GET -> getDeviceInfo()
+
+            // Stream control
+            uri == "/api/stream/start" && method == NanoHTTPD.Method.POST -> startStream(body)
+            uri == "/api/stream/stop" && method == NanoHTTPD.Method.POST -> stopStream()
+            uri == "/api/stream/status" && method == NanoHTTPD.Method.GET -> getStreamStatus()
+
+            // RTSP control
+            uri == "/api/rtsp/start" && method == NanoHTTPD.Method.POST -> startRtsp(body)
+            uri == "/api/rtsp/stop" && method == NanoHTTPD.Method.POST -> stopRtsp()
+            uri == "/api/rtsp/status" && method == NanoHTTPD.Method.GET -> getRtspStatus()
+
+            // Lens control
+            uri.startsWith("/api/lens/") && method == NanoHTTPD.Method.POST -> switchLens(uri)
+            uri == "/api/lenses" && method == NanoHTTPD.Method.GET -> getLenses()
+
+            // Camera control
+            uri == "/api/zoom" && method == NanoHTTPD.Method.POST -> setZoom(body)
+            uri == "/api/focus" && method == NanoHTTPD.Method.POST -> triggerFocus(body)
+            uri == "/api/exposure" && method == NanoHTTPD.Method.POST -> setExposure(body)
+
+            // Snapshot
+            uri == "/api/snapshot" && method == NanoHTTPD.Method.POST -> captureSnapshot()
+            uri == "/api/snapshot" && method == NanoHTTPD.Method.GET -> captureSnapshot()
+
+            // Configuration
+            uri == "/api/config" && method == NanoHTTPD.Method.GET -> getConfig()
+            uri == "/api/config" && method == NanoHTTPD.Method.PUT -> updateConfig(body)
+
+            // Encoder
+            uri == "/api/encoder/capabilities" && method == NanoHTTPD.Method.GET -> getEncoderCapabilities()
+
+            // Not found
+            else -> NanoHTTPD.newFixedLengthResponse(
+                Status.NOT_FOUND,
+                WebServer.MIME_JSON,
+                """{"error": "Endpoint not found", "uri": "$uri", "method": "${method.name}"}"""
+            )
+        }
+    }
+
+    /**
+     * Parse request body
+     */
+    private fun parseBody(session: NanoHTTPD.IHTTPSession): JSONObject? {
+        return try {
+            val files = mutableMapOf<String, String>()
+            session.parseBody(files)
+            val postData = files["postData"] ?: return null
+            JSONObject(postData)
+        } catch (e: Exception) {
+            Timber.e(e, "$TAG: Error parsing request body")
+            null
+        }
+    }
+
+    // ==================== Status Endpoints ====================
+
+    /**
+     * GET /api/status - Get overall system status
+     */
+    private fun getStatus(): NanoHTTPD.Response {
+        val camera = cameraService
+        val json = JSONObject().apply {
+            put("status", "ok")
+            put("timestamp", System.currentTimeMillis())
+
+            // Camera status
+            put("camera", JSONObject().apply {
+                put("previewActive", camera?.isPreviewActive() ?: false)
+                put("streamingActive", camera?.isStreaming() ?: false)
+                val currentLens = camera?.getCurrentLens()?.value
+                put("currentLens", currentLens?.lensType?.name ?: "none")
+                put("zoom", camera?.currentZoom?.value ?: 1.0f)
+            })
+
+            // Encoder status
+            put("encoder", JSONObject().apply {
+                val state = camera?.encoderState?.value ?: EncoderState.IDLE
+                put("state", state.name)
+                val stats = camera?.getEncoderStats()
+                if (stats != null) {
+                    put("framesEncoded", stats.framesEncoded)
+                    put("currentBitrate", stats.currentBitrateBps)
+                    put("currentFps", stats.currentFps)
+                }
+            })
+
+            // RTSP status
+            put("rtsp", JSONObject().apply {
+                put("running", camera?.isRtspServerRunning() ?: false)
+                put("url", camera?.getRtspUrl() ?: "")
+                put("clients", camera?.getRtspClientCount() ?: 0)
+                put("playing", camera?.getRtspPlayingCount() ?: 0)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * GET /api/device - Get device information
+     */
+    private fun getDeviceInfo(): NanoHTTPD.Response {
+        val json = JSONObject().apply {
+            put("manufacturer", Build.MANUFACTURER)
+            put("model", Build.MODEL)
+            put("device", Build.DEVICE)
+            put("androidVersion", Build.VERSION.RELEASE)
+            put("sdkVersion", Build.VERSION.SDK_INT)
+            put("appVersion", "1.0.0")
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Stream Control ====================
+
+    /**
+     * POST /api/stream/start - Start encoding
+     */
+    private fun startStream(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        // Parse config from body
+        val width = body?.optInt("width", 1920) ?: 1920
+        val height = body?.optInt("height", 1080) ?: 1080
+        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
+        val frameRate = body?.optInt("frameRate", 30) ?: 30
+        val codecStr = body?.optString("codec", "H264") ?: "H264"
+        val codec = try { VideoCodec.valueOf(codecStr) } catch (e: Exception) { VideoCodec.H264 }
+
+        val config = EncoderConfig(
+            codec = codec,
+            resolution = android.util.Size(width, height),
+            bitrateBps = bitrate,
+            frameRate = frameRate
+        )
+
+        camera.startStreaming(config)
+
+        val json = JSONObject().apply {
+            put("success", true)
+            put("message", "Streaming started")
+            put("config", JSONObject().apply {
+                put("width", width)
+                put("height", height)
+                put("bitrate", bitrate)
+                put("frameRate", frameRate)
+                put("codec", codec.name)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/stream/stop - Stop encoding
+     */
+    private fun stopStream(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+        camera.stopStreaming()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Streaming stopped"}"""
+        )
+    }
+
+    /**
+     * GET /api/stream/status - Get stream status
+     */
+    private fun getStreamStatus(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val stats = camera.getEncoderStats()
+        val config = camera.getEncoderConfig()
+
+        val json = JSONObject().apply {
+            put("active", camera.isStreaming())
+            put("encoderState", camera.encoderState.value.name)
+            if (stats != null) {
+                put("framesEncoded", stats.framesEncoded)
+                put("framesDropped", stats.framesDropped)
+                put("currentBitrate", stats.currentBitrateBps)
+                put("currentFps", stats.currentFps)
+                put("totalBytes", stats.totalBytesEncoded)
+                put("duration", stats.durationSec)
+            }
+            if (config != null) {
+                put("config", JSONObject().apply {
+                    put("width", config.width)
+                    put("height", config.height)
+                    put("bitrate", config.bitrateBps)
+                    put("frameRate", config.frameRate)
+                    put("codec", config.codec.name)
+                })
+            }
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== RTSP Control ====================
+
+    /**
+     * POST /api/rtsp/start - Start RTSP server
+     */
+    private fun startRtsp(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val port = body?.optInt("port", 8554) ?: 8554
+
+        // Parse encoder config
+        val width = body?.optInt("width", 1920) ?: 1920
+        val height = body?.optInt("height", 1080) ?: 1080
+        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
+        val frameRate = body?.optInt("frameRate", 30) ?: 30
+
+        val config = EncoderConfig(
+            resolution = android.util.Size(width, height),
+            bitrateBps = bitrate,
+            frameRate = frameRate
+        )
+
+        val success = camera.startRtspStreaming(config, port)
+
+        val json = JSONObject().apply {
+            put("success", success)
+            if (success) {
+                put("url", camera.getRtspUrl())
+                put("message", "RTSP streaming started")
+            } else {
+                put("message", "Failed to start RTSP streaming")
+            }
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.INTERNAL_ERROR,
+            WebServer.MIME_JSON,
+            json.toString()
+        )
+    }
+
+    /**
+     * POST /api/rtsp/stop - Stop RTSP server
+     */
+    private fun stopRtsp(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+        camera.stopRtspStreaming()
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "RTSP streaming stopped"}"""
+        )
+    }
+
+    /**
+     * GET /api/rtsp/status - Get RTSP status
+     */
+    private fun getRtspStatus(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val stats = camera.getRtspServerStats()
+
+        val json = JSONObject().apply {
+            put("running", camera.isRtspServerRunning())
+            put("url", camera.getRtspUrl() ?: "")
+            put("clients", camera.getRtspClientCount())
+            put("playing", camera.getRtspPlayingCount())
+            if (stats != null) {
+                put("totalConnections", stats.totalConnections)
+                put("totalPackets", stats.totalPacketsSent)
+                put("totalBytes", stats.totalBytesSent)
+                put("uptime", stats.uptimeMs)
+            }
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Lens Control ====================
+
+    /**
+     * POST /api/lens/{type} - Switch camera lens
+     */
+    private fun switchLens(uri: String): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val lensName = uri.substringAfterLast("/")
+        val lensType = when (lensName.lowercase()) {
+            "wide", "ultrawide" -> LensType.WIDE
+            "main", "primary" -> LensType.MAIN
+            "tele", "telephoto", "zoom" -> LensType.TELEPHOTO
+            else -> return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Unknown lens type: $lensName"}"""
+            )
+        }
+
+        camera.switchLens(lensType)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "lens": "${lensType.name}"}"""
+        )
+    }
+
+    /**
+     * GET /api/lenses - Get available lenses
+     */
+    private fun getLenses(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val lenses = camera.getAvailableLenses()
+        val currentLens = camera.getCurrentLens().value
+
+        val json = JSONObject().apply {
+            put("current", currentLens?.lensType?.name ?: "none")
+            put("available", JSONArray().apply {
+                lenses.forEach { lens ->
+                    put(JSONObject().apply {
+                        put("type", lens.lensType.name)
+                        put("displayName", lens.lensType.displayName)
+                        put("cameraId", lens.cameraId)
+                        put("focalLength", lens.focalLength)
+                        put("aperture", lens.aperture)
+                    })
+                }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Camera Control ====================
+
+    /**
+     * POST /api/zoom - Set zoom level
+     */
+    private fun setZoom(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val zoom = body?.optDouble("zoom", 1.0) ?: 1.0
+
+        camera.setZoom(zoom.toFloat())
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "zoom": $zoom}"""
+        )
+    }
+
+    /**
+     * POST /api/focus - Trigger focus at point
+     */
+    private fun triggerFocus(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val x = body?.optDouble("x", 0.5) ?: 0.5
+        val y = body?.optDouble("y", 0.5) ?: 0.5
+
+        // Trigger tap-to-focus at normalized coordinates
+        camera.triggerTapToFocus(
+            x.toFloat(),
+            y.toFloat(),
+            android.util.Size(1920, 1080) // Assume 1080p
+        )
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "x": $x, "y": $y}"""
+        )
+    }
+
+    /**
+     * POST /api/exposure - Set exposure compensation
+     */
+    private fun setExposure(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val ev = body?.optInt("ev", 0) ?: 0
+
+        camera.setExposureCompensation(ev)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "ev": $ev}"""
+        )
+    }
+
+    // ==================== Snapshot ====================
+
+    /**
+     * GET/POST /api/snapshot - Capture JPEG snapshot
+     */
+    private fun captureSnapshot(): NanoHTTPD.Response {
+        val callback = onSnapshotRequest ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.SERVICE_UNAVAILABLE,
+            WebServer.MIME_JSON,
+            """{"error": "Snapshot not available"}"""
+        )
+
+        val jpegData = callback.invoke() ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.INTERNAL_ERROR,
+            WebServer.MIME_JSON,
+            """{"error": "Failed to capture snapshot"}"""
+        )
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JPEG,
+            ByteArrayInputStream(jpegData),
+            jpegData.size.toLong()
+        )
+    }
+
+    // ==================== Configuration ====================
+
+    /**
+     * GET /api/config - Get current configuration
+     */
+    private fun getConfig(): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        val encoderConfig = camera.getEncoderConfig()
+        val captureConfig = camera.getConfig()
+
+        val json = JSONObject().apply {
+            put("encoder", JSONObject().apply {
+                if (encoderConfig != null) {
+                    put("width", encoderConfig.width)
+                    put("height", encoderConfig.height)
+                    put("bitrate", encoderConfig.bitrateBps)
+                    put("frameRate", encoderConfig.frameRate)
+                    put("codec", encoderConfig.codec.name)
+                    put("keyframeInterval", encoderConfig.keyframeIntervalSec)
+                }
+            })
+            put("camera", JSONObject().apply {
+                put("resolution", "${captureConfig.resolution.width}x${captureConfig.resolution.height}")
+                put("focusMode", captureConfig.focusMode.name)
+                put("whiteBalance", captureConfig.whiteBalance.name)
+                put("exposureCompensation", captureConfig.exposureCompensation)
+                put("zoom", captureConfig.zoomRatio)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * PUT /api/config - Update configuration
+     */
+    private fun updateConfig(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return serviceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        // Update encoder config if streaming
+        if (body.has("bitrate")) {
+            camera.updateEncoderBitrate(body.getInt("bitrate"))
+        }
+
+        // Update camera config
+        if (body.has("zoom")) {
+            camera.setZoom(body.getDouble("zoom").toFloat())
+        }
+        if (body.has("exposureCompensation")) {
+            camera.setExposureCompensation(body.getInt("exposureCompensation"))
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "message": "Configuration updated"}"""
+        )
+    }
+
+    // ==================== Encoder ====================
+
+    /**
+     * GET /api/encoder/capabilities - Get encoder capabilities
+     */
+    private fun getEncoderCapabilities(): NanoHTTPD.Response {
+        val json = JSONObject().apply {
+            put("codecs", JSONArray().apply {
+                put("H264")
+                put("H265")
+            })
+            put("resolutions", JSONArray().apply {
+                put(JSONObject().apply { put("name", "720p"); put("width", 1280); put("height", 720) })
+                put(JSONObject().apply { put("name", "1080p"); put("width", 1920); put("height", 1080) })
+                put(JSONObject().apply { put("name", "1080p60"); put("width", 1920); put("height", 1080) })
+                put(JSONObject().apply { put("name", "4K"); put("width", 3840); put("height", 2160) })
+            })
+            put("frameRates", JSONArray().apply { put(15); put(24); put(30); put(60) })
+            put("bitrateRange", JSONObject().apply {
+                put("min", 500000)
+                put("max", 20000000)
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Helpers ====================
+
+    private fun serviceUnavailable(): NanoHTTPD.Response {
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.SERVICE_UNAVAILABLE,
+            WebServer.MIME_JSON,
+            """{"error": "Camera service not available"}"""
+        )
+    }
+}
