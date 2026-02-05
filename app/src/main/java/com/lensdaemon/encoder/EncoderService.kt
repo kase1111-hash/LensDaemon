@@ -10,6 +10,7 @@ import android.content.Intent
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
+import android.media.MediaFormat
 import android.util.Size
 import android.view.Surface
 import androidx.core.app.NotificationCompat
@@ -342,6 +343,11 @@ class EncoderService : Service() {
      * Get current configuration
      */
     fun getConfig(): EncoderConfig? = currentConfig
+
+    /**
+     * Get output format from encoder (for muxer configuration)
+     */
+    fun getOutputFormat(): MediaFormat? = frameProcessor?.getOutputFormat()
 
     /**
      * Get current bitrate

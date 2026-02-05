@@ -1,0 +1,157 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LensDaemon Dashboard</title>
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>LensDaemon</h1>
+            <div id="connection-status" class="status-indicator disconnected">Disconnected</div>
+        </header>
+
+        <main>
+            <!-- Preview Section -->
+            <section class="preview-section">
+                <div class="preview-container">
+                    <img id="mjpeg-preview" src="" alt="Live Preview" class="preview-image">
+                    <div id="preview-overlay" class="preview-overlay">
+                        <span>Click to start preview</span>
+                    </div>
+                </div>
+                <div class="preview-controls">
+                    <button id="btn-preview" class="btn btn-primary">Start Preview</button>
+                    <button id="btn-snapshot" class="btn btn-secondary">Snapshot</button>
+                </div>
+            </section>
+
+            <!-- Controls Section -->
+            <section class="controls-section">
+                <!-- Stream Controls -->
+                <div class="control-group">
+                    <h3>Stream Control</h3>
+                    <div class="stream-status">
+                        <span>Status: </span>
+                        <span id="stream-status" class="status-text">Stopped</span>
+                    </div>
+                    <div class="button-group">
+                        <button id="btn-stream-start" class="btn btn-success">Start Streaming</button>
+                        <button id="btn-stream-stop" class="btn btn-danger" disabled>Stop Streaming</button>
+                    </div>
+                </div>
+
+                <!-- RTSP Controls -->
+                <div class="control-group">
+                    <h3>RTSP Server</h3>
+                    <div class="rtsp-info">
+                        <span>URL: </span>
+                        <a id="rtsp-url" href="#" class="rtsp-link">Not running</a>
+                    </div>
+                    <div class="rtsp-stats">
+                        <span>Clients: <span id="rtsp-clients">0</span></span>
+                    </div>
+                    <div class="button-group">
+                        <button id="btn-rtsp-start" class="btn btn-success">Start RTSP</button>
+                        <button id="btn-rtsp-stop" class="btn btn-danger" disabled>Stop RTSP</button>
+                    </div>
+                </div>
+
+                <!-- Lens Selection -->
+                <div class="control-group">
+                    <h3>Camera Lens</h3>
+                    <div id="lens-buttons" class="lens-buttons">
+                        <button class="btn btn-lens" data-lens="wide">Wide</button>
+                        <button class="btn btn-lens active" data-lens="main">Main</button>
+                        <button class="btn btn-lens" data-lens="tele">Tele</button>
+                    </div>
+                </div>
+
+                <!-- Zoom Control -->
+                <div class="control-group">
+                    <h3>Zoom</h3>
+                    <div class="zoom-control">
+                        <input type="range" id="zoom-slider" min="1" max="10" step="0.1" value="1">
+                        <span id="zoom-value">1.0x</span>
+                    </div>
+                </div>
+
+                <!-- Exposure Control -->
+                <div class="control-group">
+                    <h3>Exposure</h3>
+                    <div class="exposure-control">
+                        <input type="range" id="exposure-slider" min="-12" max="12" step="1" value="0">
+                        <span id="exposure-value">0 EV</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Settings Section -->
+            <section class="settings-section">
+                <h3>Encoder Settings</h3>
+                <div class="settings-form">
+                    <div class="form-group">
+                        <label for="resolution">Resolution</label>
+                        <select id="resolution">
+                            <option value="1280x720">720p (1280x720)</option>
+                            <option value="1920x1080" selected>1080p (1920x1080)</option>
+                            <option value="3840x2160">4K (3840x2160)</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="bitrate">Bitrate (Mbps)</label>
+                        <input type="number" id="bitrate" value="4" min="0.5" max="20" step="0.5">
+                    </div>
+                    <div class="form-group">
+                        <label for="framerate">Frame Rate</label>
+                        <select id="framerate">
+                            <option value="15">15 fps</option>
+                            <option value="24">24 fps</option>
+                            <option value="30" selected>30 fps</option>
+                            <option value="60">60 fps</option>
+                        </select>
+                    </div>
+                    <div class="form-group">
+                        <label for="codec">Codec</label>
+                        <select id="codec">
+                            <option value="H264" selected>H.264</option>
+                            <option value="H265">H.265 (HEVC)</option>
+                        </select>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Stats Section -->
+            <section class="stats-section">
+                <h3>Statistics</h3>
+                <div class="stats-grid">
+                    <div class="stat-item">
+                        <span class="stat-label">Frames Encoded</span>
+                        <span id="stat-frames" class="stat-value">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Current FPS</span>
+                        <span id="stat-fps" class="stat-value">0</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Bitrate</span>
+                        <span id="stat-bitrate" class="stat-value">0 kbps</span>
+                    </div>
+                    <div class="stat-item">
+                        <span class="stat-label">Encoder State</span>
+                        <span id="stat-encoder" class="stat-value">IDLE</span>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <footer>
+            <p>LensDaemon v1.0 | <span id="device-info">Loading...</span></p>
+        </footer>
+    </div>
+
+    <script src="dashboard.js"></script>
+</body>
+</html>
