@@ -208,7 +208,7 @@ See [API.md](docs/API.md) for full reference.
 - [ ] On-device motion detection
 - [ ] ONVIF compatibility
 - [ ] Multi-device management
-- [ ] **AI Director Mode** — Script-driven camera automation
+- [x] **AI Director Mode** — Script-driven camera automation
 
 ---
 
@@ -243,10 +243,10 @@ MIT — Use it, fork it, sell it, build on it.
 
 ## Links
 
-- [Full Specification](docs/SPEC.md)
+- [Full Specification](spec.md)
 - [API Reference](docs/API.md)
 - [Device Compatibility](docs/DEVICES.md)
-- [Setup Guide](docs/SETUP.md)
+- [Implementation Guide](docs/IMPLEMENTATION_GUIDE.md)
 
 ---
 

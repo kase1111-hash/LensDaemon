@@ -1,54 +1,24 @@
 package com.lensdaemon.web
 
+import com.lensdaemon.web.handlers.ApiHandlerUtils
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
-import java.lang.reflect.Method
 
 /**
- * Tests for security-related functionality in ApiRoutes.
+ * Tests for security-related functionality in API route handlers.
  *
- * Uses reflection to test private sanitizeFileName and validateFileInDirectory methods
- * since they are critical security functions that must be verified independently.
+ * Tests the public sanitizeFileName and validateFileInDirectory methods
+ * in ApiHandlerUtils which protect against path traversal attacks.
  */
 class ApiRoutesSecurityTest {
 
-    // Use reflection to access private methods for testing
-    private val sanitizeMethod: Method by lazy {
-        ApiRoutes::class.java.getDeclaredMethod("sanitizeFileName", String::class.java).also {
-            it.isAccessible = true
-        }
-    }
-
-    private val validateMethod: Method by lazy {
-        ApiRoutes::class.java.getDeclaredMethod("validateFileInDirectory", File::class.java, File::class.java).also {
-            it.isAccessible = true
-        }
-    }
-
-    private fun sanitizeFileName(fileName: String): String? {
-        // ApiRoutes requires a Context parameter; we create a minimal instance via reflection workaround
-        // Since sanitizeFileName is a pure function, we test the logic directly
-        return callSanitize(fileName)
-    }
-
     private fun callSanitize(fileName: String): String? {
-        // Test the sanitization logic directly
-        if (fileName.isEmpty()) return null
-        if (fileName.contains("/") || fileName.contains("\\") ||
-            fileName.contains("..") || fileName.contains("\u0000")) {
-            return null
-        }
-        val sanitized = fileName.trim()
-        if (!sanitized.matches(Regex("^[a-zA-Z0-9._\\- ]+$"))) {
-            return null
-        }
-        return sanitized
+        return ApiHandlerUtils.sanitizeFileName(fileName)
     }
 
     private fun validateFileInDir(file: File, directory: File): Boolean {
-        return file.canonicalPath.startsWith(directory.canonicalPath + File.separator) ||
-               file.canonicalPath == directory.canonicalPath
+        return ApiHandlerUtils.validateFileInDirectory(file, directory)
     }
 
     // ==================== sanitizeFileName Tests ====================
