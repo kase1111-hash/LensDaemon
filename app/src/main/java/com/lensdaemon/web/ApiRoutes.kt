@@ -191,6 +191,18 @@ class ApiRoutes(
             uri == "/api/director/events" && method == NanoHTTPD.Method.GET -> getDirectorEvents()
             uri == "/api/director/script/clear" && method == NanoHTTPD.Method.POST -> clearDirectorScript()
 
+            // Script file management
+            uri == "/api/director/scripts" && method == NanoHTTPD.Method.GET -> listScriptFiles()
+            uri == "/api/director/scripts/save" && method == NanoHTTPD.Method.POST -> saveScriptFile(body)
+            uri.startsWith("/api/director/scripts/") && method == NanoHTTPD.Method.GET -> loadScriptFile(uri)
+            uri.startsWith("/api/director/scripts/") && method == NanoHTTPD.Method.DELETE -> deleteScriptFile(uri)
+            uri == "/api/director/scripts/export" && method == NanoHTTPD.Method.GET -> exportCurrentScript()
+            uri == "/api/director/scripts/import" && method == NanoHTTPD.Method.POST -> importScript(body)
+
+            // Take-recording linking
+            uri == "/api/director/takes/link" && method == NanoHTTPD.Method.POST -> linkTakeToRecording(body)
+            uri == "/api/director/takes/markers" && method == NanoHTTPD.Method.GET -> getTakeMarkers()
+
             // Not found
             else -> NanoHTTPD.newFixedLengthResponse(
                 Status.NOT_FOUND,
@@ -2424,6 +2436,327 @@ class ApiRoutes(
             WebServer.MIME_JSON,
             """{"success": true, "message": "Script cleared"}"""
         )
+    }
+
+    // ==================== Script File Management ====================
+
+    /**
+     * GET /api/director/scripts - List saved script files
+     */
+    private fun listScriptFiles(): NanoHTTPD.Response {
+        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
+        if (!scriptsDir.exists()) {
+            scriptsDir.mkdirs()
+        }
+
+        val scripts = scriptsDir.listFiles()?.mapNotNull { file ->
+            if (file.isFile && file.name.endsWith(".txt")) {
+                JSONObject().apply {
+                    put("name", file.nameWithoutExtension)
+                    put("fileName", file.name)
+                    put("sizeBytes", file.length())
+                    put("lastModified", file.lastModified())
+                }
+            } else null
+        } ?: emptyList()
+
+        val json = JSONObject().apply {
+            put("success", true)
+            put("count", scripts.size)
+            put("scripts", JSONArray(scripts))
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/director/scripts/save - Save script to file
+     */
+    private fun saveScriptFile(body: JSONObject?): NanoHTTPD.Response {
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val fileName = body.optString("fileName", "")
+        val scriptText = body.optString("script", "")
+
+        if (fileName.isEmpty() || scriptText.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "fileName and script are required"}"""
+            )
+        }
+
+        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
+        scriptsDir.mkdirs()
+
+        val actualFileName = if (fileName.endsWith(".txt")) fileName else "$fileName.txt"
+        val file = java.io.File(scriptsDir, actualFileName)
+
+        return try {
+            file.writeText(scriptText)
+            NanoHTTPD.newFixedLengthResponse(
+                Status.OK,
+                WebServer.MIME_JSON,
+                """{"success": true, "fileName": "$actualFileName", "message": "Script saved"}"""
+            )
+        } catch (e: Exception) {
+            NanoHTTPD.newFixedLengthResponse(
+                Status.INTERNAL_ERROR,
+                WebServer.MIME_JSON,
+                """{"error": "Failed to save script: ${e.message}"}"""
+            )
+        }
+    }
+
+    /**
+     * GET /api/director/scripts/{fileName} - Load script file content
+     */
+    private fun loadScriptFile(uri: String): NanoHTTPD.Response {
+        val fileName = uri.removePrefix("/api/director/scripts/")
+        if (fileName.isEmpty() || fileName == "save" || fileName == "export" || fileName == "import") {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "Invalid file name"}"""
+            )
+        }
+
+        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
+        val file = java.io.File(scriptsDir, fileName)
+
+        if (!file.exists()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.NOT_FOUND,
+                WebServer.MIME_JSON,
+                """{"error": "Script file not found: $fileName"}"""
+            )
+        }
+
+        return try {
+            val content = file.readText()
+
+            // Optionally load into director
+            val director = directorManager
+            val loadResult = director?.loadScript(content)
+
+            val json = JSONObject().apply {
+                put("success", true)
+                put("fileName", fileName)
+                put("content", content)
+                put("loaded", loadResult?.isSuccess ?: false)
+                if (loadResult?.isSuccess == true) {
+                    val script = loadResult.getOrNull()!!
+                    put("scenes", script.scenes.size)
+                    put("totalCues", script.totalCues)
+                }
+            }
+
+            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        } catch (e: Exception) {
+            NanoHTTPD.newFixedLengthResponse(
+                Status.INTERNAL_ERROR,
+                WebServer.MIME_JSON,
+                """{"error": "Failed to read script: ${e.message}"}"""
+            )
+        }
+    }
+
+    /**
+     * DELETE /api/director/scripts/{fileName} - Delete script file
+     */
+    private fun deleteScriptFile(uri: String): NanoHTTPD.Response {
+        val fileName = uri.removePrefix("/api/director/scripts/")
+        if (fileName.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "File name required"}"""
+            )
+        }
+
+        val scriptsDir = java.io.File(context.filesDir, "director_scripts")
+        val file = java.io.File(scriptsDir, fileName)
+
+        if (!file.exists()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.NOT_FOUND,
+                WebServer.MIME_JSON,
+                """{"error": "Script file not found"}"""
+            )
+        }
+
+        return if (file.delete()) {
+            NanoHTTPD.newFixedLengthResponse(
+                Status.OK,
+                WebServer.MIME_JSON,
+                """{"success": true, "message": "Script deleted"}"""
+            )
+        } else {
+            NanoHTTPD.newFixedLengthResponse(
+                Status.INTERNAL_ERROR,
+                WebServer.MIME_JSON,
+                """{"error": "Failed to delete script"}"""
+            )
+        }
+    }
+
+    /**
+     * GET /api/director/scripts/export - Export current script
+     */
+    private fun exportCurrentScript(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+        val session = director.currentSession.value
+
+        if (session == null) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.NOT_FOUND,
+                WebServer.MIME_JSON,
+                """{"error": "No script currently loaded"}"""
+            )
+        }
+
+        val json = JSONObject().apply {
+            put("success", true)
+            put("script", session.script.rawText)
+            put("scenes", session.script.scenes.size)
+            put("totalCues", session.script.totalCues)
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /**
+     * POST /api/director/scripts/import - Import script text
+     */
+    private fun importScript(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val scriptText = body.optString("script", "")
+        val fileName = body.optString("fileName", "")
+        val saveToFile = body.optBoolean("save", false)
+
+        if (scriptText.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "script field is required"}"""
+            )
+        }
+
+        val result = director.loadScript(scriptText)
+
+        if (result.isSuccess && saveToFile && fileName.isNotEmpty()) {
+            val scriptsDir = java.io.File(context.filesDir, "director_scripts")
+            scriptsDir.mkdirs()
+            val actualFileName = if (fileName.endsWith(".txt")) fileName else "$fileName.txt"
+            java.io.File(scriptsDir, actualFileName).writeText(scriptText)
+        }
+
+        return if (result.isSuccess) {
+            val script = result.getOrNull()!!
+            val json = JSONObject().apply {
+                put("success", true)
+                put("message", "Script imported")
+                put("scenes", script.scenes.size)
+                put("totalCues", script.totalCues)
+                put("saved", saveToFile && fileName.isNotEmpty())
+            }
+            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        } else {
+            val error = result.exceptionOrNull()?.message ?: "Unknown error"
+            NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"success": false, "error": "$error"}"""
+            )
+        }
+    }
+
+    // ==================== Take-Recording Linking ====================
+
+    /**
+     * POST /api/director/takes/link - Link take to recording file
+     */
+    private fun linkTakeToRecording(body: JSONObject?): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+
+        body ?: return NanoHTTPD.newFixedLengthResponse(
+            Status.BAD_REQUEST,
+            WebServer.MIME_JSON,
+            """{"error": "Request body required"}"""
+        )
+
+        val takeNumber = body.optInt("takeNumber", -1)
+        val filePath = body.optString("filePath", "")
+
+        if (takeNumber < 0 || filePath.isEmpty()) {
+            return NanoHTTPD.newFixedLengthResponse(
+                Status.BAD_REQUEST,
+                WebServer.MIME_JSON,
+                """{"error": "takeNumber and filePath are required"}"""
+            )
+        }
+
+        director.getTakeManager().linkTakeToFile(takeNumber, filePath)
+
+        return NanoHTTPD.newFixedLengthResponse(
+            Status.OK,
+            WebServer.MIME_JSON,
+            """{"success": true, "takeNumber": $takeNumber, "filePath": "$filePath"}"""
+        )
+    }
+
+    /**
+     * GET /api/director/takes/markers - Get take markers for recording metadata
+     */
+    private fun getTakeMarkers(): NanoHTTPD.Response {
+        val director = directorManager ?: return directorServiceUnavailable()
+        val takeManager = director.getTakeManager()
+        val takes = takeManager.recordedTakes.value
+
+        // Generate markers from takes
+        val markers = mutableListOf<JSONObject>()
+
+        takes.forEach { take ->
+            // Start marker
+            markers.add(JSONObject().apply {
+                put("type", "TAKE_START")
+                put("takeNumber", take.takeNumber)
+                put("sceneId", take.sceneId)
+                put("sceneLabel", take.sceneLabel)
+                put("timestampMs", take.startTimeMs)
+            })
+
+            // End marker
+            if (take.endTimeMs > 0) {
+                markers.add(JSONObject().apply {
+                    put("type", "TAKE_END")
+                    put("takeNumber", take.takeNumber)
+                    put("sceneId", take.sceneId)
+                    put("timestampMs", take.endTimeMs)
+                    put("qualityScore", take.qualityScore)
+                    put("durationMs", take.durationMs)
+                })
+            }
+        }
+
+        val json = JSONObject().apply {
+            put("success", true)
+            put("count", markers.size)
+            put("markers", JSONArray(markers))
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
     // ==================== Helpers ====================

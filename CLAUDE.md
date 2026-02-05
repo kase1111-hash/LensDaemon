@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** AI Director Phase 3 complete - Web dashboard UI, real-time status updates, script input/management, and take visualization.
+**Status:** AI Director Phase 4 complete - DirectorService lifecycle, script file persistence, take-recording integration, and metadata markers.
 
 ## Tech Stack
 
@@ -858,3 +858,109 @@ The web dashboard now includes a comprehensive AI Director control panel:
 - Average quality score
 - Best takes count
 - Cue success rate
+
+## AI Director Phase 4 Files (Service Lifecycle & Recording Integration)
+
+```
+app/src/main/java/com/lensdaemon/director/
+├── DirectorService.kt           # Foreground service for AI Director
+│                                # - DirectorManager lifecycle management
+│                                # - Camera controller adapter integration
+│                                # - Quality metrics collection
+│                                # - Script persistence to device storage
+│                                # - Take/recording coordination
+│                                # - Service binding for API access
+│                                # - TakeMarker emission for recording metadata
+│                                # - DirectorServiceState (STOPPED, RUNNING, ERROR)
+│                                # - ScriptFile data class for file listing
+│                                # - TakeMarker data class for recording metadata
+│                                # - MarkerType enum (TAKE_START, TAKE_END, CUE, SCENE_CHANGE)
+└── TakeManager.kt               # Updated with new methods
+                                 # - linkTakeToFile() for recording association
+                                 # - getTakesForScene() for scene filtering
+                                 # - getTakesWithFiles() for file-linked takes
+                                 # - currentTakeNumber property
+
+app/src/main/java/com/lensdaemon/web/
+└── ApiRoutes.kt                 # Updated with script file and take endpoints
+                                 # - GET /api/director/scripts - list saved scripts
+                                 # - POST /api/director/scripts/save - save script file
+                                 # - GET /api/director/scripts/{fileName} - load script
+                                 # - DELETE /api/director/scripts/{fileName} - delete script
+                                 # - GET /api/director/scripts/export - export current
+                                 # - POST /api/director/scripts/import - import script
+                                 # - POST /api/director/takes/link - link take to file
+                                 # - GET /api/director/takes/markers - get take markers
+
+app/src/main/AndroidManifest.xml # Updated with DirectorService registration
+```
+
+## Script File Management API
+
+```
+GET  /api/director/scripts              # List saved script files
+POST /api/director/scripts/save         # Save script to file
+     body: { "fileName": "scene1.txt", "script": "[SCENE: ...]" }
+GET  /api/director/scripts/{fileName}   # Load and parse script file
+DELETE /api/director/scripts/{fileName} # Delete script file
+GET  /api/director/scripts/export       # Export current script as text
+POST /api/director/scripts/import       # Import script text (optionally save)
+     body: { "script": "...", "fileName": "...", "save": true }
+```
+
+## Take-Recording Integration API
+
+```
+POST /api/director/takes/link    # Link take to recording file
+     body: { "takeNumber": 1, "filePath": "/path/to/video.mp4" }
+GET  /api/director/takes/markers # Get take markers for recording metadata
+```
+
+## Take Markers
+
+The DirectorService emits take markers that can be embedded in recording metadata:
+
+```json
+{
+  "type": "TAKE_START",
+  "takeNumber": 1,
+  "sceneId": "scene_001",
+  "timestampMs": 1699887600000
+}
+
+{
+  "type": "TAKE_END",
+  "takeNumber": 1,
+  "sceneId": "scene_001",
+  "timestampMs": 1699887630000,
+  "qualityScore": 8.5,
+  "durationMs": 30000
+}
+
+{
+  "type": "CUE",
+  "takeNumber": 1,
+  "sceneId": "scene_001",
+  "timestampMs": 1699887615000,
+  "cueText": "[SHOT: CLOSE-UP]",
+  "cueSuccess": true
+}
+```
+
+## DirectorService Integration
+
+The DirectorService provides callbacks for recording integration:
+
+```kotlin
+// In CameraService or RecordingManager
+directorService.onTakeStarted = { take ->
+    // Mark take start in recording
+}
+
+directorService.onTakeEnded = { take ->
+    // Mark take end, save quality score
+}
+
+directorService.onRecordingMarker = { marker ->
+    // Embed marker in recording metadata
+}
