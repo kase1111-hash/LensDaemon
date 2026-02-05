@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** AI Director Phase 5 complete - Dashboard enhancements with script file browser, timeline visualization, scene navigation, and session export/reporting.
+**Status:** Post-evaluation remediation complete through Phase 5. All 10 implementation phases done. Security hardened, CI/CD added, SRT protocol implemented, LLM Director watchdog added.
 
 ## Tech Stack
 
@@ -26,6 +26,9 @@ LensDaemon is an Android application that transforms smartphones into dedicated 
 
 # Run tests
 ./gradlew test
+
+# Static analysis (detekt)
+./gradlew detekt
 
 # Lint check
 ./gradlew lint
@@ -63,12 +66,12 @@ com.lensdaemon/
 
 1. **Camera Service** - Camera2 pipeline, lens switching (wide/main/tele), frame processing
 2. **Encoder Service** - H.264/H.265 hardware encoding, adaptive bitrate
-3. **Output Manager** - RTSP server, SRT publisher, MP4 file writer
+3. **Output Manager** - RTSP server, SRT publisher (MPEG-TS/UDP), MP4 file writer
 4. **Thermal Monitor** - CPU/battery temperature tracking, throttling governors
 5. **Storage Manager** - Local, SMB/NFS, S3-compatible uploads
-6. **Web Server** - Dashboard UI, REST API endpoints
+6. **Web Server** - Dashboard UI, REST API endpoints, rate limiting
 7. **Kiosk Manager** - Device Owner mode, boot autostart
-8. **Director Manager** - AI-powered script-driven camera automation
+8. **Director Manager** - AI-powered script-driven camera automation with watchdog
 
 ## REST API Endpoints
 
@@ -80,6 +83,12 @@ POST /api/lens/{wide|main|tele}  # Switch camera lens
 POST /api/snapshot            # Capture JPEG snapshot
 GET  /api/config              # Get configuration
 PUT  /api/config              # Update configuration
+POST /api/rtsp/start          # Start RTSP streaming
+POST /api/rtsp/stop           # Stop RTSP streaming
+GET  /api/rtsp/status         # RTSP server status
+POST /api/srt/start           # Start SRT streaming
+POST /api/srt/stop            # Stop SRT streaming
+GET  /api/srt/status          # SRT publisher status
 ```
 
 ## Development Setup
@@ -1025,3 +1034,109 @@ app/src/main/assets/web/
 - **Export Session Report** - Full JSON with session info, takes, stats
 - **Export Script** - Download current script as text file
 - **Export Takes CSV** - Spreadsheet-compatible takes data with quality scores
+
+## Post-Evaluation Remediation
+
+A comprehensive 5-phase remediation was performed after code evaluation:
+
+### Phase 1: Critical Security & Build (commit e49a645)
+- API authentication with Bearer token support
+- Path traversal protection (sanitizeFileName, validateFileInDirectory)
+- SSRF prevention on LLM endpoint validation (private IP blocking)
+- Credential safety: encrypted storage via Android Keystore
+- Build fixes for Gradle/Kotlin compatibility
+
+### Phase 2: Testing Infrastructure (commit ba03d21)
+- Detekt static analysis integration with strict config (maxIssues: 0)
+- Security test suite (ApiRoutesSecurityTest) for path traversal, auth, input validation
+- Detekt baseline and custom rules
+
+### Phase 3: Architecture Refactoring (commit 018bd0b)
+- Split 2917-line ApiRoutes.kt into thin dispatcher + 5 per-module handlers
+- Shared ApiHandlerUtils for sanitization and response helpers
+- BatteryBypass software-only fallback with recommendation engine
+- RecordingCoordinator and RtspCoordinator extracted from CameraService
+- Fixed broken doc links, added API.md, DEVICES.md, CONTRIBUTING.md
+
+### Phase 4: CI/CD & Polish (commit bcc4ba9)
+- GitHub Actions CI/CD workflow (build, test, detekt, lint, APK artifact)
+- Token bucket rate limiter with per-client IP tracking
+- Device-agnostic thermal zone discovery (replaces hardcoded thermal_zone0)
+- Magic number extraction to named constants
+- IMPLEMENTATION_GUIDE.md fully checked off
+
+### Phase 5: SRT Protocol & LLM Hardening
+- SRT publisher (MPEG-TS over UDP) with caller/listener modes
+- SRT integration into CameraService and REST API
+- DirectorWatchdog for autonomous operation:
+  - Execution stall detection and auto-advance
+  - Error recovery with consecutive error tracking
+  - LLM health checking with automatic PRE_PARSED fallback
+  - Thermal hold auto-resume
+  - Script queue for chained execution
+
+## SRT Publisher Architecture
+
+```
+app/src/main/java/com/lensdaemon/output/
+└── SrtPublisher.kt              # MPEG-TS over UDP publisher
+                                 # - SrtConfig (port, mode, target, latency)
+                                 # - SrtMode enum (CALLER, LISTENER)
+                                 # - SrtStats with StateFlow
+                                 # - MPEG-TS packetization (PAT, PMT, PES)
+                                 # - H.264/H.265 stream type support
+                                 # - Per-PID continuity counters
+                                 # - UDP datagram batching (7 TS packets)
+```
+
+### SRT API Endpoints
+
+```
+POST /api/srt/start     # Start SRT streaming
+     body: { "port": 9000, "mode": "listener|caller",
+             "targetHost": "...", "targetPort": 9000,
+             "width": 1920, "height": 1080, "bitrate": 4000000 }
+POST /api/srt/stop      # Stop SRT streaming
+GET  /api/srt/status    # SRT publisher statistics
+```
+
+## DirectorWatchdog Architecture
+
+```
+app/src/main/java/com/lensdaemon/director/
+└── DirectorWatchdog.kt          # Autonomous operation hardening
+                                 # - WatchdogConfig (stall timeout, max errors)
+                                 # - WatchdogStats (stalls, errors, downgrades)
+                                 # - WatchdogEvent sealed class
+                                 # - Stall detection with auto-advance
+                                 # - Error recovery (skip + continue)
+                                 # - LLM health check + auto-downgrade
+                                 # - Thermal hold auto-resume
+                                 # - Script queue for sequential execution
+```
+
+## Web API Route Handlers
+
+```
+app/src/main/java/com/lensdaemon/web/
+├── ApiRoutes.kt                 # Thin dispatcher (auth, rate limit, routing)
+├── RateLimiter.kt               # Token bucket per-client rate limiter
+├── WebServer.kt                 # NanoHTTPD HTTP server
+├── MjpegStreamer.kt             # MJPEG live preview
+├── WebServerService.kt          # Foreground service
+└── handlers/
+    ├── ApiHandlerUtils.kt       # Shared: sanitize, validate, response helpers
+    ├── StreamApiHandler.kt      # /api/stream/*, /api/rtsp/*, /api/srt/*, /api/recording/*
+    ├── UploadApiHandler.kt      # /api/upload/* (S3, SMB)
+    ├── ThermalApiHandler.kt     # /api/thermal/*
+    ├── KioskApiHandler.kt       # /api/kiosk/*
+    └── DirectorApiHandler.kt    # /api/director/*
+```
+
+## CI/CD
+
+GitHub Actions workflow at `.github/workflows/ci.yml`:
+- Triggers on push to main/develop and PRs to main
+- JDK 17, Android SDK, Gradle 8.4 via wrapper
+- Steps: build → test → detekt → lint → assembleDebug
+- Artifacts: debug APK, test results, lint report, detekt report

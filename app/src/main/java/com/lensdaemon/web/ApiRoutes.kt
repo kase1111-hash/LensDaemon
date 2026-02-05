@@ -181,6 +181,7 @@ class ApiRoutes(
         // Delegate to per-module handlers by URI prefix
         when {
             uri.startsWith("/api/stream/") || uri.startsWith("/api/rtsp/") ||
+            uri.startsWith("/api/srt/") ||
             uri.startsWith("/api/recording/") || uri.startsWith("/api/recordings") ||
             uri.startsWith("/api/storage/") -> {
                 streamHandler.handleRequest(uri, method, body)?.let { return it }

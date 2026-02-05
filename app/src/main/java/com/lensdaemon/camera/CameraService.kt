@@ -26,6 +26,9 @@ import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.RtspServer
 import com.lensdaemon.output.RtspServerState
 import com.lensdaemon.output.RtspServerStats
+import com.lensdaemon.output.SrtConfig
+import com.lensdaemon.output.SrtPublisher
+import com.lensdaemon.output.SrtStats
 import com.lensdaemon.output.RecordingEvent
 import com.lensdaemon.output.RecordingListener
 import com.lensdaemon.output.RecordingStats
@@ -125,6 +128,16 @@ class CameraService : Service() {
     // Frame listener for RTSP server
     private val rtspFrameListener: (EncodedFrame) -> Unit = { frame ->
         rtspServer?.sendFrame(frame)
+    }
+
+    // SRT publisher
+    private var srtPublisher: SrtPublisher? = null
+    private val _srtRunning = MutableStateFlow(false)
+    val srtRunning: StateFlow<Boolean> = _srtRunning
+
+    // Frame listener for SRT publisher
+    private val srtFrameListener: (EncodedFrame) -> Unit = { frame ->
+        srtPublisher?.sendFrame(frame)
     }
 
     private val encoderConnection = object : ServiceConnection {
@@ -1051,6 +1064,96 @@ class CameraService : Service() {
         stopRtspServer()
         stopStreaming()
         Timber.i("RTSP streaming stopped")
+    }
+
+    // ==================== SRT Publisher ====================
+
+    /**
+     * Start SRT publisher with given config.
+     */
+    fun startSrtPublisher(config: SrtConfig = SrtConfig()): Boolean {
+        if (srtPublisher?.isRunning() == true) {
+            Timber.w("SRT publisher already running")
+            return true
+        }
+
+        val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
+        srtPublisher = SrtPublisher(config, codec)
+
+        addEncodedFrameListener(srtFrameListener)
+
+        val success = srtPublisher?.start() ?: false
+        if (success) {
+            _srtRunning.value = true
+            Timber.i("SRT publisher started on port ${config.port}")
+        } else {
+            _srtRunning.value = false
+            removeEncodedFrameListener(srtFrameListener)
+            Timber.e("Failed to start SRT publisher")
+        }
+        return success
+    }
+
+    /**
+     * Stop SRT publisher.
+     */
+    fun stopSrtPublisher() {
+        removeEncodedFrameListener(srtFrameListener)
+        srtPublisher?.stop()
+        srtPublisher = null
+        _srtRunning.value = false
+        Timber.i("SRT publisher stopped")
+    }
+
+    /**
+     * Check if SRT publisher is running.
+     */
+    fun isSrtRunning(): Boolean = srtPublisher?.isRunning() ?: false
+
+    /**
+     * Get SRT publisher statistics.
+     */
+    fun getSrtStats(): SrtStats? = srtPublisher?.getStats()
+
+    /**
+     * Start SRT streaming (encoder + SRT publisher).
+     */
+    fun startSrtStreaming(
+        encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
+        srtConfig: SrtConfig = SrtConfig()
+    ): Boolean {
+        if (!isPreviewActive) {
+            Timber.w("Preview not active, starting with main lens")
+            startPreview(LensType.MAIN)
+        }
+
+        if (!initializeEncoder(encoderConfig)) {
+            Timber.e("Failed to initialize encoder for SRT")
+            return false
+        }
+
+        encoderService?.startEncoding()
+        isStreamingActive = true
+
+        val srtStarted = startSrtPublisher(srtConfig)
+        if (!srtStarted) {
+            Timber.e("Failed to start SRT publisher")
+            stopStreaming()
+            return false
+        }
+
+        updateNotification()
+        Timber.i("SRT streaming started on port ${srtConfig.port}")
+        return true
+    }
+
+    /**
+     * Stop SRT streaming.
+     */
+    fun stopSrtStreaming() {
+        stopSrtPublisher()
+        stopStreaming()
+        Timber.i("SRT streaming stopped")
     }
 
     // ==================== Local Recording (Phase 7) ====================
