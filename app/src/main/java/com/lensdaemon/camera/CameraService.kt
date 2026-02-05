@@ -23,6 +23,9 @@ import com.lensdaemon.encoder.EncoderService
 import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.encoder.EncoderStats
 import com.lensdaemon.encoder.VideoCodec
+import com.lensdaemon.output.RtspServer
+import com.lensdaemon.output.RtspServerState
+import com.lensdaemon.output.RtspServerStats
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -93,6 +96,16 @@ class CameraService : Service() {
 
     // Frame listeners (for external consumers like RTSP server)
     private val encodedFrameListeners = mutableListOf<(EncodedFrame) -> Unit>()
+
+    // RTSP server (Phase 5)
+    private var rtspServer: RtspServer? = null
+    private val _rtspServerState = MutableStateFlow(RtspServerState.STOPPED)
+    val rtspServerState: StateFlow<RtspServerState> = _rtspServerState
+
+    // Frame listener for RTSP server
+    private val rtspFrameListener: (EncodedFrame) -> Unit = { frame ->
+        rtspServer?.sendFrame(frame)
+    }
 
     private val encoderConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -883,4 +896,140 @@ class CameraService : Service() {
      * Check if encoder is ready.
      */
     fun isEncoderReady(): Boolean = _encoderState.value == EncoderState.READY || _encoderState.value == EncoderState.ENCODING
+
+    // ==================== RTSP Server (Phase 5) ====================
+
+    /**
+     * Start RTSP server.
+     * @param port RTSP port (default 8554)
+     */
+    fun startRtspServer(port: Int = 8554): Boolean {
+        if (rtspServer?.isRunning() == true) {
+            Timber.w("RTSP server already running")
+            return true
+        }
+
+        rtspServer = RtspServer(port)
+
+        // Set up keyframe request callback
+        rtspServer?.onKeyframeRequest = {
+            requestKeyFrame()
+        }
+
+        // Update codec config if available
+        val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
+        rtspServer?.setCodecConfig(codec, getSps(), getPps(), getVps())
+
+        // Add frame listener
+        addEncodedFrameListener(rtspFrameListener)
+
+        val success = rtspServer?.start() ?: false
+        if (success) {
+            _rtspServerState.value = RtspServerState.RUNNING
+            Timber.i("RTSP server started: ${rtspServer?.getRtspUrl()}")
+        } else {
+            _rtspServerState.value = RtspServerState.ERROR
+            removeEncodedFrameListener(rtspFrameListener)
+        }
+
+        return success
+    }
+
+    /**
+     * Stop RTSP server.
+     */
+    fun stopRtspServer() {
+        removeEncodedFrameListener(rtspFrameListener)
+        rtspServer?.stop()
+        rtspServer = null
+        _rtspServerState.value = RtspServerState.STOPPED
+        Timber.i("RTSP server stopped")
+    }
+
+    /**
+     * Get RTSP server URL.
+     */
+    fun getRtspUrl(): String? = rtspServer?.getRtspUrl()
+
+    /**
+     * Get RTSP server statistics.
+     */
+    fun getRtspServerStats(): RtspServerStats? = rtspServer?.getStats()
+
+    /**
+     * Get number of RTSP clients connected.
+     */
+    fun getRtspClientCount(): Int = rtspServer?.getActiveConnections() ?: 0
+
+    /**
+     * Get number of RTSP clients currently streaming.
+     */
+    fun getRtspPlayingCount(): Int = rtspServer?.getPlayingClients() ?: 0
+
+    /**
+     * Check if RTSP server is running.
+     */
+    fun isRtspServerRunning(): Boolean = rtspServer?.isRunning() ?: false
+
+    /**
+     * Update RTSP codec config (call when SPS/PPS changes).
+     */
+    private fun updateRtspCodecConfig() {
+        val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
+        rtspServer?.setCodecConfig(codec, getSps(), getPps(), getVps())
+    }
+
+    /**
+     * Start streaming with RTSP server.
+     * Convenience method that starts both encoding and RTSP server.
+     */
+    fun startRtspStreaming(
+        config: EncoderConfig = EncoderConfig.PRESET_1080P,
+        rtspPort: Int = 8554
+    ): Boolean {
+        // Start preview if not active
+        if (!isPreviewActive) {
+            Timber.w("Preview not active, starting with main lens")
+            startPreview(LensType.MAIN)
+        }
+
+        // Initialize and start encoder
+        if (!initializeEncoder(config)) {
+            Timber.e("Failed to initialize encoder")
+            return false
+        }
+
+        // Start encoding
+        encoderService?.startEncoding()
+        isStreamingActive = true
+
+        // Start RTSP server
+        val rtspStarted = startRtspServer(rtspPort)
+        if (!rtspStarted) {
+            Timber.e("Failed to start RTSP server")
+            stopStreaming()
+            return false
+        }
+
+        // Update codec config for RTSP
+        serviceScope.launch {
+            // Wait for SPS/PPS to be available
+            delay(500)
+            updateRtspCodecConfig()
+        }
+
+        updateNotification()
+        Timber.i("RTSP streaming started: ${getRtspUrl()}")
+        return true
+    }
+
+    /**
+     * Stop RTSP streaming.
+     * Convenience method that stops both RTSP server and encoding.
+     */
+    fun stopRtspStreaming() {
+        stopRtspServer()
+        stopStreaming()
+        Timber.i("RTSP streaming stopped")
+    }
 }

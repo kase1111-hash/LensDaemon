@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Phase 4 complete - Hardware video encoding with H.264/H.265 MediaCodec, NAL unit parsing, and adaptive bitrate.
+**Status:** Phase 5 complete - RTSP server with RTP packetization, SDP generation, multi-client support, and UDP/TCP transport modes.
 
 ## Tech Stack
 
@@ -114,7 +114,7 @@ See `docs/IMPLEMENTATION_GUIDE.md` for the complete 10-phase implementation guid
 | 2 | Camera2 Pipeline | Complete |
 | 3 | Lens Control | Complete |
 | 4 | Video Encoding | Complete |
-| 5 | RTSP Server | Pending |
+| 5 | RTSP Server | Complete |
 | 6 | Web Interface | Pending |
 | 7 | Local Recording | Pending |
 | 8 | Network Storage | Pending |
@@ -236,4 +236,45 @@ app/src/main/java/com/lensdaemon/camera/
                                  # - Streaming start/stop with encoding
                                  # - Encoded frame listeners
                                  # - Adaptive bitrate control APIs
+```
+
+## Phase 5 Files (RTSP Server Implementation)
+
+```
+app/src/main/java/com/lensdaemon/output/
+├── RtspConstants.kt             # RTSP protocol constants
+│                                # - Status codes and method constants
+│                                # - RtspRequest parser
+│                                # - RtspResponse builder
+│                                # - TransportParams parser (UDP/TCP)
+├── SdpGenerator.kt              # SDP (Session Description Protocol) generator
+│                                # - H.264/H.265 SDP generation
+│                                # - Profile-level-id calculation
+│                                # - SPS/PPS base64 encoding for fmtp
+│                                # - Local IP address detection
+├── RtpPacketizer.kt             # RTP packet creation and fragmentation
+│                                # - RtpPacket data class with serialization
+│                                # - H.264 FU-A fragmentation (RFC 6184)
+│                                # - H.265 FU fragmentation (RFC 7798)
+│                                # - NAL unit packetization
+│                                # - Timestamp and sequence handling
+├── RtspSession.kt               # Individual client session handler
+│                                # - RTSP command processing (OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN)
+│                                # - UDP unicast and TCP interleaved transport
+│                                # - Session state machine
+│                                # - Frame distribution to clients
+│                                # - Session statistics tracking
+└── RtspServer.kt                # Main RTSP server implementation
+                                 # - Multi-client support (up to 10 clients)
+                                 # - Server socket accept loop
+                                 # - Codec config management
+                                 # - Server statistics and monitoring
+                                 # - RtspServerBuilder for configuration
+
+app/src/main/java/com/lensdaemon/camera/
+└── CameraService.kt             # Updated with RTSP integration
+                                 # - RTSP server lifecycle management
+                                 # - startRtspStreaming/stopRtspStreaming convenience methods
+                                 # - RTSP URL getter
+                                 # - Client count and statistics
 ```
