@@ -23,20 +23,14 @@ import com.lensdaemon.encoder.EncoderService
 import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.encoder.EncoderStats
 import com.lensdaemon.encoder.VideoCodec
-import com.lensdaemon.output.RtspServer
-import com.lensdaemon.output.RtspServerState
-import com.lensdaemon.output.RtspServerStats
 import com.lensdaemon.output.MpegTsUdpConfig
-import com.lensdaemon.output.MpegTsUdpPublisher
 import com.lensdaemon.output.MpegTsUdpStats
-import com.lensdaemon.output.RecordingEvent
-import com.lensdaemon.output.RecordingListener
 import com.lensdaemon.output.RecordingStats
 import com.lensdaemon.output.RecordingState
+import com.lensdaemon.output.RtspServerState
+import com.lensdaemon.output.RtspServerStats
 import com.lensdaemon.output.SegmentDuration
 import com.lensdaemon.storage.RecordingFile
-import com.lensdaemon.storage.StorageManager
-import com.lensdaemon.storage.StorageManagerBuilder
 import com.lensdaemon.storage.StorageStatus
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -107,38 +101,18 @@ class CameraService : Service() {
     private val _encoderState = MutableStateFlow(EncoderState.IDLE)
     val encoderState: StateFlow<EncoderState> = _encoderState
 
-    // Frame listeners (for external consumers like RTSP server)
-    private val encodedFrameListeners = mutableListOf<(EncodedFrame) -> Unit>()
+    // Frame distribution to all consumers (RTSP, recording, MPEG-TS, etc.)
+    private val frameDistributor = FrameDistributor()
 
-    // RTSP server (Phase 5)
-    private var rtspServer: RtspServer? = null
-    private val _rtspServerState = MutableStateFlow(RtspServerState.STOPPED)
-    val rtspServerState: StateFlow<RtspServerState> = _rtspServerState
+    // Protocol coordinators (isolate transport concerns from camera service)
+    private val rtspCoordinator = RtspCoordinator()
+    private lateinit var recordingCoordinator: RecordingCoordinator
+    private val mpegTsCoordinator = MpegTsCoordinator()
 
-    // Storage manager (Phase 7)
-    private var storageManager: StorageManager? = null
-    private val _recordingState = MutableStateFlow(RecordingState.IDLE)
-    val recordingState: StateFlow<RecordingState> = _recordingState
-
-    // Recording frame listener
-    private val recordingFrameListener: (EncodedFrame) -> Unit = { frame ->
-        storageManager?.writeFrame(frame)
-    }
-
-    // Frame listener for RTSP server
-    private val rtspFrameListener: (EncodedFrame) -> Unit = { frame ->
-        rtspServer?.sendFrame(frame)
-    }
-
-    // MPEG-TS/UDP publisher
-    private var mpegtsPublisher: MpegTsUdpPublisher? = null
-    private val _mpegtsRunning = MutableStateFlow(false)
-    val mpegtsRunning: StateFlow<Boolean> = _mpegtsRunning
-
-    // Frame listener for MPEG-TS/UDP publisher
-    private val mpegtsFrameListener: (EncodedFrame) -> Unit = { frame ->
-        mpegtsPublisher?.sendFrame(frame)
-    }
+    // Observable state delegated from coordinators
+    val rtspServerState: StateFlow<RtspServerState> get() = rtspCoordinator.serverState
+    val recordingState: StateFlow<RecordingState> get() = recordingCoordinator.recordingState
+    val mpegtsRunning: StateFlow<Boolean> get() = mpegTsCoordinator.running
 
     private val encoderConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
@@ -178,6 +152,11 @@ class CameraService : Service() {
 
         // Initialize lens controller with available lenses
         lensController = LensController(systemCameraManager, lensDaemonCameraManager.availableLenses)
+
+        // Initialize coordinators
+        recordingCoordinator = RecordingCoordinator(applicationContext, serviceScope)
+        recordingCoordinator.onStateChanged = { updateNotification() }
+        rtspCoordinator.onKeyframeRequest = { requestKeyFrame() }
 
         // Set up zoom change listener
         zoomController.setOnZoomChangedListener { zoom ->
@@ -256,6 +235,10 @@ class CameraService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Timber.i("CameraService destroyed")
+        rtspCoordinator.stop()
+        mpegTsCoordinator.stop()
+        recordingCoordinator.release()
+        frameDistributor.removeAll()
         stopStreaming()
         stopPreview()
         unbindEncoderService()
@@ -889,30 +872,18 @@ class CameraService : Service() {
      * Add listener for encoded frames.
      */
     fun addEncodedFrameListener(listener: (EncodedFrame) -> Unit) {
-        synchronized(encodedFrameListeners) {
-            encodedFrameListeners.add(listener)
-        }
+        frameDistributor.addListener(listener)
     }
 
     /**
      * Remove encoded frame listener.
      */
     fun removeEncodedFrameListener(listener: (EncodedFrame) -> Unit) {
-        synchronized(encodedFrameListeners) {
-            encodedFrameListeners.remove(listener)
-        }
+        frameDistributor.removeListener(listener)
     }
 
     private fun dispatchEncodedFrame(frame: EncodedFrame) {
-        synchronized(encodedFrameListeners) {
-            encodedFrameListeners.forEach { listener ->
-                try {
-                    listener(frame)
-                } catch (e: Exception) {
-                    Timber.e(e, "Error in encoded frame listener")
-                }
-            }
-        }
+        frameDistributor.dispatch(frame)
     }
 
     /**
@@ -932,111 +903,55 @@ class CameraService : Service() {
 
     // ==================== RTSP Server (Phase 5) ====================
 
-    /**
-     * Start RTSP server.
-     * @param port RTSP port (default 8554)
-     */
     fun startRtspServer(port: Int = 8554): Boolean {
-        if (rtspServer?.isRunning() == true) {
-            Timber.w("RTSP server already running")
-            return true
-        }
-
-        rtspServer = RtspServer(port)
-
-        // Set up keyframe request callback
-        rtspServer?.onKeyframeRequest = {
-            requestKeyFrame()
-        }
-
-        // Update codec config if available
         val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
-        rtspServer?.setCodecConfig(codec, getSps(), getPps(), getVps())
+        rtspCoordinator.updateCodecConfig(codec, getSps(), getPps(), getVps())
+        frameDistributor.addListener(rtspCoordinator.frameListener)
 
-        // Add frame listener
-        addEncodedFrameListener(rtspFrameListener)
-
-        val success = rtspServer?.start() ?: false
-        if (success) {
-            _rtspServerState.value = RtspServerState.RUNNING
-            Timber.i("RTSP server started: ${rtspServer?.getRtspUrl()}")
-        } else {
-            _rtspServerState.value = RtspServerState.ERROR
-            removeEncodedFrameListener(rtspFrameListener)
+        val success = rtspCoordinator.start(port)
+        if (!success) {
+            frameDistributor.removeListener(rtspCoordinator.frameListener)
         }
-
         return success
     }
 
-    /**
-     * Stop RTSP server.
-     */
     fun stopRtspServer() {
-        removeEncodedFrameListener(rtspFrameListener)
-        rtspServer?.stop()
-        rtspServer = null
-        _rtspServerState.value = RtspServerState.STOPPED
-        Timber.i("RTSP server stopped")
+        frameDistributor.removeListener(rtspCoordinator.frameListener)
+        rtspCoordinator.stop()
     }
 
-    /**
-     * Get RTSP server URL.
-     */
-    fun getRtspUrl(): String? = rtspServer?.getRtspUrl()
+    fun getRtspUrl(): String? = rtspCoordinator.getRtspUrl()
 
-    /**
-     * Get RTSP server statistics.
-     */
-    fun getRtspServerStats(): RtspServerStats? = rtspServer?.getStats()
+    fun getRtspServerStats(): RtspServerStats? = rtspCoordinator.getStats()
 
-    /**
-     * Get number of RTSP clients connected.
-     */
-    fun getRtspClientCount(): Int = rtspServer?.getActiveConnections() ?: 0
+    fun getRtspClientCount(): Int = rtspCoordinator.getActiveConnections()
 
-    /**
-     * Get number of RTSP clients currently streaming.
-     */
-    fun getRtspPlayingCount(): Int = rtspServer?.getPlayingClients() ?: 0
+    fun getRtspPlayingCount(): Int = rtspCoordinator.getPlayingClients()
 
-    /**
-     * Check if RTSP server is running.
-     */
-    fun isRtspServerRunning(): Boolean = rtspServer?.isRunning() ?: false
+    fun isRtspServerRunning(): Boolean = rtspCoordinator.isRunning()
 
-    /**
-     * Update RTSP codec config (call when SPS/PPS changes).
-     */
     private fun updateRtspCodecConfig() {
         val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
-        rtspServer?.setCodecConfig(codec, getSps(), getPps(), getVps())
+        rtspCoordinator.updateCodecConfig(codec, getSps(), getPps(), getVps())
     }
 
-    /**
-     * Start streaming with RTSP server.
-     * Convenience method that starts both encoding and RTSP server.
-     */
     fun startRtspStreaming(
         config: EncoderConfig = EncoderConfig.PRESET_1080P,
         rtspPort: Int = 8554
     ): Boolean {
-        // Start preview if not active
         if (!isPreviewActive) {
             Timber.w("Preview not active, starting with main lens")
             startPreview(LensType.MAIN)
         }
 
-        // Initialize and start encoder
         if (!initializeEncoder(config)) {
             Timber.e("Failed to initialize encoder")
             return false
         }
 
-        // Start encoding
         encoderService?.startEncoding()
         isStreamingActive = true
 
-        // Start RTSP server
         val rtspStarted = startRtspServer(rtspPort)
         if (!rtspStarted) {
             Timber.e("Failed to start RTSP server")
@@ -1044,9 +959,7 @@ class CameraService : Service() {
             return false
         }
 
-        // Update codec config for RTSP
         serviceScope.launch {
-            // Wait for SPS/PPS to be available
             delay(500)
             updateRtspCodecConfig()
         }
@@ -1056,10 +969,6 @@ class CameraService : Service() {
         return true
     }
 
-    /**
-     * Stop RTSP streaming.
-     * Convenience method that stops both RTSP server and encoding.
-     */
     fun stopRtspStreaming() {
         stopRtspServer()
         stopStreaming()
@@ -1068,58 +977,26 @@ class CameraService : Service() {
 
     // ==================== MPEG-TS/UDP Publisher ====================
 
-    /**
-     * Start MPEG-TS/UDP publisher with given config.
-     */
     fun startMpegTsPublisher(config: MpegTsUdpConfig = MpegTsUdpConfig()): Boolean {
-        if (mpegtsPublisher?.isRunning() == true) {
-            Timber.w("MPEG-TS/UDP publisher already running")
-            return true
-        }
-
         val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
-        mpegtsPublisher = MpegTsUdpPublisher(config).also {
-            it.setCodecConfig(codec, getSps(), getPps(), getVps())
-        }
+        frameDistributor.addListener(mpegTsCoordinator.frameListener)
 
-        addEncodedFrameListener(mpegtsFrameListener)
-
-        val success = mpegtsPublisher?.start() ?: false
-        if (success) {
-            _mpegtsRunning.value = true
-            Timber.i("MPEG-TS/UDP publisher started on port ${config.port}")
-        } else {
-            _mpegtsRunning.value = false
-            removeEncodedFrameListener(mpegtsFrameListener)
-            Timber.e("Failed to start MPEG-TS/UDP publisher")
+        val success = mpegTsCoordinator.start(config, codec, getSps(), getPps(), getVps())
+        if (!success) {
+            frameDistributor.removeListener(mpegTsCoordinator.frameListener)
         }
         return success
     }
 
-    /**
-     * Stop MPEG-TS/UDP publisher.
-     */
     fun stopMpegTsPublisher() {
-        removeEncodedFrameListener(mpegtsFrameListener)
-        mpegtsPublisher?.stop()
-        mpegtsPublisher = null
-        _mpegtsRunning.value = false
-        Timber.i("MPEG-TS/UDP publisher stopped")
+        frameDistributor.removeListener(mpegTsCoordinator.frameListener)
+        mpegTsCoordinator.stop()
     }
 
-    /**
-     * Check if MPEG-TS/UDP publisher is running.
-     */
-    fun isMpegTsRunning(): Boolean = mpegtsPublisher?.isRunning() ?: false
+    fun isMpegTsRunning(): Boolean = mpegTsCoordinator.isRunning()
 
-    /**
-     * Get MPEG-TS/UDP publisher statistics.
-     */
-    fun getMpegTsStats(): MpegTsUdpStats? = mpegtsPublisher?.getStats()
+    fun getMpegTsStats(): MpegTsUdpStats? = mpegTsCoordinator.getStats()
 
-    /**
-     * Start MPEG-TS/UDP streaming (encoder + publisher).
-     */
     fun startMpegTsStreaming(
         encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
         mpegtsConfig: MpegTsUdpConfig = MpegTsUdpConfig()
@@ -1149,9 +1026,6 @@ class CameraService : Service() {
         return true
     }
 
-    /**
-     * Stop MPEG-TS/UDP streaming.
-     */
     fun stopMpegTsStreaming() {
         stopMpegTsPublisher()
         stopStreaming()
@@ -1160,107 +1034,42 @@ class CameraService : Service() {
 
     // ==================== Local Recording (Phase 7) ====================
 
-    /**
-     * Initialize storage manager for recording.
-     * @param segmentDuration Segment duration for file splitting
-     */
     fun initializeRecording(
         encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
         segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
     ): Boolean {
-        if (storageManager != null) {
-            Timber.w("Storage manager already initialized")
-            return true
-        }
-
-        storageManager = StorageManagerBuilder(applicationContext)
-            .encoderConfig(encoderConfig)
-            .segmentDuration(segmentDuration)
-            .build()
-
-        // Add recording state listener
-        storageManager?.addListener(object : RecordingListener {
-            override fun onRecordingEvent(event: RecordingEvent) {
-                when (event) {
-                    is RecordingEvent.Started -> {
-                        _recordingState.value = RecordingState.RECORDING
-                        updateNotification()
-                    }
-                    is RecordingEvent.Stopped -> {
-                        _recordingState.value = RecordingState.IDLE
-                        updateNotification()
-                    }
-                    is RecordingEvent.Paused -> {
-                        _recordingState.value = RecordingState.PAUSED
-                    }
-                    is RecordingEvent.Resumed -> {
-                        _recordingState.value = RecordingState.RECORDING
-                    }
-                    is RecordingEvent.Error -> {
-                        _recordingState.value = RecordingState.ERROR
-                        Timber.e("Recording error: ${event.error}")
-                    }
-                    is RecordingEvent.SegmentCompleted -> {
-                        Timber.d("Recording segment completed: ${event.filePath}")
-                    }
-                    is RecordingEvent.NewSegmentStarted -> {
-                        Timber.d("New recording segment: ${event.filePath}")
-                    }
-                }
-            }
-        })
-
-        Timber.i("Storage manager initialized")
-        return true
+        return recordingCoordinator.initialize(encoderConfig, segmentDuration)
     }
 
-    /**
-     * Start local recording.
-     * Requires encoder to be initialized and running.
-     */
     fun startRecording(): Boolean {
         if (!isStreamingActive) {
             Timber.e("Cannot start recording: encoder not active")
             return false
         }
 
-        // Initialize storage manager if needed
-        if (storageManager == null) {
+        if (!recordingCoordinator.isInitialized()) {
             val config = getEncoderConfig() ?: EncoderConfig.PRESET_1080P
-            initializeRecording(config)
+            recordingCoordinator.initialize(config)
         }
 
-        // Set video format from encoder
         val format = encoderService?.getOutputFormat()
         if (format != null) {
-            storageManager?.setVideoFormat(format)
-        } else {
-            Timber.w("Encoder output format not available, will wait for first frame")
+            recordingCoordinator.setVideoFormat(format)
         }
 
-        // Add frame listener for recording
-        addEncodedFrameListener(recordingFrameListener)
+        frameDistributor.addListener(recordingCoordinator.frameListener)
 
-        // Start recording
-        val success = storageManager?.startRecording() == true
+        val success = recordingCoordinator.startRecording()
         if (!success) {
-            removeEncodedFrameListener(recordingFrameListener)
-            Timber.e("Failed to start recording")
-        } else {
-            Timber.i("Recording started")
+            frameDistributor.removeListener(recordingCoordinator.frameListener)
         }
-
         return success
     }
 
-    /**
-     * Start recording with specific configuration.
-     */
     fun startRecording(
         config: EncoderConfig,
         segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
     ): Boolean {
-        // Initialize encoder if needed
         if (!isStreamingActive) {
             if (!initializeEncoder(config)) {
                 return false
@@ -1269,138 +1078,62 @@ class CameraService : Service() {
             isStreamingActive = true
         }
 
-        // Initialize storage manager with config
-        if (storageManager == null) {
-            initializeRecording(config, segmentDuration)
+        if (!recordingCoordinator.isInitialized()) {
+            recordingCoordinator.initialize(config, segmentDuration)
         }
 
         return startRecording()
     }
 
-    /**
-     * Stop local recording.
-     * @return List of recorded segment file paths
-     */
     fun stopRecording(): List<String> {
-        if (_recordingState.value == RecordingState.IDLE) {
-            Timber.w("Not recording")
-            return emptyList()
-        }
-
-        // Remove frame listener
-        removeEncodedFrameListener(recordingFrameListener)
-
-        // Stop recording
-        val segments = storageManager?.stopRecording() ?: emptyList()
-        Timber.i("Recording stopped: ${segments.size} segments")
-
-        return segments
+        frameDistributor.removeListener(recordingCoordinator.frameListener)
+        return recordingCoordinator.stopRecording()
     }
 
-    /**
-     * Pause recording.
-     */
-    fun pauseRecording(): Boolean {
-        return storageManager?.pauseRecording() == true
-    }
+    fun pauseRecording(): Boolean = recordingCoordinator.pauseRecording()
 
-    /**
-     * Resume recording.
-     */
-    fun resumeRecording(): Boolean {
-        return storageManager?.resumeRecording() == true
-    }
+    fun resumeRecording(): Boolean = recordingCoordinator.resumeRecording()
 
-    /**
-     * Check if recording is active.
-     */
-    fun isRecording(): Boolean = _recordingState.value == RecordingState.RECORDING
+    fun isRecording(): Boolean = recordingCoordinator.isRecording()
 
-    /**
-     * Check if recording is paused.
-     */
-    fun isRecordingPaused(): Boolean = _recordingState.value == RecordingState.PAUSED
+    fun isRecordingPaused(): Boolean = recordingCoordinator.isPaused()
 
-    /**
-     * Get recording statistics.
-     */
-    fun getRecordingStats(): RecordingStats {
-        return storageManager?.getRecordingStats() ?: RecordingStats()
-    }
+    fun getRecordingStats(): RecordingStats = recordingCoordinator.getStats()
 
-    /**
-     * Get storage status.
-     */
-    fun getStorageStatus(): StorageStatus {
-        return storageManager?.status?.value ?: StorageStatus()
-    }
+    fun getStorageStatus(): StorageStatus = recordingCoordinator.getStorageStatus()
 
-    /**
-     * List all recorded files.
-     */
-    fun listRecordings(): List<RecordingFile> {
-        return storageManager?.listRecordings() ?: emptyList()
-    }
+    fun listRecordings(): List<RecordingFile> = recordingCoordinator.listRecordings()
 
-    /**
-     * Delete a recording file.
-     */
-    fun deleteRecording(file: RecordingFile): Boolean {
-        return storageManager?.deleteRecording(file) == true
-    }
+    fun deleteRecording(file: RecordingFile): Boolean = recordingCoordinator.deleteRecording(file)
 
-    /**
-     * Get recordings directory path.
-     */
-    fun getRecordingsPath(): String {
-        return storageManager?.getRecordingsDirectory()?.absolutePath ?: ""
-    }
+    fun getRecordingsPath(): String = recordingCoordinator.getRecordingsPath()
 
-    /**
-     * Set segment duration for recording.
-     */
     fun setSegmentDuration(duration: SegmentDuration) {
-        storageManager?.updateSegmentDuration(duration)
+        recordingCoordinator.setSegmentDuration(duration)
     }
 
-    /**
-     * Enforce retention policy (manual cleanup).
-     */
     fun enforceRetention() {
-        serviceScope.launch {
-            storageManager?.enforceRetention()
-        }
+        recordingCoordinator.enforceRetention()
     }
 
-    /**
-     * Release storage manager resources.
-     */
     fun releaseStorageManager() {
-        removeEncodedFrameListener(recordingFrameListener)
-        storageManager?.release()
-        storageManager = null
-        _recordingState.value = RecordingState.IDLE
+        frameDistributor.removeListener(recordingCoordinator.frameListener)
+        recordingCoordinator.release()
     }
 
-    /**
-     * Start combined streaming and recording.
-     */
     fun startStreamingAndRecording(
         config: EncoderConfig = EncoderConfig.PRESET_1080P,
         segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES,
         rtspPort: Int = 8554
     ): Boolean {
-        // Start RTSP streaming
         if (!startRtspStreaming(config, rtspPort)) {
             return false
         }
 
-        // Start recording
-        if (storageManager == null) {
-            initializeRecording(config, segmentDuration)
+        if (!recordingCoordinator.isInitialized()) {
+            recordingCoordinator.initialize(config, segmentDuration)
         }
 
-        // Small delay to let encoder start
         serviceScope.launch {
             delay(500)
             if (!startRecording()) {
@@ -1411,9 +1144,6 @@ class CameraService : Service() {
         return true
     }
 
-    /**
-     * Stop combined streaming and recording.
-     */
     fun stopStreamingAndRecording(): List<String> {
         val segments = stopRecording()
         stopRtspStreaming()
