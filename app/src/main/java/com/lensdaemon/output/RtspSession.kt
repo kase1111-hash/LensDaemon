@@ -83,6 +83,12 @@ class RtspSession(
     private val bytesSent = AtomicLong(0)
     private var startTimeMs = 0L
 
+    // RTCP feedback
+    private var rtcpSocket: DatagramSocket? = null
+    @Volatile var lastFractionLost: Int = 0; private set
+    @Volatile var lastCumulativeLost: Int = 0; private set
+    @Volatile var lastJitter: Long = 0; private set
+
     // Activity tracking for idle eviction
     @Volatile
     var lastActivityMs: Long = System.currentTimeMillis()
@@ -275,9 +281,58 @@ class RtspSession(
             serverRtpPort = udpSocket?.localPort ?: 0
             serverRtcpPort = serverRtpPort + 1
 
+            // Create RTCP socket on RTP port + 1 for receiver reports
+            try {
+                rtcpSocket = DatagramSocket(serverRtcpPort)
+                rtcpSocket?.soTimeout = 1000
+                startRtcpListener()
+            } catch (e: Exception) {
+                Timber.w("$TAG: Could not bind RTCP port $serverRtcpPort: ${e.message}")
+            }
+
             Timber.i("$TAG: UDP transport setup - server port $serverRtpPort, client ${params.clientRtpPort}")
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to setup UDP transport")
+        }
+    }
+
+    /**
+     * Listen for RTCP receiver reports on the RTCP port.
+     * Updates loss and jitter metrics from client feedback.
+     */
+    private fun startRtcpListener() {
+        sessionScope.launch {
+            val socket = rtcpSocket ?: return@launch
+            val buf = ByteArray(512)
+            val packet = DatagramPacket(buf, buf.size)
+
+            while (isRunning.get() && !socket.isClosed) {
+                try {
+                    socket.receive(packet)
+                    val reports = RtcpParser.parseReceiverReports(
+                        buf.copyOf(packet.length)
+                    )
+                    for (report in reports) {
+                        lastFractionLost = report.fractionLost
+                        lastCumulativeLost = report.cumulativeLost
+                        lastJitter = report.jitter
+                        lastActivityMs = System.currentTimeMillis()
+
+                        if (report.lossPercent > 5f) {
+                            Timber.tag(TAG).w(
+                                "Session $sessionId: loss=${report.lossPercent}%, jitter=${report.jitter}"
+                            )
+                        }
+                    }
+                } catch (e: java.net.SocketTimeoutException) {
+                    // Expected — loop and check isRunning
+                } catch (e: Exception) {
+                    if (isRunning.get()) {
+                        Timber.tag(TAG).e(e, "RTCP listener error")
+                    }
+                    break
+                }
+            }
         }
     }
 
@@ -456,7 +511,10 @@ class RtspSession(
             state = state,
             packetsSent = packetsSent.get(),
             bytesSent = bytesSent.get(),
-            durationMs = durationMs
+            durationMs = durationMs,
+            fractionLost = lastFractionLost,
+            cumulativeLost = lastCumulativeLost,
+            jitter = lastJitter
         )
     }
 
@@ -472,6 +530,7 @@ class RtspSession(
         isPlaying.set(false)
 
         try {
+            rtcpSocket?.close()
             udpSocket?.close()
             inputStream?.close()
             outputStream?.close()
@@ -494,8 +553,13 @@ data class SessionStats(
     val state: SessionState,
     val packetsSent: Long,
     val bytesSent: Long,
-    val durationMs: Long
+    val durationMs: Long,
+    val fractionLost: Int = 0,
+    val cumulativeLost: Int = 0,
+    val jitter: Long = 0
 ) {
     val bitrateBps: Long
         get() = if (durationMs > 0) (bytesSent * 8 * 1000) / durationMs else 0
+    val lossPercent: Float
+        get() = (fractionLost / 256f) * 100f
 }
