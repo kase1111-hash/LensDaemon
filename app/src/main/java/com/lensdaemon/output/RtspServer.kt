@@ -52,9 +52,15 @@ class RtspServer(
 ) {
     companion object {
         private const val TAG = "RtspServer"
-        private const val MAX_CLIENTS = 10
+        private const val DEFAULT_MAX_CLIENTS = 10
         private const val ACCEPT_TIMEOUT_MS = 1000
+        private const val EVICTION_CHECK_INTERVAL_MS = 30_000L
+        private const val DEFAULT_SESSION_TIMEOUT_MS = 120_000L
     }
+
+    // Configurable limits
+    var maxClients: Int = DEFAULT_MAX_CLIENTS
+    var sessionTimeoutMs: Long = DEFAULT_SESSION_TIMEOUT_MS
 
     // Server state
     private val _state = MutableStateFlow(RtspServerState.STOPPED)
@@ -109,6 +115,11 @@ class RtspServer(
             // Start accept loop
             serverScope.launch {
                 acceptLoop()
+            }
+
+            // Start idle session eviction loop
+            serverScope.launch {
+                evictionLoop()
             }
 
             _state.value = RtspServerState.RUNNING
@@ -244,8 +255,8 @@ class RtspServer(
      * Handle new client connection
      */
     private fun handleNewConnection(socket: Socket) {
-        if (sessions.size >= MAX_CLIENTS) {
-            Timber.w("$TAG: Max clients reached, rejecting connection")
+        if (sessions.size >= maxClients) {
+            Timber.w("$TAG: Max clients ($maxClients) reached, rejecting connection from ${socket.inetAddress?.hostAddress}")
             socket.close()
             return
         }
@@ -272,6 +283,36 @@ class RtspServer(
         session.startRequestLoop()
 
         Timber.i("$TAG: New session ${session.sessionId} from ${session.clientAddress}, active: ${sessions.size}")
+    }
+
+    /**
+     * Periodically check for and evict idle sessions.
+     * A session is idle if it hasn't received a command or sent a frame
+     * within [sessionTimeoutMs].
+     */
+    private suspend fun evictionLoop() {
+        while (isRunning.get()) {
+            delay(EVICTION_CHECK_INTERVAL_MS)
+            if (!isRunning.get()) break
+
+            val now = System.currentTimeMillis()
+            val idleSessions = sessions.values.filter { session ->
+                now - session.lastActivityMs > sessionTimeoutMs
+            }
+
+            for (session in idleSessions) {
+                Timber.i(
+                    "$TAG: Evicting idle session ${session.sessionId} " +
+                    "(idle ${(now - session.lastActivityMs) / 1000}s, timeout ${sessionTimeoutMs / 1000}s)"
+                )
+                try {
+                    session.close()
+                } catch (e: Exception) {
+                    Timber.e(e, "$TAG: Error evicting session ${session.sessionId}")
+                }
+                sessions.remove(session.sessionId)
+            }
+        }
     }
 
     /**
@@ -356,6 +397,8 @@ class RtspServerBuilder {
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
     private var vps: ByteArray? = null
+    private var maxClients: Int = 10
+    private var sessionTimeoutMs: Long = 120_000L
     private var onKeyframeRequest: (() -> Unit)? = null
 
     fun port(port: Int) = apply { this.port = port }
@@ -363,11 +406,15 @@ class RtspServerBuilder {
     fun sps(sps: ByteArray?) = apply { this.sps = sps }
     fun pps(pps: ByteArray?) = apply { this.pps = pps }
     fun vps(vps: ByteArray?) = apply { this.vps = vps }
+    fun maxClients(max: Int) = apply { this.maxClients = max }
+    fun sessionTimeoutMs(timeout: Long) = apply { this.sessionTimeoutMs = timeout }
     fun onKeyframeRequest(callback: () -> Unit) = apply { this.onKeyframeRequest = callback }
 
     fun build(): RtspServer {
         return RtspServer(port).also { server ->
             server.setCodecConfig(codec, sps, pps, vps)
+            server.maxClients = maxClients
+            server.sessionTimeoutMs = sessionTimeoutMs
             server.onKeyframeRequest = onKeyframeRequest
         }
     }

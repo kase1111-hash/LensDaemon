@@ -26,9 +26,9 @@ import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.RtspServer
 import com.lensdaemon.output.RtspServerState
 import com.lensdaemon.output.RtspServerStats
-import com.lensdaemon.output.SrtConfig
-import com.lensdaemon.output.SrtPublisher
-import com.lensdaemon.output.SrtStats
+import com.lensdaemon.output.MpegTsUdpConfig
+import com.lensdaemon.output.MpegTsUdpPublisher
+import com.lensdaemon.output.MpegTsUdpStats
 import com.lensdaemon.output.RecordingEvent
 import com.lensdaemon.output.RecordingListener
 import com.lensdaemon.output.RecordingStats
@@ -130,14 +130,14 @@ class CameraService : Service() {
         rtspServer?.sendFrame(frame)
     }
 
-    // SRT publisher
-    private var srtPublisher: SrtPublisher? = null
-    private val _srtRunning = MutableStateFlow(false)
-    val srtRunning: StateFlow<Boolean> = _srtRunning
+    // MPEG-TS/UDP publisher
+    private var mpegtsPublisher: MpegTsUdpPublisher? = null
+    private val _mpegtsRunning = MutableStateFlow(false)
+    val mpegtsRunning: StateFlow<Boolean> = _mpegtsRunning
 
-    // Frame listener for SRT publisher
-    private val srtFrameListener: (EncodedFrame) -> Unit = { frame ->
-        srtPublisher?.sendFrame(frame)
+    // Frame listener for MPEG-TS/UDP publisher
+    private val mpegtsFrameListener: (EncodedFrame) -> Unit = { frame ->
+        mpegtsPublisher?.sendFrame(frame)
     }
 
     private val encoderConnection = object : ServiceConnection {
@@ -1066,61 +1066,63 @@ class CameraService : Service() {
         Timber.i("RTSP streaming stopped")
     }
 
-    // ==================== SRT Publisher ====================
+    // ==================== MPEG-TS/UDP Publisher ====================
 
     /**
-     * Start SRT publisher with given config.
+     * Start MPEG-TS/UDP publisher with given config.
      */
-    fun startSrtPublisher(config: SrtConfig = SrtConfig()): Boolean {
-        if (srtPublisher?.isRunning() == true) {
-            Timber.w("SRT publisher already running")
+    fun startMpegTsPublisher(config: MpegTsUdpConfig = MpegTsUdpConfig()): Boolean {
+        if (mpegtsPublisher?.isRunning() == true) {
+            Timber.w("MPEG-TS/UDP publisher already running")
             return true
         }
 
         val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
-        srtPublisher = SrtPublisher(config, codec)
+        mpegtsPublisher = MpegTsUdpPublisher(config).also {
+            it.setCodecConfig(codec, getSps(), getPps(), getVps())
+        }
 
-        addEncodedFrameListener(srtFrameListener)
+        addEncodedFrameListener(mpegtsFrameListener)
 
-        val success = srtPublisher?.start() ?: false
+        val success = mpegtsPublisher?.start() ?: false
         if (success) {
-            _srtRunning.value = true
-            Timber.i("SRT publisher started on port ${config.port}")
+            _mpegtsRunning.value = true
+            Timber.i("MPEG-TS/UDP publisher started on port ${config.port}")
         } else {
-            _srtRunning.value = false
-            removeEncodedFrameListener(srtFrameListener)
-            Timber.e("Failed to start SRT publisher")
+            _mpegtsRunning.value = false
+            removeEncodedFrameListener(mpegtsFrameListener)
+            Timber.e("Failed to start MPEG-TS/UDP publisher")
         }
         return success
     }
 
     /**
-     * Stop SRT publisher.
+     * Stop MPEG-TS/UDP publisher.
      */
-    fun stopSrtPublisher() {
-        removeEncodedFrameListener(srtFrameListener)
-        srtPublisher?.stop()
-        srtPublisher = null
-        _srtRunning.value = false
-        Timber.i("SRT publisher stopped")
+    fun stopMpegTsPublisher() {
+        removeEncodedFrameListener(mpegtsFrameListener)
+        mpegtsPublisher?.stop()
+        mpegtsPublisher = null
+        _mpegtsRunning.value = false
+        Timber.i("MPEG-TS/UDP publisher stopped")
     }
 
     /**
-     * Check if SRT publisher is running.
+     * Check if MPEG-TS/UDP publisher is running.
      */
-    fun isSrtRunning(): Boolean = srtPublisher?.isRunning() ?: false
+    fun isMpegTsRunning(): Boolean = mpegtsPublisher?.isRunning() ?: false
 
     /**
-     * Get SRT publisher statistics.
+     * Get MPEG-TS/UDP publisher statistics.
      */
-    fun getSrtStats(): SrtStats? = srtPublisher?.getStats()
+    fun getMpegTsStats(): MpegTsUdpStats? = mpegtsPublisher?.getStats()
 
     /**
-     * Start SRT streaming (encoder + SRT publisher).
+     * Start MPEG-TS/UDP streaming (encoder + publisher).
      */
-    fun startSrtStreaming(
+    fun startMpegTsStreaming(
         encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
-        srtConfig: SrtConfig = SrtConfig()
+        mpegtsConfig: MpegTsUdpConfig = MpegTsUdpConfig()
     ): Boolean {
         if (!isPreviewActive) {
             Timber.w("Preview not active, starting with main lens")
@@ -1128,32 +1130,32 @@ class CameraService : Service() {
         }
 
         if (!initializeEncoder(encoderConfig)) {
-            Timber.e("Failed to initialize encoder for SRT")
+            Timber.e("Failed to initialize encoder for MPEG-TS/UDP")
             return false
         }
 
         encoderService?.startEncoding()
         isStreamingActive = true
 
-        val srtStarted = startSrtPublisher(srtConfig)
-        if (!srtStarted) {
-            Timber.e("Failed to start SRT publisher")
+        val started = startMpegTsPublisher(mpegtsConfig)
+        if (!started) {
+            Timber.e("Failed to start MPEG-TS/UDP publisher")
             stopStreaming()
             return false
         }
 
         updateNotification()
-        Timber.i("SRT streaming started on port ${srtConfig.port}")
+        Timber.i("MPEG-TS/UDP streaming started on port ${mpegtsConfig.port}")
         return true
     }
 
     /**
-     * Stop SRT streaming.
+     * Stop MPEG-TS/UDP streaming.
      */
-    fun stopSrtStreaming() {
-        stopSrtPublisher()
+    fun stopMpegTsStreaming() {
+        stopMpegTsPublisher()
         stopStreaming()
-        Timber.i("SRT streaming stopped")
+        Timber.i("MPEG-TS/UDP streaming stopped")
     }
 
     // ==================== Local Recording (Phase 7) ====================

@@ -186,22 +186,29 @@ class VideoEncoder(
             val format = config.toMediaFormat()
             Timber.d("$TAG: Configuring with format: $format")
 
-            mediaCodec!!.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            val codec = mediaCodec ?: return Result.failure(
+                IllegalStateException("MediaCodec creation returned null")
+            )
+
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
 
             // Create input surface
-            inputSurface = mediaCodec!!.createInputSurface()
+            inputSurface = codec.createInputSurface()
 
             // Setup encoder callback thread
             encoderThread = HandlerThread("EncoderThread").apply { start() }
             encoderHandler = Handler(encoderThread!!.looper)
 
             // Set async callback
-            mediaCodec!!.setCallback(encoderCallback, encoderHandler)
+            codec.setCallback(encoderCallback, encoderHandler)
 
             _state.value = EncoderState.READY
             Timber.i("$TAG: Encoder initialized, resolution=${config.width}x${config.height}, bitrate=${config.bitrateBps}")
 
-            return Result.success(inputSurface!!)
+            val surface = inputSurface ?: return Result.failure(
+                IllegalStateException("Failed to create encoder input surface")
+            )
+            return Result.success(surface)
 
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to initialize encoder")

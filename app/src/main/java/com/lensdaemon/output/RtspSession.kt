@@ -83,6 +83,11 @@ class RtspSession(
     private val bytesSent = AtomicLong(0)
     private var startTimeMs = 0L
 
+    // Activity tracking for idle eviction
+    @Volatile
+    var lastActivityMs: Long = System.currentTimeMillis()
+        private set
+
     /**
      * Initialize session streams
      */
@@ -91,7 +96,7 @@ class RtspSession(
             socket.soTimeout = READ_TIMEOUT_MS
             inputStream = socket.getInputStream()
             outputStream = socket.getOutputStream()
-            reader = BufferedReader(InputStreamReader(inputStream!!))
+            reader = BufferedReader(InputStreamReader(inputStream ?: return))
             Timber.i("$TAG: Session $sessionId initialized from ${clientAddress.hostAddress}:$clientPort")
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to initialize session")
@@ -128,6 +133,7 @@ class RtspSession(
             try {
                 while (isRunning.get() && !socket.isClosed) {
                     val request = readRequest() ?: break
+                    lastActivityMs = System.currentTimeMillis()
                     val response = handleRequest(request)
                     sendResponse(response)
                 }
@@ -266,7 +272,7 @@ class RtspSession(
         try {
             // Create UDP socket for RTP
             udpSocket = DatagramSocket()
-            serverRtpPort = udpSocket!!.localPort
+            serverRtpPort = udpSocket?.localPort ?: 0
             serverRtcpPort = serverRtpPort + 1
 
             Timber.i("$TAG: UDP transport setup - server port $serverRtpPort, client ${params.clientRtpPort}")
@@ -357,10 +363,11 @@ class RtspSession(
      * Send encoded frame to client
      */
     fun sendFrame(frame: EncodedFrame) {
-        if (!isPlaying.get() || rtpPacketizer == null) return
+        if (!isPlaying.get()) return
+        val packetizer = rtpPacketizer ?: return
 
         try {
-            val packets = rtpPacketizer!!.packetize(frame.data, frame.presentationTimeUs)
+            val packets = packetizer.packetize(frame.data, frame.presentationTimeUs)
 
             for (packet in packets) {
                 sendRtpPacket(packet)
@@ -368,6 +375,7 @@ class RtspSession(
 
             packetsSent.addAndGet(packets.size.toLong())
             bytesSent.addAndGet(frame.size.toLong())
+            lastActivityMs = System.currentTimeMillis()
 
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Error sending frame to session $sessionId")
@@ -416,10 +424,11 @@ class RtspSession(
             header[2] = (data.size shr 8).toByte()
             header[3] = (data.size and 0xFF).toByte()
 
-            synchronized(outputStream!!) {
-                outputStream?.write(header)
-                outputStream?.write(data)
-                outputStream?.flush()
+            val out = outputStream ?: return
+            synchronized(out) {
+                out.write(header)
+                out.write(data)
+                out.flush()
             }
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Error sending interleaved packet")
