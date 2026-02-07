@@ -16,10 +16,6 @@ let directorEnabled = false;
 let directorState = 'DISABLED';
 let directorEventSource = null;
 let loadedScriptFileName = null;
-let scriptScenes = [];
-let currentSceneIndex = -1;
-let currentCueIndex = -1;
-let totalCues = 0;
 
 // DOM Elements
 const elements = {
@@ -78,17 +74,8 @@ const elements = {
     scriptFilename: document.getElementById('script-filename'),
     btnSaveScript: document.getElementById('btn-save-script'),
 
-    // Timeline elements
-    timelineTrack: document.getElementById('timeline-track'),
-    timelineScenes: document.getElementById('timeline-scenes'),
-    timelinePlayhead: document.getElementById('timeline-playhead'),
-    timelineProgress: document.getElementById('timeline-progress'),
-    sceneNav: document.getElementById('scene-nav'),
-
-    // Session export elements
-    btnExportSession: document.getElementById('btn-export-session'),
-    btnExportScript: document.getElementById('btn-export-script'),
-    btnExportTakes: document.getElementById('btn-export-takes')
+    // Scene progress (text-only)
+    sceneProgress: document.getElementById('scene-progress')
 };
 
 // Initialize
@@ -179,16 +166,6 @@ function setupEventListeners() {
         elements.btnSaveScript.addEventListener('click', saveScriptFile);
     }
 
-    // Session export
-    if (elements.btnExportSession) {
-        elements.btnExportSession.addEventListener('click', exportSessionReport);
-    }
-    if (elements.btnExportScript) {
-        elements.btnExportScript.addEventListener('click', exportScript);
-    }
-    if (elements.btnExportTakes) {
-        elements.btnExportTakes.addEventListener('click', exportTakesCsv);
-    }
 }
 
 // API calls
@@ -538,21 +515,13 @@ function updateDirectorStatus(director) {
         updateDirectorStats(director.stats);
     }
 
-    // Update timeline from director status
-    if (director.scenes && scriptScenes.length === 0) {
-        renderTimeline(director.scenes);
-    }
-    if (director.sceneIndex !== undefined || director.cueIndex !== undefined) {
-        updateTimelinePlayhead({
-            sceneIndex: director.sceneIndex || 0,
-            cueIndex: director.cueIndex || 0
-        });
-    }
-
-    // Hide playhead when not running
-    if (director.state === 'IDLE' || director.state === 'DISABLED') {
-        if (elements.timelinePlayhead) {
-            elements.timelinePlayhead.classList.remove('active');
+    // Update text-based scene progress
+    if (elements.sceneProgress) {
+        if (director.currentScene && director.state === 'RUNNING') {
+            const cueInfo = director.cueIndex !== undefined ? ` (cue ${(director.cueIndex || 0) + 1})` : '';
+            elements.sceneProgress.textContent = `${director.currentScene}${cueInfo}`;
+        } else {
+            elements.sceneProgress.textContent = '-';
         }
     }
 }
@@ -608,10 +577,6 @@ async function loadScript() {
     const result = await apiCall('/api/director/script', 'POST', { script });
     if (result?.success) {
         elements.btnDirectorStart.disabled = false;
-        // Update timeline if scenes came back
-        if (result.scenes) {
-            renderTimeline(result.scenes);
-        }
         alert('Script loaded: ' + (result.cueCount || 0) + ' cues parsed');
     } else {
         alert('Failed to load script: ' + (result?.message || 'Unknown error'));
@@ -622,14 +587,6 @@ async function loadScript() {
 function clearScript() {
     elements.scriptTextarea.value = '';
     loadedScriptFileName = null;
-    scriptScenes = [];
-    currentSceneIndex = -1;
-    currentCueIndex = -1;
-    totalCues = 0;
-    renderTimeline([]);
-    if (elements.timelinePlayhead) {
-        elements.timelinePlayhead.classList.remove('active');
-    }
     apiCall('/api/director/script/clear', 'POST');
 }
 
@@ -786,7 +743,6 @@ function handleDirectorEvent(data) {
             if (elements.directorCue) {
                 elements.directorCue.textContent = data.cue || '-';
             }
-            updateTimelinePlayhead(data);
             break;
         case 'take':
             fetchTakesList();
@@ -795,7 +751,6 @@ function handleDirectorEvent(data) {
             if (elements.directorScene) {
                 elements.directorScene.textContent = data.scene || '-';
             }
-            updateTimelineScene(data);
             break;
     }
 }
@@ -857,12 +812,6 @@ async function loadScriptFromFile(fileName) {
         elements.scriptFilesList.querySelectorAll('.script-file-item').forEach(item => {
             item.classList.toggle('active', item.dataset.filename === fileName);
         });
-
-        // If parsed cues came back, update timeline
-        if (result.scenes) {
-            scriptScenes = result.scenes;
-            renderTimeline(result.scenes);
-        }
     } else {
         alert('Failed to load script: ' + (result?.message || 'Unknown error'));
     }
@@ -911,223 +860,7 @@ async function deleteScriptFile(fileName) {
     }
 }
 
-// ==================== Timeline Visualization Functions ====================
-
-// Render the timeline from parsed scenes
-function renderTimeline(scenes) {
-    if (!elements.timelineScenes) return;
-
-    scriptScenes = scenes || [];
-    totalCues = 0;
-
-    if (scriptScenes.length === 0) {
-        elements.timelineScenes.innerHTML = '';
-        updateTimelineProgress(0, 0);
-        renderSceneNav([]);
-        return;
-    }
-
-    // Calculate total cues across all scenes
-    scriptScenes.forEach(scene => {
-        totalCues += (scene.cues || []).length;
-    });
-
-    // Render scene blocks proportional to cue count
-    elements.timelineScenes.innerHTML = scriptScenes.map((scene, index) => {
-        const cueCount = (scene.cues || []).length;
-        const widthPercent = totalCues > 0 ? (cueCount / totalCues) * 100 : (100 / scriptScenes.length);
-        const label = scene.label || `Scene ${index + 1}`;
-        const stateClass = index < currentSceneIndex ? 'past' :
-                          index === currentSceneIndex ? 'current' : 'future';
-
-        return `<div class="timeline-scene-block ${stateClass}"
-                     style="width: ${widthPercent}%"
-                     data-scene-index="${index}"
-                     title="${escapeHtml(label)} (${cueCount} cues)">
-                    ${escapeHtml(label)}
-                </div>`;
-    }).join('');
-
-    updateTimelineProgress(0, totalCues);
-    renderSceneNav(scriptScenes);
-}
-
-// Update timeline playhead position based on cue progress
-function updateTimelinePlayhead(data) {
-    if (!elements.timelinePlayhead || totalCues === 0) return;
-
-    const cueIndex = data.cueIndex || 0;
-    const sceneIndex = data.sceneIndex || 0;
-
-    currentCueIndex = cueIndex;
-    currentSceneIndex = sceneIndex;
-
-    // Calculate cumulative position
-    let cuesBefore = 0;
-    for (let i = 0; i < sceneIndex && i < scriptScenes.length; i++) {
-        cuesBefore += (scriptScenes[i].cues || []).length;
-    }
-    cuesBefore += cueIndex;
-
-    const position = (cuesBefore / totalCues) * 100;
-    elements.timelinePlayhead.style.left = position + '%';
-    elements.timelinePlayhead.classList.add('active');
-
-    // Update scene block states
-    elements.timelineScenes.querySelectorAll('.timeline-scene-block').forEach((block, idx) => {
-        block.classList.remove('past', 'current', 'future');
-        if (idx < sceneIndex) block.classList.add('past');
-        else if (idx === sceneIndex) block.classList.add('current');
-        else block.classList.add('future');
-    });
-
-    // Update scene nav active state
-    elements.sceneNav.querySelectorAll('.scene-nav-btn').forEach((btn, idx) => {
-        btn.classList.remove('active', 'completed');
-        if (idx < sceneIndex) btn.classList.add('completed');
-        else if (idx === sceneIndex) btn.classList.add('active');
-    });
-
-    updateTimelineProgress(cuesBefore, totalCues);
-}
-
-// Update timeline scene highlighting
-function updateTimelineScene(data) {
-    const sceneIndex = data.sceneIndex || 0;
-    currentSceneIndex = sceneIndex;
-
-    if (!elements.timelineScenes) return;
-
-    elements.timelineScenes.querySelectorAll('.timeline-scene-block').forEach((block, idx) => {
-        block.classList.remove('past', 'current', 'future');
-        if (idx < sceneIndex) block.classList.add('past');
-        else if (idx === sceneIndex) block.classList.add('current');
-        else block.classList.add('future');
-    });
-}
-
-// Update progress text
-function updateTimelineProgress(current, total) {
-    if (elements.timelineProgress) {
-        elements.timelineProgress.textContent = `${current} / ${total} cues`;
-    }
-}
-
-// Render scene navigation buttons
-function renderSceneNav(scenes) {
-    if (!elements.sceneNav) return;
-
-    if (!scenes || scenes.length === 0) {
-        elements.sceneNav.innerHTML = '';
-        return;
-    }
-
-    elements.sceneNav.innerHTML = scenes.map((scene, index) => {
-        const label = scene.label || `Scene ${index + 1}`;
-        return `<button class="scene-nav-btn" data-scene-index="${index}" title="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
-    }).join('');
-
-    // Add click handlers for scene navigation
-    elements.sceneNav.querySelectorAll('.scene-nav-btn').forEach(btn => {
-        btn.addEventListener('click', () => {
-            const sceneIndex = parseInt(btn.dataset.sceneIndex);
-            jumpToScene(sceneIndex);
-        });
-    });
-}
-
-// Jump to a specific scene
-async function jumpToScene(sceneIndex) {
-    const result = await apiCall('/api/director/scene', 'POST', { sceneIndex });
-    if (!result?.success) {
-        console.error('Failed to jump to scene:', result?.message);
-    }
-}
-
-// ==================== Session Export Functions ====================
-
-// Export session report as JSON
-async function exportSessionReport() {
-    const [sessionResult, takesResult, statusResult] = await Promise.all([
-        apiCall('/api/director/session'),
-        apiCall('/api/director/takes'),
-        apiCall('/api/director/status')
-    ]);
-
-    const report = {
-        exportDate: new Date().toISOString(),
-        session: sessionResult?.session || {},
-        status: statusResult || {},
-        takes: takesResult?.takes || [],
-        stats: sessionResult?.stats || {}
-    };
-
-    downloadJson(report, `session-report-${formatTimestamp()}.json`);
-}
-
-// Export current script as text
-async function exportScript() {
-    const script = elements.scriptTextarea.value.trim();
-    if (!script) {
-        // Try to get from API
-        const result = await apiCall('/api/director/scripts/export');
-        if (result?.success && result.script) {
-            downloadText(result.script, `script-${formatTimestamp()}.txt`);
-        } else {
-            alert('No script to export');
-        }
-        return;
-    }
-
-    const fileName = loadedScriptFileName || `script-${formatTimestamp()}.txt`;
-    downloadText(script, fileName);
-}
-
-// Export takes as CSV
-async function exportTakesCsv() {
-    const result = await apiCall('/api/director/takes');
-    if (!result?.success || !result.takes || result.takes.length === 0) {
-        alert('No takes to export');
-        return;
-    }
-
-    const takes = result.takes;
-    const headers = ['Take #', 'Scene', 'Duration (s)', 'Quality Score', 'Quality Class', 'Marks', 'Best', 'File'];
-    const rows = takes.map((take, index) => [
-        index + 1,
-        take.scene || '',
-        (take.duration || 0).toFixed(1),
-        (take.qualityScore || 0).toFixed(2),
-        getQualityClass(take.qualityScore || 0),
-        (take.marks || []).join('; '),
-        take.best ? 'Yes' : 'No',
-        take.filePath || ''
-    ]);
-
-    const csv = [headers.join(','), ...rows.map(row => row.map(cell => `"${cell}"`).join(','))].join('\n');
-    downloadText(csv, `takes-${formatTimestamp()}.csv`);
-}
-
 // ==================== Utility Functions ====================
-
-function downloadJson(data, filename) {
-    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
-    downloadBlob(blob, filename);
-}
-
-function downloadText(text, filename) {
-    const blob = new Blob([text], { type: 'text/plain' });
-    downloadBlob(blob, filename);
-}
-
-function downloadBlob(blob, filename) {
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    a.click();
-    URL.revokeObjectURL(url);
-}
 
 function formatFileSize(bytes) {
     if (bytes < 1024) return bytes + ' B';
@@ -1138,16 +871,6 @@ function formatFileSize(bytes) {
 function formatDate(timestamp) {
     const date = new Date(timestamp);
     return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function formatTimestamp() {
-    const now = new Date();
-    return now.getFullYear() +
-        String(now.getMonth() + 1).padStart(2, '0') +
-        String(now.getDate()).padStart(2, '0') + '-' +
-        String(now.getHours()).padStart(2, '0') +
-        String(now.getMinutes()).padStart(2, '0') +
-        String(now.getSeconds()).padStart(2, '0');
 }
 
 function escapeHtml(str) {

@@ -217,21 +217,10 @@ Return to wide shot."></textarea>
                         </div>
                     </div>
 
-                    <!-- Timeline Visualization -->
-                    <div class="timeline-section">
-                        <div class="timeline-header">
-                            <span class="label">Script Timeline</span>
-                            <span id="timeline-progress" class="timeline-progress">0 / 0 cues</span>
-                        </div>
-                        <div class="timeline-container">
-                            <div id="timeline-track" class="timeline-track">
-                                <div id="timeline-scenes" class="timeline-scenes"></div>
-                                <div id="timeline-playhead" class="timeline-playhead"></div>
-                            </div>
-                        </div>
-                        <div id="scene-nav" class="scene-nav">
-                            <!-- Scene buttons will be dynamically generated -->
-                        </div>
+                    <!-- Scene Progress -->
+                    <div class="status-row">
+                        <span class="label">Progress:</span>
+                        <span id="scene-progress" class="value">-</span>
                     </div>
 
                     <!-- Director Controls -->
@@ -285,12 +274,6 @@ Return to wide shot."></textarea>
                         </div>
                     </div>
 
-                    <!-- Session Export -->
-                    <div class="session-export">
-                        <button id="btn-export-session" class="btn btn-export">Export Session Report</button>
-                        <button id="btn-export-script" class="btn btn-export">Export Script</button>
-                        <button id="btn-export-takes" class="btn btn-export">Export Takes CSV</button>
-                    </div>
                 </div>
             </section>
         </main>
