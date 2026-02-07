@@ -89,26 +89,31 @@ class FrameProcessor(
 
         try {
             // Create encoder
-            encoder = VideoEncoder(encoderConfig)
+            val newEncoder = VideoEncoder(encoderConfig)
+            encoder = newEncoder
 
             // Initialize encoder and get input surface
-            val surfaceResult = encoder!!.initialize()
+            val surfaceResult = newEncoder.initialize()
             if (surfaceResult.isFailure) {
                 _state.value = ProcessorState.ERROR
-                return Result.failure(surfaceResult.exceptionOrNull()!!)
+                return Result.failure(surfaceResult.exceptionOrNull()
+                    ?: IllegalStateException("Encoder initialization failed"))
             }
 
             encoderSurface = surfaceResult.getOrNull()
 
             // Set up frame callback
-            encoder!!.setFrameCallback { frame ->
+            newEncoder.setFrameCallback { frame ->
                 handleEncodedFrame(frame)
             }
 
             _state.value = ProcessorState.READY
             Timber.i("$TAG: Frame processor initialized")
 
-            return Result.success(encoderSurface!!)
+            val surface = encoderSurface ?: return Result.failure(
+                IllegalStateException("Encoder did not provide an input surface")
+            )
+            return Result.success(surface)
 
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to initialize frame processor")

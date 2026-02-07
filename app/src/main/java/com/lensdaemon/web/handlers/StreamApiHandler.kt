@@ -4,8 +4,8 @@ import com.lensdaemon.camera.CameraService
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.SegmentDuration
-import com.lensdaemon.output.SrtConfig
-import com.lensdaemon.output.SrtMode
+import com.lensdaemon.output.MpegTsUdpConfig
+import com.lensdaemon.output.MpegTsMode
 import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
@@ -18,7 +18,7 @@ import org.json.JSONObject
  * Handles:
  * - /api/stream/*     - Encoding start/stop/status
  * - /api/rtsp/*       - RTSP server control
- * - /api/srt/*        - SRT publisher control
+ * - /api/mpegts/*     - MPEG-TS/UDP publisher control
  * - /api/recording/*  - Local recording control
  * - /api/recordings   - Recording file management
  * - /api/storage/*    - Storage status and cleanup
@@ -42,10 +42,10 @@ class StreamApiHandler {
             uri == "/api/rtsp/stop" && method == NanoHTTPD.Method.POST -> stopRtsp()
             uri == "/api/rtsp/status" && method == NanoHTTPD.Method.GET -> getRtspStatus()
 
-            // SRT control
-            uri == "/api/srt/start" && method == NanoHTTPD.Method.POST -> startSrt(body)
-            uri == "/api/srt/stop" && method == NanoHTTPD.Method.POST -> stopSrt()
-            uri == "/api/srt/status" && method == NanoHTTPD.Method.GET -> getSrtStatus()
+            // MPEG-TS/UDP control
+            uri == "/api/mpegts/start" && method == NanoHTTPD.Method.POST -> startMpegTs(body)
+            uri == "/api/mpegts/stop" && method == NanoHTTPD.Method.POST -> stopMpegTs()
+            uri == "/api/mpegts/status" && method == NanoHTTPD.Method.GET -> getMpegTsStatus()
 
             // Recording control
             uri == "/api/recording/start" && method == NanoHTTPD.Method.POST -> startRecording(body)
@@ -209,9 +209,9 @@ class StreamApiHandler {
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    // ==================== SRT Control ====================
+    // ==================== MPEG-TS/UDP Control ====================
 
-    private fun startSrt(body: JSONObject?): NanoHTTPD.Response {
+    private fun startMpegTs(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
         val port = body?.optInt("port", 9000) ?: 9000
@@ -224,9 +224,9 @@ class StreamApiHandler {
         val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
         val frameRate = body?.optInt("frameRate", 30) ?: 30
 
-        val mode = if (modeStr.equals("caller", ignoreCase = true)) SrtMode.CALLER else SrtMode.LISTENER
+        val mode = if (modeStr.equals("caller", ignoreCase = true)) MpegTsMode.CALLER else MpegTsMode.LISTENER
 
-        val srtConfig = SrtConfig(
+        val mpegtsConfig = MpegTsUdpConfig(
             port = port,
             mode = mode,
             targetHost = targetHost,
@@ -240,16 +240,16 @@ class StreamApiHandler {
             frameRate = frameRate
         )
 
-        val success = camera.startSrtStreaming(encoderConfig, srtConfig)
+        val success = camera.startMpegTsStreaming(encoderConfig, mpegtsConfig)
 
         val json = JSONObject().apply {
             put("success", success)
             if (success) {
-                put("message", "SRT streaming started")
+                put("message", "MPEG-TS/UDP streaming started")
                 put("port", port)
                 put("mode", mode.name)
             } else {
-                put("message", "Failed to start SRT streaming")
+                put("message", "Failed to start MPEG-TS/UDP streaming")
             }
         }
 
@@ -259,23 +259,23 @@ class StreamApiHandler {
         )
     }
 
-    private fun stopSrt(): NanoHTTPD.Response {
+    private fun stopMpegTs(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
-        camera.stopSrtStreaming()
+        camera.stopMpegTsStreaming()
 
         return NanoHTTPD.newFixedLengthResponse(
             Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "SRT streaming stopped"}"""
+            """{"success": true, "message": "MPEG-TS/UDP streaming stopped"}"""
         )
     }
 
-    private fun getSrtStatus(): NanoHTTPD.Response {
+    private fun getMpegTsStatus(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val stats = camera.getSrtStats()
+        val stats = camera.getMpegTsStats()
 
         val json = JSONObject().apply {
-            put("running", camera.isSrtRunning())
+            put("running", camera.isMpegTsRunning())
             if (stats != null) {
                 put("connected", stats.isConnected)
                 put("mode", stats.mode.name)

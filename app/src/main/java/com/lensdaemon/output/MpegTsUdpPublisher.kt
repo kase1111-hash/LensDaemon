@@ -9,34 +9,34 @@ import java.net.*
 import java.nio.ByteBuffer
 import java.util.concurrent.atomic.AtomicBoolean
 
-enum class SrtMode { CALLER, LISTENER }
+enum class MpegTsMode { CALLER, LISTENER }
 
-data class SrtConfig(
+data class MpegTsUdpConfig(
     val port: Int = 9000,
-    val mode: SrtMode = SrtMode.LISTENER,
+    val mode: MpegTsMode = MpegTsMode.LISTENER,
     val targetHost: String = "",
     val targetPort: Int = 9000,
     val latencyMs: Int = 120,
     val maxBandwidthBps: Long = 0
 )
 
-data class SrtStats(
+data class MpegTsUdpStats(
     val isConnected: Boolean = false,
     val bytesSent: Long = 0,
     val packetsSent: Long = 0,
     val framesSent: Long = 0,
     val uptimeMs: Long = 0,
-    val mode: SrtMode = SrtMode.LISTENER,
+    val mode: MpegTsMode = MpegTsMode.LISTENER,
     val port: Int = 9000,
     val remoteAddress: String = ""
 )
 
 /**
- * SRT publisher that sends H.264/H.265 encoded video over UDP with MPEG-TS wrapping.
+ * MPEG-TS over UDP publisher for H.264/H.265 encoded video.
  *
- * Implements the transport layer with MPEG-TS packaging over UDP. A full SRT
- * implementation requires native libsrt; this provides the framing layer that
- * can later be upgraded with native SRT bindings.
+ * Sends MPEG Transport Stream packets over raw UDP datagrams. This is NOT
+ * an SRT implementation — there is no encryption, ARQ, or congestion control.
+ * A full SRT implementation requires native libsrt bindings.
  *
  * Features:
  * - Caller mode (push to remote) and Listener mode (accept incoming pulls)
@@ -45,10 +45,10 @@ data class SrtStats(
  * - Coroutine-based async architecture with SupervisorJob
  * - Real-time statistics via StateFlow
  */
-class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
+class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()) {
 
     companion object {
-        private const val TAG = "SrtPublisher"
+        private const val TAG = "MpegTsUdpPublisher"
         private const val TS_PACKET_SIZE = 188
         private const val TS_SYNC_BYTE = 0x47.toByte()
         private const val PAT_PID = 0
@@ -61,8 +61,8 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
     }
 
     private val isRunning = AtomicBoolean(false)
-    private val _stats = MutableStateFlow(SrtStats(mode = config.mode, port = config.port))
-    val stats: StateFlow<SrtStats> = _stats.asStateFlow()
+    private val _stats = MutableStateFlow(MpegTsUdpStats(mode = config.mode, port = config.port))
+    val stats: StateFlow<MpegTsUdpStats> = _stats.asStateFlow()
 
     private var scope: CoroutineScope? = null
     private var socket: DatagramSocket? = null
@@ -95,10 +95,10 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
         }
         return try {
             scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-            socket = DatagramSocket(if (config.mode == SrtMode.LISTENER) config.port else null)
+            socket = DatagramSocket(if (config.mode == MpegTsMode.LISTENER) config.port else null)
 
             when (config.mode) {
-                SrtMode.CALLER -> {
+                MpegTsMode.CALLER -> {
                     if (config.targetHost.isBlank()) {
                         Timber.e("$TAG: Caller mode requires a target host")
                         cleanup()
@@ -107,7 +107,7 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
                     remoteAddress = InetSocketAddress(InetAddress.getByName(config.targetHost), config.targetPort)
                     Timber.i("$TAG: Caller mode targeting ${config.targetHost}:${config.targetPort}")
                 }
-                SrtMode.LISTENER -> {
+                MpegTsMode.LISTENER -> {
                     scope?.launch { listenerLoop() }
                     Timber.i("$TAG: Listener mode on port ${config.port}")
                 }
@@ -121,10 +121,10 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
             packetsSent = 0L
             framesSent = 0L
             updateStats()
-            Timber.i("$TAG: SRT publisher started (mode=${config.mode}, port=${config.port})")
+            Timber.i("$TAG: MPEG-TS/UDP publisher started (mode=${config.mode}, port=${config.port})")
             true
         } catch (e: Exception) {
-            Timber.e(e, "$TAG: Failed to start SRT publisher")
+            Timber.e(e, "$TAG: Failed to start MPEG-TS/UDP publisher")
             cleanup()
             false
         }
@@ -132,10 +132,10 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
 
     fun stop() {
         if (!isRunning.compareAndSet(true, false)) return
-        Timber.i("$TAG: Stopping SRT publisher")
+        Timber.i("$TAG: Stopping MPEG-TS/UDP publisher")
         cleanup()
-        _stats.value = SrtStats(mode = config.mode, port = config.port)
-        Timber.i("$TAG: SRT publisher stopped")
+        _stats.value = MpegTsUdpStats(mode = config.mode, port = config.port)
+        Timber.i("$TAG: MPEG-TS/UDP publisher stopped")
     }
 
     fun sendFrame(frame: EncodedFrame) {
@@ -164,6 +164,8 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
     fun isRunning(): Boolean = isRunning.get()
 
     fun isConnected(): Boolean = isRunning.get() && remoteAddress != null
+
+    fun getStats(): MpegTsUdpStats = _stats.value
 
     // --- Listener mode: wait for incoming UDP to discover peer ---
 
@@ -406,7 +408,7 @@ class SrtPublisher(private val config: SrtConfig = SrtConfig()) {
     private fun updateStats() {
         val uptimeMs = if (startTimeMs > 0) System.currentTimeMillis() - startTimeMs else 0
         val remote = remoteAddress
-        _stats.value = SrtStats(
+        _stats.value = MpegTsUdpStats(
             isConnected = isRunning.get() && remote != null,
             bytesSent = bytesSent,
             packetsSent = packetsSent,

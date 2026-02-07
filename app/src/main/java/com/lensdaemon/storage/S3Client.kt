@@ -137,7 +137,8 @@ class S3Client(
     }
 
     /**
-     * Single PUT upload for small files
+     * Single PUT upload for small files.
+     * Streams file content to avoid loading entire file into memory.
      */
     private suspend fun uploadSingle(
         localFile: File,
@@ -147,8 +148,9 @@ class S3Client(
     ): Result<S3UploadResult> {
         return try {
             val fileSize = localFile.length()
-            val fileBytes = localFile.readBytes()
-            val contentSha256 = sha256Hex(fileBytes)
+
+            // Compute SHA256 incrementally to avoid loading entire file into memory
+            val contentSha256 = sha256HexFile(localFile)
 
             val date = Date()
             val headers = mutableMapOf(
@@ -158,17 +160,19 @@ class S3Client(
             )
 
             val url = "${credentials.endpointUrl}/${credentials.bucket}/$key"
-            val request = createSignedRequest("PUT", url, headers, fileBytes, date)
+            // Sign with empty payload — actual hash is in x-amz-content-sha256 header
+            val request = createSignedRequest("PUT", url, headers, ByteArray(0), date)
 
             val connection = (URL(request.url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "PUT"
                 doOutput = true
+                setFixedLengthStreamingMode(fileSize)
                 connectTimeout = CONNECT_TIMEOUT
                 readTimeout = READ_TIMEOUT
                 request.headers.forEach { (k, v) -> setRequestProperty(k, v) }
             }
 
-            // Write data with progress
+            // Stream file directly to connection output — never buffer full file in memory
             connection.outputStream.use { output ->
                 var bytesWritten = 0L
                 val buffer = ByteArray(8192)
@@ -560,6 +564,18 @@ class S3Client(
         val mac = Mac.getInstance("HmacSHA256")
         mac.init(SecretKeySpec(key, "HmacSHA256"))
         return mac.doFinal(data.toByteArray(Charsets.UTF_8))
+    }
+
+    private fun sha256HexFile(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val buffer = ByteArray(8192)
+        FileInputStream(file).use { input ->
+            var read: Int
+            while (input.read(buffer).also { read = it } != -1) {
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().toHex()
     }
 
     private fun sha256Hex(data: ByteArray): String {
