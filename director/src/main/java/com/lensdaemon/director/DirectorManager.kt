@@ -1,7 +1,6 @@
 package com.lensdaemon.director
 
 import android.content.Context
-import com.lensdaemon.camera.LensType
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import timber.log.Timber
@@ -30,7 +29,7 @@ class DirectorManager(
      * Camera control interface for executing commands
      */
     interface CameraController {
-        fun switchLens(lens: LensType)
+        fun switchLens(lens: String)
         fun setZoom(level: Float, animated: Boolean = false, durationMs: Long = 0)
         fun setFocusMode(target: FocusTarget)
         fun setExposurePreset(preset: ExposurePreset)

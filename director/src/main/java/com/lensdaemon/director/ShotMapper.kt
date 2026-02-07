@@ -1,6 +1,5 @@
 package com.lensdaemon.director
 
-import com.lensdaemon.camera.LensType
 import timber.log.Timber
 
 /**
@@ -57,7 +56,7 @@ class ShotMapper(
      * Mapped camera command to execute a shot
      */
     data class CameraCommand(
-        val lens: LensType,
+        val lens: String,
         val zoomLevel: Float,
         val focusMode: FocusTarget,
         val exposurePreset: ExposurePreset = ExposurePreset.AUTO,
@@ -341,7 +340,7 @@ class ShotMapper(
     private fun selectLensAndZoom(
         shotType: ShotType,
         warnings: MutableList<String>
-    ): Pair<LensType, Float> {
+    ): Pair<String, Float> {
         val zoomRange = SHOT_ZOOM_RANGES[shotType] ?: (1.0f..1.0f)
         val targetZoom = (zoomRange.start + zoomRange.endInclusive) / 2
 
@@ -350,10 +349,10 @@ class ShotMapper(
             // Wide shots - prefer wide lens
             shotType in listOf(ShotType.ESTABLISHING, ShotType.WIDE) -> {
                 if (capabilities.hasWide) {
-                    Pair(LensType.WIDE, targetZoom.coerceIn(0.5f, 1.0f))
+                    Pair("wide", targetZoom.coerceIn(0.5f, 1.0f))
                 } else {
                     warnings.add("Wide lens not available, using main lens")
-                    Pair(LensType.MAIN, 1.0f)
+                    Pair("main", 1.0f)
                 }
             }
 
@@ -361,17 +360,17 @@ class ShotMapper(
             shotType in listOf(ShotType.CLOSE_UP, ShotType.EXTREME_CLOSE, ShotType.OVER_SHOULDER) -> {
                 if (capabilities.hasTelephoto) {
                     // Telephoto lens, use lower zoom
-                    Pair(LensType.TELEPHOTO, targetZoom.coerceIn(1.0f, 2.0f))
+                    Pair("tele", targetZoom.coerceIn(1.0f, 2.0f))
                 } else {
                     // Digital zoom on main lens
                     warnings.add("Telephoto lens not available, using digital zoom")
-                    Pair(LensType.MAIN, targetZoom.coerceIn(1.0f, capabilities.maxDigitalZoom))
+                    Pair("main", targetZoom.coerceIn(1.0f, capabilities.maxDigitalZoom))
                 }
             }
 
             // Medium shots - use main lens
             else -> {
-                Pair(LensType.MAIN, targetZoom.coerceIn(1.0f, 2.0f))
+                Pair("main", targetZoom.coerceIn(1.0f, 2.0f))
             }
         }
     }
@@ -395,7 +394,7 @@ class ShotMapper(
      */
     private fun getDefaultCommand(): CameraCommand {
         return CameraCommand(
-            lens = LensType.MAIN,
+            lens = "main",
             zoomLevel = 1.0f,
             focusMode = FocusTarget.AUTO,
             exposurePreset = ExposurePreset.AUTO
@@ -420,9 +419,9 @@ class ShotMapper(
      */
     fun calculateEffectiveFocalLength(command: CameraCommand): Float {
         val baseFocal = when (command.lens) {
-            LensType.WIDE -> capabilities.wideFocalLength
-            LensType.MAIN -> capabilities.mainFocalLength
-            LensType.TELEPHOTO -> capabilities.telephotoFocalLength
+            "wide" -> capabilities.wideFocalLength
+            "tele" -> capabilities.telephotoFocalLength
+            else -> capabilities.mainFocalLength
         }
         return baseFocal * command.zoomLevel
     }
