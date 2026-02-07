@@ -14,6 +14,7 @@ import androidx.core.app.NotificationCompat
 import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
+import com.lensdaemon.BuildConfig
 import com.lensdaemon.camera.CameraService
 import com.lensdaemon.director.CameraControllerAdapter
 import com.lensdaemon.director.DirectorManager
@@ -206,6 +207,7 @@ class WebServerService : Service() {
      * Set up AI Director integration with camera service
      */
     private fun setupDirectorIntegration() {
+        if (!BuildConfig.ENABLE_DIRECTOR) return
         val camera = cameraService ?: return
 
         // Create director manager

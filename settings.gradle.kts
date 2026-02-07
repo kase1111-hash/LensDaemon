@@ -16,3 +16,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "LensDaemon"
 include(":app")
+include(":director")

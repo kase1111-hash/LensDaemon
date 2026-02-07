@@ -45,10 +45,25 @@ android {
 
     buildFeatures {
         viewBinding = true
+        buildConfig = true
+    }
+
+    flavorDimensions += "feature"
+    productFlavors {
+        create("core") {
+            dimension = "feature"
+            buildConfigField("boolean", "ENABLE_DIRECTOR", "false")
+        }
+        create("full") {
+            dimension = "feature"
+            buildConfigField("boolean", "ENABLE_DIRECTOR", "true")
+        }
     }
 }
 
 dependencies {
+    // Director module (included in all flavors; gated at runtime via ENABLE_DIRECTOR)
+    implementation(project(":director"))
     // AndroidX Core
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")

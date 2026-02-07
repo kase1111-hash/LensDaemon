@@ -255,9 +255,13 @@ async function fetchStatus() {
             elements.zoomValue.textContent = `${status.camera.zoom.toFixed(1)}x`;
         }
 
-        // Director status
+        // Director status — hide section entirely if backend has no director
+        var directorSection = document.querySelector('.director-section');
         if (status.director) {
+            if (directorSection) directorSection.style.display = '';
             updateDirectorStatus(status.director);
+        } else {
+            if (directorSection) directorSection.style.display = 'none';
         }
 
     } else {

@@ -3,7 +3,6 @@ package com.lensdaemon.director
 import org.junit.Assert.*
 import org.junit.Before
 import org.junit.Test
-import com.lensdaemon.camera.LensType
 
 /**
  * Comprehensive unit tests for ShotMapper.
@@ -125,7 +124,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.WIDE))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.WIDE, result.command!!.lens)
+        assertEquals("wide", result.command!!.lens)
     }
 
     @Test
@@ -133,7 +132,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.ESTABLISHING))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.WIDE, result.command!!.lens)
+        assertEquals("wide", result.command!!.lens)
     }
 
     @Test
@@ -141,7 +140,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.TELEPHOTO, result.command!!.lens)
+        assertEquals("tele", result.command!!.lens)
     }
 
     @Test
@@ -149,7 +148,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.EXTREME_CLOSE))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.TELEPHOTO, result.command!!.lens)
+        assertEquals("tele", result.command!!.lens)
     }
 
     @Test
@@ -157,7 +156,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.OVER_SHOULDER))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.TELEPHOTO, result.command!!.lens)
+        assertEquals("tele", result.command!!.lens)
     }
 
     @Test
@@ -165,7 +164,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.MEDIUM))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -173,7 +172,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.FULL_SHOT))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -181,7 +180,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.MEDIUM_CLOSE))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -189,7 +188,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.CUSTOM))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -504,7 +503,7 @@ class ShotMapperTest {
         assertTrue(result.success)
         assertNotNull(result.command)
         // Default command: MAIN lens, zoom 1.0, AUTO focus
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
         // Push in from 1.0 -> 1.5
         assertEquals(1.5f, result.command!!.zoomLevel, 0.01f)
     }
@@ -593,7 +592,7 @@ class ShotMapperTest {
         mapper.reset()
         val result = mapper.mapCue(focusCue(FocusTarget.FACE))
         assertTrue(result.success)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
         assertEquals(1.0f, result.command!!.zoomLevel, 0.001f)
     }
 
@@ -666,7 +665,7 @@ class ShotMapperTest {
         mapper.reset()
         val result = mapper.mapCue(exposureCue(ExposurePreset.SILHOUETTE))
         assertTrue(result.success)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
         assertEquals(1.0f, result.command!!.zoomLevel, 0.001f)
     }
 
@@ -691,13 +690,13 @@ class ShotMapperTest {
     @Test
     fun `CUT cue maps shot type to correct lens`() {
         val wideResult = mapper.mapCue(cutCue(ShotType.WIDE))
-        assertEquals(LensType.WIDE, wideResult.command!!.lens)
+        assertEquals("wide", wideResult.command!!.lens)
 
         val closeResult = mapper.mapCue(cutCue(ShotType.CLOSE_UP))
-        assertEquals(LensType.TELEPHOTO, closeResult.command!!.lens)
+        assertEquals("tele", closeResult.command!!.lens)
 
         val mediumResult = mapper.mapCue(cutCue(ShotType.MEDIUM))
-        assertEquals(LensType.MAIN, mediumResult.command!!.lens)
+        assertEquals("main", mediumResult.command!!.lens)
     }
 
     @Test
@@ -705,7 +704,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(cutCue(shotType = null))
         assertTrue(result.success)
         assertNotNull(result.command)
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -827,7 +826,7 @@ class ShotMapperTest {
         assertTrue(result.success)
         assertTrue(result.fallbackUsed)
         assertTrue(result.warnings.any { it.contains("Wide lens not available") })
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -837,7 +836,7 @@ class ShotMapperTest {
         assertTrue(result.success)
         assertTrue(result.fallbackUsed)
         assertTrue(result.warnings.any { it.contains("Wide lens not available") })
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -853,7 +852,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
         assertTrue(result.success)
         assertTrue(result.warnings.any { it.contains("Telephoto lens not available") })
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -862,7 +861,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(shotCue(ShotType.EXTREME_CLOSE))
         assertTrue(result.success)
         assertTrue(result.warnings.any { it.contains("Telephoto lens not available") })
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
     }
 
     @Test
@@ -877,7 +876,7 @@ class ShotMapperTest {
     fun `SHOT CLOSE_UP without telephoto uses digital zoom on main`() {
         mapper.updateCapabilities(minimalCapabilities)
         val result = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
         // Zoom should be > 1.0 (digital zoom)
         assertTrue(
             "Zoom ${result.command!!.zoomLevel} should be >= 1.0",
@@ -948,24 +947,24 @@ class ShotMapperTest {
     fun `updateCapabilities changes lens selection for wide shots`() {
         // Initially has wide lens
         val resultWithWide = mapper.mapCue(shotCue(ShotType.WIDE))
-        assertEquals(LensType.WIDE, resultWithWide.command!!.lens)
+        assertEquals("wide", resultWithWide.command!!.lens)
 
         // Remove wide lens
         mapper.updateCapabilities(fullCapabilities.copy(hasWide = false))
 
         val resultWithoutWide = mapper.mapCue(shotCue(ShotType.WIDE))
-        assertEquals(LensType.MAIN, resultWithoutWide.command!!.lens)
+        assertEquals("main", resultWithoutWide.command!!.lens)
     }
 
     @Test
     fun `updateCapabilities changes lens selection for telephoto shots`() {
         val resultWithTele = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
-        assertEquals(LensType.TELEPHOTO, resultWithTele.command!!.lens)
+        assertEquals("tele", resultWithTele.command!!.lens)
 
         mapper.updateCapabilities(fullCapabilities.copy(hasTelephoto = false))
 
         val resultWithoutTele = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
-        assertEquals(LensType.MAIN, resultWithoutTele.command!!.lens)
+        assertEquals("main", resultWithoutTele.command!!.lens)
     }
 
     @Test
@@ -1023,7 +1022,7 @@ class ShotMapperTest {
         val result = mapper.mapCue(transitionCue(TransitionType.PUSH_IN))
         assertTrue(result.success)
         // Default command is MAIN lens at 1.0 zoom, push in -> 1.5
-        assertEquals(LensType.MAIN, result.command!!.lens)
+        assertEquals("main", result.command!!.lens)
         assertEquals(1.5f, result.command!!.zoomLevel, 0.01f)
     }
 
@@ -1041,7 +1040,7 @@ class ShotMapperTest {
 
         mapper.mapCue(shotCue(ShotType.WIDE))
         val cmd = mapper.getCurrentCommand()!!
-        assertEquals(LensType.WIDE, cmd.lens)
+        assertEquals("wide", cmd.lens)
         // Exposure should be default (AUTO via shot cue default), not SILHOUETTE
         assertEquals(ExposurePreset.AUTO, cmd.exposurePreset)
     }
@@ -1078,7 +1077,7 @@ class ShotMapperTest {
 
         mapper.mapScene(scene)
         val cmd = mapper.getCurrentCommand()!!
-        assertEquals(LensType.WIDE, cmd.lens)
+        assertEquals("wide", cmd.lens)
     }
 
     @Test
@@ -1095,15 +1094,15 @@ class ShotMapperTest {
         val results = mapper.mapScene(scene)
 
         // First result: MEDIUM shot with AUTO exposure and AUTO focus
-        assertEquals(LensType.MAIN, results[0].command!!.lens)
+        assertEquals("main", results[0].command!!.lens)
         assertEquals(ExposurePreset.AUTO, results[0].command!!.exposurePreset)
 
         // Second result: still MAIN lens, now DARK exposure
-        assertEquals(LensType.MAIN, results[1].command!!.lens)
+        assertEquals("main", results[1].command!!.lens)
         assertEquals(ExposurePreset.DARK, results[1].command!!.exposurePreset)
 
         // Third result: still MAIN lens, still DARK exposure, now FACE focus
-        assertEquals(LensType.MAIN, results[2].command!!.lens)
+        assertEquals("main", results[2].command!!.lens)
         assertEquals(ExposurePreset.DARK, results[2].command!!.exposurePreset)
         assertEquals(FocusTarget.FACE, results[2].command!!.focusMode)
     }
@@ -1397,7 +1396,7 @@ class ShotMapperTest {
     @Test
     fun `calculateEffectiveFocalLength for wide lens at 1x zoom`() {
         val command = ShotMapper.CameraCommand(
-            lens = LensType.WIDE,
+            lens = "wide",
             zoomLevel = 1.0f,
             focusMode = FocusTarget.AUTO
         )
@@ -1408,7 +1407,7 @@ class ShotMapperTest {
     @Test
     fun `calculateEffectiveFocalLength for main lens at 1x zoom`() {
         val command = ShotMapper.CameraCommand(
-            lens = LensType.MAIN,
+            lens = "main",
             zoomLevel = 1.0f,
             focusMode = FocusTarget.AUTO
         )
@@ -1419,7 +1418,7 @@ class ShotMapperTest {
     @Test
     fun `calculateEffectiveFocalLength for telephoto lens at 1x zoom`() {
         val command = ShotMapper.CameraCommand(
-            lens = LensType.TELEPHOTO,
+            lens = "tele",
             zoomLevel = 1.0f,
             focusMode = FocusTarget.AUTO
         )
@@ -1430,7 +1429,7 @@ class ShotMapperTest {
     @Test
     fun `calculateEffectiveFocalLength multiplies by zoom level`() {
         val command = ShotMapper.CameraCommand(
-            lens = LensType.MAIN,
+            lens = "main",
             zoomLevel = 2.0f,
             focusMode = FocusTarget.AUTO
         )
@@ -1447,12 +1446,12 @@ class ShotMapperTest {
         ))
 
         val wideCmd = ShotMapper.CameraCommand(
-            lens = LensType.WIDE, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
+            lens = "wide", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
         )
         assertEquals(14f, mapper.calculateEffectiveFocalLength(wideCmd), 0.001f)
 
         val teleCmd = ShotMapper.CameraCommand(
-            lens = LensType.TELEPHOTO, zoomLevel = 1.5f, focusMode = FocusTarget.AUTO
+            lens = "tele", zoomLevel = 1.5f, focusMode = FocusTarget.AUTO
         )
         assertEquals(105f * 1.5f, mapper.calculateEffectiveFocalLength(teleCmd), 0.001f)
     }
@@ -1460,7 +1459,7 @@ class ShotMapperTest {
     @Test
     fun `calculateEffectiveFocalLength with fractional zoom`() {
         val command = ShotMapper.CameraCommand(
-            lens = LensType.WIDE,
+            lens = "wide",
             zoomLevel = 0.75f,
             focusMode = FocusTarget.AUTO
         )
@@ -1571,16 +1570,16 @@ class ShotMapperTest {
         mapper.mapCue(shotCue(ShotType.WIDE))
         val cmd = mapper.getCurrentCommand()
         assertNotNull(cmd)
-        assertEquals(LensType.WIDE, cmd!!.lens)
+        assertEquals("wide", cmd!!.lens)
     }
 
     @Test
     fun `getCurrentCommand updates after each successful mapping`() {
         mapper.mapCue(shotCue(ShotType.WIDE))
-        assertEquals(LensType.WIDE, mapper.getCurrentCommand()!!.lens)
+        assertEquals("wide", mapper.getCurrentCommand()!!.lens)
 
         mapper.mapCue(shotCue(ShotType.CLOSE_UP))
-        assertEquals(LensType.TELEPHOTO, mapper.getCurrentCommand()!!.lens)
+        assertEquals("tele", mapper.getCurrentCommand()!!.lens)
     }
 
     @Test
@@ -1636,7 +1635,7 @@ class ShotMapperTest {
         mapper.mapCue(cutCue(ShotType.WIDE))
 
         val cmd = mapper.getCurrentCommand()!!
-        assertEquals(LensType.WIDE, cmd.lens)
+        assertEquals("wide", cmd.lens)
         assertEquals(TransitionType.CUT, cmd.transitionType)
         assertEquals(0L, cmd.transitionDurationMs)
     }
@@ -1648,7 +1647,7 @@ class ShotMapperTest {
     @Test
     fun `differsFrom returns false for identical commands`() {
         val cmd = ShotMapper.CameraCommand(
-            lens = LensType.MAIN,
+            lens = "main",
             zoomLevel = 1.0f,
             focusMode = FocusTarget.AUTO
         )
@@ -1658,16 +1657,16 @@ class ShotMapperTest {
     @Test
     fun `differsFrom returns true for different lens`() {
         val cmd1 = ShotMapper.CameraCommand(
-            lens = LensType.MAIN, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
+            lens = "main", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
         )
-        val cmd2 = cmd1.copy(lens = LensType.WIDE)
+        val cmd2 = cmd1.copy(lens = "wide")
         assertTrue(cmd1.differsFrom(cmd2))
     }
 
     @Test
     fun `differsFrom returns true for zoom difference greater than 0_1`() {
         val cmd1 = ShotMapper.CameraCommand(
-            lens = LensType.MAIN, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
+            lens = "main", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
         )
         val cmd2 = cmd1.copy(zoomLevel = 1.2f)
         assertTrue(cmd1.differsFrom(cmd2))
@@ -1676,7 +1675,7 @@ class ShotMapperTest {
     @Test
     fun `differsFrom returns false for zoom difference less than 0_1`() {
         val cmd1 = ShotMapper.CameraCommand(
-            lens = LensType.MAIN, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
+            lens = "main", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
         )
         val cmd2 = cmd1.copy(zoomLevel = 1.05f)
         assertFalse(cmd1.differsFrom(cmd2))
@@ -1685,7 +1684,7 @@ class ShotMapperTest {
     @Test
     fun `differsFrom returns true for different focus mode`() {
         val cmd1 = ShotMapper.CameraCommand(
-            lens = LensType.MAIN, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
+            lens = "main", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO
         )
         val cmd2 = cmd1.copy(focusMode = FocusTarget.FACE)
         assertTrue(cmd1.differsFrom(cmd2))
@@ -1694,7 +1693,7 @@ class ShotMapperTest {
     @Test
     fun `differsFrom ignores exposure preset difference`() {
         val cmd1 = ShotMapper.CameraCommand(
-            lens = LensType.MAIN, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO,
+            lens = "main", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO,
             exposurePreset = ExposurePreset.AUTO
         )
         val cmd2 = cmd1.copy(exposurePreset = ExposurePreset.DARK)
@@ -1704,7 +1703,7 @@ class ShotMapperTest {
     @Test
     fun `differsFrom ignores transition type difference`() {
         val cmd1 = ShotMapper.CameraCommand(
-            lens = LensType.MAIN, zoomLevel = 1.0f, focusMode = FocusTarget.AUTO,
+            lens = "main", zoomLevel = 1.0f, focusMode = FocusTarget.AUTO,
             transitionType = TransitionType.CUT
         )
         val cmd2 = cmd1.copy(transitionType = TransitionType.PUSH_IN)
@@ -1738,7 +1737,7 @@ class ShotMapperTest {
 
         // Final state should be CLOSE_UP on telephoto
         val finalCmd = mapper.getCurrentCommand()!!
-        assertEquals(LensType.TELEPHOTO, finalCmd.lens)
+        assertEquals("tele", finalCmd.lens)
     }
 
     @Test
