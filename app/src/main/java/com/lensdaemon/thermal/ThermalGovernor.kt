@@ -33,12 +33,15 @@ import timber.log.Timber
  */
 class ThermalGovernor(
     private val context: Context,
-    private val config: ThermalConfig = ThermalConfig.DEFAULT
+    private var config: ThermalConfig = ThermalConfig.DEFAULT
 ) : ThermalMonitor.ThermalMonitorListener {
 
     companion object {
         private const val TAG = "ThermalGovernor"
     }
+
+    // Profile manager for device-specific tuning
+    val profileManager = ThermalProfileManager(context)
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var governorJob: Job? = null
@@ -149,6 +152,21 @@ class ThermalGovernor(
         scope.cancel()
         listeners.clear()
     }
+
+    /**
+     * Apply the active thermal profile to the governor config.
+     * Call after initialization or when the profile changes.
+     */
+    fun applyActiveProfile() {
+        val profile = profileManager.getActiveProfile()
+        config = profile.toThermalConfig(config)
+        Timber.tag(TAG).i("Applied thermal profile: ${profile.displayName}")
+    }
+
+    /**
+     * Get the current config (useful for API responses)
+     */
+    fun getConfig(): ThermalConfig = config
 
     /**
      * Add governor listener
