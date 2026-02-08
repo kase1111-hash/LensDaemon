@@ -34,7 +34,9 @@ data class RtspServerStats(
     val totalConnections: Long,
     val totalPacketsSent: Long,
     val totalBytesSent: Long,
-    val uptimeMs: Long
+    val uptimeMs: Long,
+    val avgLossPercent: Float = 0f,
+    val maxJitter: Long = 0
 )
 
 /**
@@ -337,6 +339,11 @@ class RtspServer(
      */
     fun getStats(): RtspServerStats {
         val uptimeMs = if (startTimeMs > 0) System.currentTimeMillis() - startTimeMs else 0
+        val sessionList = sessions.values.toList()
+        val avgLoss = if (sessionList.isNotEmpty()) {
+            sessionList.map { it.lastFractionLost / 256f * 100f }.average().toFloat()
+        } else 0f
+        val maxJitter = sessionList.maxOfOrNull { it.lastJitter } ?: 0L
         return RtspServerStats(
             state = _state.value,
             port = port,
@@ -344,7 +351,9 @@ class RtspServer(
             totalConnections = totalConnections,
             totalPacketsSent = totalPacketsSent,
             totalBytesSent = totalBytesSent,
-            uptimeMs = uptimeMs
+            uptimeMs = uptimeMs,
+            avgLossPercent = avgLoss,
+            maxJitter = maxJitter
         )
     }
 
