@@ -129,6 +129,8 @@ class WebServer(
 
                 // Static assets
                 uri == "/" || uri == "/index.html" -> serveAsset("web/index.html", MIME_HTML)
+                uri == "/setup" || uri == "/setup.html" -> serveAsset("web/setup.html", MIME_HTML)
+                uri == "/setup.js" -> serveAsset("web/setup.js", MIME_JS)
                 uri == "/dashboard.js" -> serveAsset("web/dashboard.js", MIME_JS)
                 uri == "/styles.css" -> serveAsset("web/styles.css", MIME_CSS)
                 uri.endsWith(".png") -> serveAsset("web${uri}", MIME_PNG)

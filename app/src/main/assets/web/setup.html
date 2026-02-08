@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LensDaemon Setup Wizard</title>
+    <style>
+        :root {
+            --primary-color: #2196F3;
+            --success-color: #4CAF50;
+            --danger-color: #f44336;
+            --warning-color: #ff9800;
+            --bg-color: #1a1a2e;
+            --card-bg: #16213e;
+            --text-color: #eee;
+            --text-muted: #888;
+            --border-color: #0f3460;
+            --step-inactive: #333;
+            --step-active: #2196F3;
+            --step-done: #4CAF50;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            line-height: 1.6;
+        }
+
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 15px 0;
+            border-bottom: 1px solid var(--border-color);
+            margin-bottom: 30px;
+        }
+
+        header h1 { font-size: 1.8rem; color: var(--primary-color); }
+        header a { color: var(--primary-color); text-decoration: none; font-size: 0.9rem; }
+        header a:hover { text-decoration: underline; }
+
+        /* Step indicator */
+        .step-indicator {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 30px;
+            position: relative;
+        }
+
+        .step-indicator::before {
+            content: '';
+            position: absolute;
+            top: 18px;
+            left: 40px;
+            right: 40px;
+            height: 2px;
+            background: var(--step-inactive);
+            z-index: 0;
+        }
+
+        .step {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            z-index: 1;
+            flex: 1;
+        }
+
+        .step-circle {
+            width: 36px;
+            height: 36px;
+            border-radius: 50%;
+            background: var(--step-inactive);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-weight: bold;
+            font-size: 0.9rem;
+            margin-bottom: 6px;
+            transition: background 0.3s;
+        }
+
+        .step.active .step-circle { background: var(--step-active); }
+        .step.done .step-circle { background: var(--step-done); }
+
+        .step-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            text-align: center;
+        }
+
+        .step.active .step-label { color: var(--text-color); }
+        .step.done .step-label { color: var(--step-done); }
+
+        /* Step content */
+        .step-content {
+            background: var(--card-bg);
+            border-radius: 8px;
+            padding: 24px;
+            margin-bottom: 20px;
+            display: none;
+        }
+
+        .step-content.active { display: block; }
+
+        .step-content h2 {
+            font-size: 1.3rem;
+            margin-bottom: 16px;
+            color: var(--primary-color);
+        }
+
+        .step-content p {
+            margin-bottom: 12px;
+            color: var(--text-muted);
+        }
+
+        /* Status checks */
+        .check-item {
+            display: flex;
+            align-items: center;
+            padding: 12px;
+            background: rgba(0,0,0,0.2);
+            border-radius: 6px;
+            margin-bottom: 8px;
+        }
+
+        .check-icon {
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-right: 12px;
+            font-size: 0.85rem;
+            flex-shrink: 0;
+        }
+
+        .check-icon.pass { background: var(--success-color); }
+        .check-icon.fail { background: var(--danger-color); }
+        .check-icon.warn { background: var(--warning-color); }
+        .check-icon.pending { background: var(--step-inactive); }
+
+        .check-text { flex: 1; }
+        .check-text .label { display: block; font-weight: 500; }
+        .check-text .detail { display: block; font-size: 0.85rem; color: var(--text-muted); }
+
+        /* Code block */
+        .code-block {
+            background: #0d0d1a;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            padding: 12px 16px;
+            font-family: 'Courier New', monospace;
+            font-size: 0.85rem;
+            color: var(--success-color);
+            margin: 12px 0;
+            overflow-x: auto;
+            user-select: all;
+        }
+
+        /* Preset cards */
+        .preset-grid {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin: 16px 0;
+        }
+
+        @media (max-width: 600px) {
+            .preset-grid { grid-template-columns: 1fr; }
+        }
+
+        .preset-card {
+            background: rgba(0,0,0,0.2);
+            border: 2px solid var(--border-color);
+            border-radius: 8px;
+            padding: 16px;
+            cursor: pointer;
+            transition: border-color 0.3s, background 0.3s;
+        }
+
+        .preset-card:hover { border-color: var(--primary-color); }
+        .preset-card.selected { border-color: var(--success-color); background: rgba(76,175,80,0.1); }
+
+        .preset-card h4 { margin-bottom: 8px; }
+        .preset-card ul {
+            list-style: none;
+            font-size: 0.85rem;
+            color: var(--text-muted);
+        }
+        .preset-card ul li { padding: 2px 0; }
+        .preset-card ul li::before { content: '\2022 '; color: var(--primary-color); }
+
+        /* Form elements */
+        .form-group {
+            margin-bottom: 16px;
+        }
+
+        .form-group label {
+            display: block;
+            margin-bottom: 6px;
+            font-size: 0.9rem;
+            font-weight: 500;
+        }
+
+        .form-group select, .form-group input[type="text"],
+        .form-group input[type="number"], .form-group input[type="password"] {
+            width: 100%;
+            padding: 10px 12px;
+            background: rgba(0,0,0,0.3);
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            color: var(--text-color);
+            font-size: 0.9rem;
+        }
+
+        .form-group select:focus, .form-group input:focus {
+            outline: none;
+            border-color: var(--primary-color);
+        }
+
+        .form-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+        }
+
+        .form-hint {
+            font-size: 0.8rem;
+            color: var(--text-muted);
+            margin-top: 4px;
+        }
+
+        /* Thermal status */
+        .thermal-bar {
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+        }
+
+        .thermal-bar .bar-label {
+            width: 100px;
+            font-size: 0.85rem;
+        }
+
+        .thermal-bar .bar-track {
+            flex: 1;
+            height: 8px;
+            background: rgba(0,0,0,0.3);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .thermal-bar .bar-fill {
+            height: 100%;
+            border-radius: 4px;
+            transition: width 0.5s, background 0.5s;
+        }
+
+        .thermal-bar .bar-value {
+            width: 60px;
+            text-align: right;
+            font-size: 0.85rem;
+            font-family: monospace;
+        }
+
+        /* Buttons */
+        .btn {
+            padding: 10px 20px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.9rem;
+            font-weight: 500;
+            transition: opacity 0.2s;
+        }
+
+        .btn:hover { opacity: 0.9; }
+        .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+        .btn-primary { background: var(--primary-color); color: white; }
+        .btn-success { background: var(--success-color); color: white; }
+        .btn-danger { background: var(--danger-color); color: white; }
+        .btn-secondary { background: var(--step-inactive); color: var(--text-color); }
+
+        .nav-buttons {
+            display: flex;
+            justify-content: space-between;
+            margin-top: 20px;
+        }
+
+        /* Result banner */
+        .result-banner {
+            padding: 16px;
+            border-radius: 8px;
+            margin: 16px 0;
+            display: none;
+        }
+
+        .result-banner.success {
+            background: rgba(76,175,80,0.15);
+            border: 1px solid var(--success-color);
+            display: block;
+        }
+
+        .result-banner.error {
+            background: rgba(244,67,54,0.15);
+            border: 1px solid var(--danger-color);
+            display: block;
+        }
+
+        /* Loading spinner */
+        .spinner {
+            display: inline-block;
+            width: 16px;
+            height: 16px;
+            border: 2px solid var(--text-muted);
+            border-top-color: var(--primary-color);
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+            margin-right: 8px;
+            vertical-align: middle;
+        }
+
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        footer {
+            text-align: center;
+            padding: 20px 0;
+            color: var(--text-muted);
+            font-size: 0.85rem;
+        }
+
+        footer a { color: var(--primary-color); text-decoration: none; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>LensDaemon Setup</h1>
+            <a href="/">Back to Dashboard</a>
+        </header>
+
+        <!-- Step Indicator -->
+        <div class="step-indicator">
+            <div class="step active" data-step="1">
+                <div class="step-circle">1</div>
+                <span class="step-label">Device Check</span>
+            </div>
+            <div class="step" data-step="2">
+                <div class="step-circle">2</div>
+                <span class="step-label">Preset</span>
+            </div>
+            <div class="step" data-step="3">
+                <div class="step-circle">3</div>
+                <span class="step-label">Storage</span>
+            </div>
+            <div class="step" data-step="4">
+                <div class="step-circle">4</div>
+                <span class="step-label">Test Stream</span>
+            </div>
+            <div class="step" data-step="5">
+                <div class="step-circle">5</div>
+                <span class="step-label">Activate</span>
+            </div>
+        </div>
+
+        <!-- Step 1: Device Check -->
+        <div class="step-content active" id="step-1">
+            <h2>Step 1: Device &amp; Kiosk Status</h2>
+            <p>Checking your device capabilities and Device Owner status.</p>
+
+            <div id="checks-list">
+                <div class="check-item">
+                    <div class="check-icon pending" id="check-device-icon">...</div>
+                    <div class="check-text">
+                        <span class="label">Device Identification</span>
+                        <span class="detail" id="check-device-detail">Checking...</span>
+                    </div>
+                </div>
+                <div class="check-item">
+                    <div class="check-icon pending" id="check-kiosk-icon">...</div>
+                    <div class="check-text">
+                        <span class="label">Device Owner Status</span>
+                        <span class="detail" id="check-kiosk-detail">Checking...</span>
+                    </div>
+                </div>
+                <div class="check-item">
+                    <div class="check-icon pending" id="check-camera-icon">...</div>
+                    <div class="check-text">
+                        <span class="label">Camera Service</span>
+                        <span class="detail" id="check-camera-detail">Checking...</span>
+                    </div>
+                </div>
+                <div class="check-item">
+                    <div class="check-icon pending" id="check-thermal-icon">...</div>
+                    <div class="check-text">
+                        <span class="label">Thermal Profile</span>
+                        <span class="detail" id="check-thermal-detail">Checking...</span>
+                    </div>
+                </div>
+            </div>
+
+            <div id="device-owner-help" style="display:none; margin-top: 16px;">
+                <p style="color: var(--warning-color);">Device Owner is not set. Run this ADB command on a factory-reset device (or one with no accounts):</p>
+                <div class="code-block">adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver</div>
+                <p>After running the command, tap "Re-check" below.</p>
+                <button class="btn btn-primary" onclick="runChecks()">Re-check</button>
+            </div>
+
+            <div class="nav-buttons">
+                <span></span>
+                <button class="btn btn-primary" id="btn-step1-next" disabled onclick="goToStep(2)">Next</button>
+            </div>
+        </div>
+
+        <!-- Step 2: Preset Selection -->
+        <div class="step-content" id="step-2">
+            <h2>Step 2: Choose Kiosk Preset</h2>
+            <p>Select how you want the device to operate.</p>
+
+            <div class="preset-grid">
+                <div class="preset-card" id="preset-appliance" onclick="selectPreset('appliance')">
+                    <h4>Appliance Mode</h4>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 8px;">
+                        24/7 unattended operation
+                    </p>
+                    <ul>
+                        <li>Screen OFF (saves power)</li>
+                        <li>Auto-start streaming on boot</li>
+                        <li>Auto-start RTSP server</li>
+                        <li>Lock all system UI</li>
+                        <li>Auto-restart on crash</li>
+                        <li>Network auto-reconnect</li>
+                    </ul>
+                </div>
+                <div class="preset-card" id="preset-interactive" onclick="selectPreset('interactive')">
+                    <h4>Interactive Mode</h4>
+                    <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 8px;">
+                        Kiosk with live preview
+                    </p>
+                    <ul>
+                        <li>Screen shows camera preview</li>
+                        <li>Keep screen always on</li>
+                        <li>Navigation bar accessible</li>
+                        <li>Vol+Vol gesture to exit</li>
+                        <li>Dashboard accessible via web</li>
+                        <li>Manual stream control</li>
+                    </ul>
+                </div>
+            </div>
+
+            <div class="nav-buttons">
+                <button class="btn btn-secondary" onclick="goToStep(1)">Back</button>
+                <button class="btn btn-primary" id="btn-step2-next" disabled onclick="goToStep(3)">Next</button>
+            </div>
+        </div>
+
+        <!-- Step 3: Storage (Optional) -->
+        <div class="step-content" id="step-3">
+            <h2>Step 3: Network Storage (Optional)</h2>
+            <p>Configure where recordings are uploaded. You can skip this step and set it up later from the dashboard.</p>
+
+            <div class="form-group">
+                <label for="storage-type">Storage Backend</label>
+                <select id="storage-type" onchange="updateStorageForm()">
+                    <option value="none">None (local only)</option>
+                    <option value="s3">S3-Compatible (AWS S3, Backblaze B2, MinIO, Cloudflare R2)</option>
+                    <option value="smb">SMB/CIFS Network Share</option>
+                </select>
+            </div>
+
+            <div id="s3-config" style="display:none;">
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="s3-endpoint">Endpoint URL</label>
+                        <input type="text" id="s3-endpoint" placeholder="https://s3.amazonaws.com">
+                    </div>
+                    <div class="form-group">
+                        <label for="s3-region">Region</label>
+                        <input type="text" id="s3-region" placeholder="us-east-1">
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="s3-bucket">Bucket Name</label>
+                    <input type="text" id="s3-bucket" placeholder="my-recordings">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="s3-access-key">Access Key</label>
+                        <input type="text" id="s3-access-key" placeholder="AKIAIOSFODNN7EXAMPLE">
+                    </div>
+                    <div class="form-group">
+                        <label for="s3-secret-key">Secret Key</label>
+                        <input type="password" id="s3-secret-key" placeholder="Secret key">
+                    </div>
+                </div>
+                <button class="btn btn-secondary" onclick="testS3()">Test Connection</button>
+                <div id="s3-test-result" class="result-banner"></div>
+            </div>
+
+            <div id="smb-config" style="display:none;">
+                <div class="form-group">
+                    <label for="smb-host">Server Address</label>
+                    <input type="text" id="smb-host" placeholder="192.168.1.100">
+                </div>
+                <div class="form-group">
+                    <label for="smb-share">Share Name</label>
+                    <input type="text" id="smb-share" placeholder="recordings">
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="smb-username">Username</label>
+                        <input type="text" id="smb-username" placeholder="user">
+                    </div>
+                    <div class="form-group">
+                        <label for="smb-password">Password</label>
+                        <input type="password" id="smb-password" placeholder="Password">
+                    </div>
+                </div>
+                <button class="btn btn-secondary" onclick="testSmb()">Test Connection</button>
+                <div id="smb-test-result" class="result-banner"></div>
+            </div>
+
+            <div class="nav-buttons">
+                <button class="btn btn-secondary" onclick="goToStep(2)">Back</button>
+                <button class="btn btn-primary" onclick="goToStep(4)">Next</button>
+            </div>
+        </div>
+
+        <!-- Step 4: Test Stream -->
+        <div class="step-content" id="step-4">
+            <h2>Step 4: Test Stream &amp; Thermal Check</h2>
+            <p>Start a test stream to verify the camera and check thermal behavior.</p>
+
+            <div class="check-item">
+                <div class="check-icon pending" id="check-stream-icon">...</div>
+                <div class="check-text">
+                    <span class="label">Stream Test</span>
+                    <span class="detail" id="check-stream-detail">Not started</span>
+                </div>
+            </div>
+
+            <div style="margin: 16px 0;">
+                <button class="btn btn-success" id="btn-test-stream" onclick="startTestStream()">Start Test Stream</button>
+                <button class="btn btn-danger" id="btn-stop-test" onclick="stopTestStream()" style="display:none;">Stop Test</button>
+            </div>
+
+            <div id="thermal-status-area" style="display:none;">
+                <h4 style="margin: 16px 0 8px;">Thermal Status</h4>
+                <div class="thermal-bar">
+                    <span class="bar-label">CPU</span>
+                    <div class="bar-track">
+                        <div class="bar-fill" id="cpu-bar" style="width: 0%; background: var(--success-color);"></div>
+                    </div>
+                    <span class="bar-value" id="cpu-temp">--</span>
+                </div>
+                <div class="thermal-bar">
+                    <span class="bar-label">Battery</span>
+                    <div class="bar-track">
+                        <div class="bar-fill" id="battery-bar" style="width: 0%; background: var(--success-color);"></div>
+                    </div>
+                    <span class="bar-value" id="battery-temp">--</span>
+                </div>
+                <div class="check-item" style="margin-top: 8px;">
+                    <div class="check-icon pending" id="check-thermal-ok-icon">...</div>
+                    <div class="check-text">
+                        <span class="label">Thermal Behavior</span>
+                        <span class="detail" id="check-thermal-ok-detail">Monitoring...</span>
+                    </div>
+                </div>
+            </div>
+
+            <div class="nav-buttons">
+                <button class="btn btn-secondary" onclick="goToStep(3)">Back</button>
+                <button class="btn btn-primary" id="btn-step4-next" onclick="goToStep(5)">Next</button>
+            </div>
+        </div>
+
+        <!-- Step 5: Activate -->
+        <div class="step-content" id="step-5">
+            <h2>Step 5: Activate Kiosk Mode</h2>
+            <p>Review your settings and activate kiosk mode. Once activated, the device will lock into the selected mode.</p>
+
+            <div id="setup-summary" style="background: rgba(0,0,0,0.2); border-radius: 6px; padding: 16px; margin: 16px 0;">
+                <div style="margin-bottom: 8px;"><strong>Preset:</strong> <span id="summary-preset">Not selected</span></div>
+                <div style="margin-bottom: 8px;"><strong>Storage:</strong> <span id="summary-storage">Local only</span></div>
+                <div style="margin-bottom: 8px;"><strong>Device:</strong> <span id="summary-device">Unknown</span></div>
+                <div><strong>Thermal Profile:</strong> <span id="summary-thermal">Default</span></div>
+            </div>
+
+            <div id="activation-result" class="result-banner"></div>
+
+            <div style="margin: 16px 0; padding: 12px; background: rgba(255,152,0,0.1); border: 1px solid var(--warning-color); border-radius: 6px;">
+                <strong style="color: var(--warning-color);">Warning:</strong>
+                Once kiosk mode is activated, the device will be locked to LensDaemon.
+                You can exit via the web dashboard or by holding Vol Up + Vol Down for 5 seconds.
+            </div>
+
+            <div class="nav-buttons">
+                <button class="btn btn-secondary" onclick="goToStep(4)">Back</button>
+                <button class="btn btn-success" id="btn-activate" onclick="activateKiosk()">Activate Kiosk Mode</button>
+            </div>
+        </div>
+
+        <footer>
+            <p>LensDaemon Setup Wizard | <a href="/">Dashboard</a></p>
+        </footer>
+    </div>
+
+    <script src="setup.js"></script>
+</body>
+</html>
