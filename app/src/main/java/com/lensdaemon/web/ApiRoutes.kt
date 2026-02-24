@@ -56,45 +56,45 @@ class ApiRoutes(
         )
     }
 
-    // Service references (set by WebServerService)
-    var cameraService: CameraService? = null
+    // Service references (set by WebServerService on main thread, read by NanoHTTPD threads)
+    @Volatile var cameraService: CameraService? = null
         set(value) {
             field = value
             streamHandler.cameraService = value
         }
 
-    var uploadService: UploadService? = null
+    @Volatile var uploadService: UploadService? = null
         set(value) {
             field = value
             uploadHandler.uploadService = value
         }
 
-    var thermalGovernor: ThermalGovernor? = null
+    @Volatile var thermalGovernor: ThermalGovernor? = null
         set(value) {
             field = value
             thermalHandler.thermalGovernor = value
         }
 
-    var kioskManager: KioskManager? = null
+    @Volatile var kioskManager: KioskManager? = null
         set(value) {
             field = value
             kioskHandler.kioskManager = value
         }
 
-    var directorManager: DirectorManager? = null
+    @Volatile var directorManager: DirectorManager? = null
         set(value) {
             field = value
             directorHandler.directorManager = value
         }
 
     // Snapshot callback
-    var onSnapshotRequest: (() -> ByteArray?)? = null
+    @Volatile var onSnapshotRequest: (() -> ByteArray?)? = null
 
     // API authentication token (null = auth disabled for backwards compat)
-    var apiToken: String? = null
+    @Volatile var apiToken: String? = null
 
     // Rate limiter (null = disabled)
-    var rateLimiter: RateLimiter? = null
+    @Volatile var rateLimiter: RateLimiter? = null
 
     // Delegated route handlers
     private val streamHandler = StreamApiHandler()

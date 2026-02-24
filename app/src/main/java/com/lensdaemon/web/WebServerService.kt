@@ -171,6 +171,13 @@ class WebServerService : Service() {
         apiRoutes = ApiRoutes(this)
         mjpegStreamer = MjpegStreamer()
 
+        // Wire rate limiter (60 burst, 10/sec refill)
+        apiRoutes?.rateLimiter = RateLimiter()
+
+        // Load API token from prefs (null = auth disabled for first-boot setup)
+        val prefs = getSharedPreferences("lensdaemon_security", MODE_PRIVATE)
+        apiRoutes?.apiToken = prefs.getString("api_token", null)
+
         // Bind to camera service
         bindCameraService()
 
@@ -427,6 +434,20 @@ class WebServerService : Service() {
      */
     fun setSnapshotCallback(callback: () -> ByteArray?) {
         apiRoutes?.onSnapshotRequest = callback
+    }
+
+    /**
+     * Set or clear the API authentication token.
+     * Pass null to disable authentication.
+     */
+    fun setApiToken(token: String?) {
+        val prefs = getSharedPreferences("lensdaemon_security", MODE_PRIVATE)
+        if (token.isNullOrEmpty()) {
+            prefs.edit().remove("api_token").apply()
+        } else {
+            prefs.edit().putString("api_token", token).apply()
+        }
+        apiRoutes?.apiToken = token
     }
 
     // ==================== AI Director API ====================
