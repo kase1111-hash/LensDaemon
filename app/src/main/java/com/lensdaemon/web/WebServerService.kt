@@ -144,10 +144,36 @@ class WebServerService : Service() {
             // Connect thermal governor to API routes
             apiRoutes?.thermalGovernor = thermalService?.getGovernor()
 
+            // Wire thermal throttle callbacks to camera service
+            thermalService?.onReduceBitrate = { percent ->
+                val camera = cameraService ?: return@onReduceBitrate
+                val currentBitrate = camera.getEncoderStats()?.currentBitrateBps ?: 4_000_000
+                val newBitrate = (currentBitrate * (100 - percent) / 100).coerceAtLeast(500_000)
+                camera.updateEncoderBitrate(newBitrate)
+                Timber.w("$TAG: Thermal throttle: reduced bitrate by $percent% to $newBitrate bps")
+            }
+
+            thermalService?.onPauseStreaming = {
+                cameraService?.stopStreaming()
+                Timber.w("$TAG: Thermal throttle: paused streaming")
+            }
+
+            thermalService?.onResumeStreaming = {
+                Timber.i("$TAG: Thermal throttle: resume streaming (requires manual restart)")
+            }
+
+            thermalService?.onRestoreSettings = {
+                Timber.i("$TAG: Thermal throttle: settings restored to normal")
+            }
+
             Timber.i("$TAG: ThermalService connected")
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            thermalService?.onReduceBitrate = null
+            thermalService?.onPauseStreaming = null
+            thermalService?.onResumeStreaming = null
+            thermalService?.onRestoreSettings = null
             thermalService = null
             thermalBound = false
             apiRoutes?.thermalGovernor = null
