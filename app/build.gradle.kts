@@ -87,9 +87,6 @@ dependencies {
     // JSON parsing
     implementation("com.google.code.gson:gson:2.10.1")
 
-    // AWS S3 SDK (for S3-compatible storage)
-    implementation("com.amazonaws:aws-android-sdk-s3:2.73.0")
-
     // SMB client (for network shares)
     implementation("com.hierynomus:smbj:0.12.2")
 

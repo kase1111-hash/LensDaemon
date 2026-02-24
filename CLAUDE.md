@@ -6,7 +6,7 @@ This file provides guidance for Claude Code when working with this repository.
 
 LensDaemon is an Android application that transforms smartphones into dedicated video streaming appliances (streaming cameras, security monitors, or recording endpoints). It leverages the superior imaging hardware in modern phones while avoiding the thermal and battery issues of running a full Android OS.
 
-**Status:** Post-evaluation remediation complete through Phase 5. All 10 implementation phases done. Security hardened, CI/CD added, SRT protocol implemented, LLM Director watchdog added.
+**Status:** Post-evaluation remediation complete through Phase 5. All 10 implementation phases done. Security hardened, CI/CD added, MPEG-TS/UDP streaming implemented, LLM Director watchdog added.
 
 ## Tech Stack
 
@@ -14,7 +14,7 @@ LensDaemon is an Android application that transforms smartphones into dedicated 
 - **Language:** Kotlin
 - **Build System:** Gradle
 - **Core APIs:** Camera2 API, MediaCodec, Device Owner APIs, BatteryManager
-- **Streaming:** RTSP (port 8554), SRT (port 9000), MJPEG preview
+- **Streaming:** RTSP (port 8554), MPEG-TS/UDP (port 9000), MJPEG preview
 - **Storage:** Local MP4, SMB/NFS, S3-compatible (AWS S3, Backblaze B2, MinIO, Cloudflare R2)
 - **Web Interface:** HTTP server on port 8080 with REST API
 
@@ -53,7 +53,7 @@ com.lensdaemon/
 │   ├── AdminReceiver.kt          # Device admin receiver
 │   ├── camera/                   # Camera2 pipeline, lens control
 │   ├── encoder/                  # MediaCodec, adaptive bitrate
-│   ├── output/                   # RTSP, SRT, file writer
+│   ├── output/                   # RTSP, MPEG-TS/UDP, file writer
 │   ├── storage/                  # SMB, S3, local storage
 │   ├── thermal/                  # Temperature monitoring, governors
 │   ├── web/                      # HTTP server, REST API, dashboard
@@ -66,7 +66,7 @@ com.lensdaemon/
 
 1. **Camera Service** - Camera2 pipeline, lens switching (wide/main/tele), frame processing
 2. **Encoder Service** - H.264/H.265 hardware encoding, adaptive bitrate
-3. **Output Manager** - RTSP server, SRT publisher (MPEG-TS/UDP), MP4 file writer
+3. **Output Manager** - RTSP server, MPEG-TS/UDP publisher, MP4 file writer
 4. **Thermal Monitor** - CPU/battery temperature tracking, throttling governors
 5. **Storage Manager** - Local, SMB/NFS, S3-compatible uploads
 6. **Web Server** - Dashboard UI, REST API endpoints, rate limiting
@@ -86,9 +86,9 @@ PUT  /api/config              # Update configuration
 POST /api/rtsp/start          # Start RTSP streaming
 POST /api/rtsp/stop           # Stop RTSP streaming
 GET  /api/rtsp/status         # RTSP server status
-POST /api/srt/start           # Start SRT streaming
-POST /api/srt/stop            # Stop SRT streaming
-GET  /api/srt/status          # SRT publisher status
+POST /api/mpegts/start        # Start MPEG-TS/UDP streaming
+POST /api/mpegts/stop         # Stop MPEG-TS/UDP streaming
+GET  /api/mpegts/status       # MPEG-TS/UDP publisher status
 ```
 
 ## Development Setup
@@ -1065,9 +1065,9 @@ A comprehensive 5-phase remediation was performed after code evaluation:
 - Magic number extraction to named constants
 - IMPLEMENTATION_GUIDE.md fully checked off
 
-### Phase 5: SRT Protocol & LLM Hardening
-- SRT publisher (MPEG-TS over UDP) with caller/listener modes
-- SRT integration into CameraService and REST API
+### Phase 5: MPEG-TS/UDP Streaming & LLM Hardening
+- MPEG-TS/UDP publisher with caller/listener modes
+- MPEG-TS integration into CameraService and REST API
 - DirectorWatchdog for autonomous operation:
   - Execution stall detection and auto-advance
   - Error recovery with consecutive error tracking
@@ -1075,29 +1075,32 @@ A comprehensive 5-phase remediation was performed after code evaluation:
   - Thermal hold auto-resume
   - Script queue for chained execution
 
-## SRT Publisher Architecture
+## MPEG-TS/UDP Publisher Architecture
+
+Note: Despite some naming references to "SRT", this is plain MPEG-TS over UDP
+without SRT encryption, ARQ, or congestion control.
 
 ```
 app/src/main/java/com/lensdaemon/output/
-└── SrtPublisher.kt              # MPEG-TS over UDP publisher
-                                 # - SrtConfig (port, mode, target, latency)
-                                 # - SrtMode enum (CALLER, LISTENER)
-                                 # - SrtStats with StateFlow
+└── MpegTsUdpPublisher.kt       # MPEG-TS over UDP publisher
+                                 # - MpegTsUdpConfig (port, mode, target, latency)
+                                 # - MpegTsMode enum (CALLER, LISTENER)
+                                 # - MpegTsUdpStats with StateFlow
                                  # - MPEG-TS packetization (PAT, PMT, PES)
                                  # - H.264/H.265 stream type support
                                  # - Per-PID continuity counters
                                  # - UDP datagram batching (7 TS packets)
 ```
 
-### SRT API Endpoints
+### MPEG-TS/UDP API Endpoints
 
 ```
-POST /api/srt/start     # Start SRT streaming
+POST /api/mpegts/start  # Start MPEG-TS/UDP streaming
      body: { "port": 9000, "mode": "listener|caller",
              "targetHost": "...", "targetPort": 9000,
              "width": 1920, "height": 1080, "bitrate": 4000000 }
-POST /api/srt/stop      # Stop SRT streaming
-GET  /api/srt/status    # SRT publisher statistics
+POST /api/mpegts/stop   # Stop MPEG-TS/UDP streaming
+GET  /api/mpegts/status # MPEG-TS/UDP publisher statistics
 ```
 
 ## DirectorWatchdog Architecture
@@ -1126,7 +1129,7 @@ app/src/main/java/com/lensdaemon/web/
 ├── WebServerService.kt          # Foreground service
 └── handlers/
     ├── ApiHandlerUtils.kt       # Shared: sanitize, validate, response helpers
-    ├── StreamApiHandler.kt      # /api/stream/*, /api/rtsp/*, /api/srt/*, /api/recording/*
+    ├── StreamApiHandler.kt      # /api/stream/*, /api/rtsp/*, /api/mpegts/*, /api/recording/*
     ├── UploadApiHandler.kt      # /api/upload/* (S3, SMB)
     ├── ThermalApiHandler.kt     # /api/thermal/*
     ├── KioskApiHandler.kt       # /api/kiosk/*
