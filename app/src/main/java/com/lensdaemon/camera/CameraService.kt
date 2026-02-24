@@ -79,10 +79,10 @@ class CameraService : Service() {
     private val exposureController = ExposureController()
     private val zoomController = ZoomController()
 
-    // Current state
+    // Current state (volatile: read from NanoHTTPD threads via isPreviewActive()/isStreaming())
     private var currentConfig = CaptureConfig()
-    private var isPreviewActive = false
-    private var isStreamingActive = false
+    @Volatile private var isPreviewActive = false
+    @Volatile private var isStreamingActive = false
 
     // Focus state observable
     private val _focusState = MutableStateFlow(FocusState.INACTIVE)
@@ -92,9 +92,9 @@ class CameraService : Service() {
     private val _currentZoom = MutableStateFlow(1.0f)
     val currentZoom: StateFlow<Float> = _currentZoom
 
-    // Encoder service connection (Phase 4)
-    private var encoderService: EncoderService? = null
-    private var encoderBound = false
+    // Encoder service connection (Phase 4, volatile: read from HTTP threads)
+    @Volatile private var encoderService: EncoderService? = null
+    @Volatile private var encoderBound = false
     private var encoderSurface: Surface? = null
 
     // Encoder state observable

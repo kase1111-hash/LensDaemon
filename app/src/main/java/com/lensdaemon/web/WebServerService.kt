@@ -144,10 +144,36 @@ class WebServerService : Service() {
             // Connect thermal governor to API routes
             apiRoutes?.thermalGovernor = thermalService?.getGovernor()
 
+            // Wire thermal throttle callbacks to camera service
+            thermalService?.onReduceBitrate = { percent ->
+                val camera = cameraService ?: return@onReduceBitrate
+                val currentBitrate = camera.getEncoderStats()?.currentBitrateBps ?: 4_000_000
+                val newBitrate = (currentBitrate * (100 - percent) / 100).coerceAtLeast(500_000)
+                camera.updateEncoderBitrate(newBitrate)
+                Timber.w("$TAG: Thermal throttle: reduced bitrate by $percent% to $newBitrate bps")
+            }
+
+            thermalService?.onPauseStreaming = {
+                cameraService?.stopStreaming()
+                Timber.w("$TAG: Thermal throttle: paused streaming")
+            }
+
+            thermalService?.onResumeStreaming = {
+                Timber.i("$TAG: Thermal throttle: resume streaming (requires manual restart)")
+            }
+
+            thermalService?.onRestoreSettings = {
+                Timber.i("$TAG: Thermal throttle: settings restored to normal")
+            }
+
             Timber.i("$TAG: ThermalService connected")
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            thermalService?.onReduceBitrate = null
+            thermalService?.onPauseStreaming = null
+            thermalService?.onResumeStreaming = null
+            thermalService?.onRestoreSettings = null
             thermalService = null
             thermalBound = false
             apiRoutes?.thermalGovernor = null
@@ -170,6 +196,13 @@ class WebServerService : Service() {
         // Initialize components
         apiRoutes = ApiRoutes(this)
         mjpegStreamer = MjpegStreamer()
+
+        // Wire rate limiter (60 burst, 10/sec refill)
+        apiRoutes?.rateLimiter = RateLimiter()
+
+        // Load API token from prefs (null = auth disabled for first-boot setup)
+        val prefs = getSharedPreferences("lensdaemon_security", MODE_PRIVATE)
+        apiRoutes?.apiToken = prefs.getString("api_token", null)
 
         // Bind to camera service
         bindCameraService()
@@ -427,6 +460,20 @@ class WebServerService : Service() {
      */
     fun setSnapshotCallback(callback: () -> ByteArray?) {
         apiRoutes?.onSnapshotRequest = callback
+    }
+
+    /**
+     * Set or clear the API authentication token.
+     * Pass null to disable authentication.
+     */
+    fun setApiToken(token: String?) {
+        val prefs = getSharedPreferences("lensdaemon_security", MODE_PRIVATE)
+        if (token.isNullOrEmpty()) {
+            prefs.edit().remove("api_token").apply()
+        } else {
+            prefs.edit().putString("api_token", token).apply()
+        }
+        apiRoutes?.apiToken = token
     }
 
     // ==================== AI Director API ====================

@@ -434,27 +434,31 @@ class StreamApiHandler {
     private fun deleteRecording(uri: String): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val filename = uri.substringAfterLast("/")
-        if (filename.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST, WebServer.MIME_JSON,
-                """{"error": "Filename required"}"""
+        val rawFilename = uri.substringAfterLast("/")
+        val filename = ApiHandlerUtils.sanitizeFileName(rawFilename)
+            ?: return ApiHandlerUtils.errorJson(
+                Status.BAD_REQUEST,
+                "Invalid filename"
             )
-        }
 
         val recordings = camera.listRecordings()
         val recording = recordings.find { it.name == filename }
-            ?: return NanoHTTPD.newFixedLengthResponse(
-                Status.NOT_FOUND, WebServer.MIME_JSON,
-                """{"error": "Recording not found: $filename"}"""
+            ?: return ApiHandlerUtils.errorJson(
+                Status.NOT_FOUND,
+                "Recording not found"
             )
 
         val success = camera.deleteRecording(recording)
 
+        val json = JSONObject().apply {
+            put("success", success)
+            put("filename", filename)
+        }
+
         return NanoHTTPD.newFixedLengthResponse(
             if (success) Status.OK else Status.INTERNAL_ERROR,
             WebServer.MIME_JSON,
-            """{"success": $success, "filename": "$filename"}"""
+            json.toString()
         )
     }
 
