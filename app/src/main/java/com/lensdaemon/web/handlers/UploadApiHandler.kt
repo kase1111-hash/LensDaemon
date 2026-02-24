@@ -9,6 +9,7 @@ import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.withTimeout
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
@@ -247,14 +248,21 @@ class UploadApiHandler {
         if (!upload.isS3Configured()) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "S3 not configured"}""")
         }
-        return runBlocking {
-            val result = upload.testS3Connection()
-            if (result.isSuccess) {
-                NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "S3 connection successful"}""")
-            } else {
-                Timber.tag(TAG).w("S3 connection test failed: ${result.exceptionOrNull()?.message}")
-                NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "S3 connection test failed"}""")
+        return try {
+            runBlocking {
+                withTimeout(CONNECTION_TEST_TIMEOUT_MS) {
+                    val result = upload.testS3Connection()
+                    if (result.isSuccess) {
+                        NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "S3 connection successful"}""")
+                    } else {
+                        Timber.tag(TAG).w("S3 connection test failed: ${result.exceptionOrNull()?.message}")
+                        NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "S3 connection test failed"}""")
+                    }
+                }
             }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            Timber.tag(TAG).w("S3 connection test timed out")
+            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "S3 connection test timed out"}""")
         }
     }
 
@@ -309,18 +317,26 @@ class UploadApiHandler {
         if (!upload.isSmbConfigured()) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "SMB not configured"}""")
         }
-        return runBlocking {
-            val result = upload.testSmbConnection()
-            if (result.isSuccess) {
-                NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "SMB connection successful"}""")
-            } else {
-                Timber.tag(TAG).w("SMB connection test failed: ${result.exceptionOrNull()?.message}")
-                NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "SMB connection test failed"}""")
+        return try {
+            runBlocking {
+                withTimeout(CONNECTION_TEST_TIMEOUT_MS) {
+                    val result = upload.testSmbConnection()
+                    if (result.isSuccess) {
+                        NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "SMB connection successful"}""")
+                    } else {
+                        Timber.tag(TAG).w("SMB connection test failed: ${result.exceptionOrNull()?.message}")
+                        NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "SMB connection test failed"}""")
+                    }
+                }
             }
+        } catch (e: kotlinx.coroutines.TimeoutCancellationException) {
+            Timber.tag(TAG).w("SMB connection test timed out")
+            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "SMB connection test timed out"}""")
         }
     }
 
     companion object {
         private const val TAG = "UploadApiHandler"
+        private const val CONNECTION_TEST_TIMEOUT_MS = 15_000L
     }
 }

@@ -8,10 +8,15 @@ import com.lensdaemon.director.TakeQuality
 import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.File
+import java.io.PipedInputStream
+import java.io.PipedOutputStream
 
 /**
  * Handles all /api/director/ routes including script file management and take-recording linking.
@@ -433,20 +438,82 @@ class DirectorApiHandler(
 
     private fun getDirectorEvents(): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
-        val status = director.getStatus()
-        val initialEvent = JSONObject().apply {
-            put("type", "state")
-            put("enabled", status.enabled)
-            put("state", status.state.name)
-            put("currentScene", status.currentScene ?: "")
-            put("currentCue", status.currentCue ?: "")
-            put("currentTake", status.takeNumber)
+
+        val pipedOutput = PipedOutputStream()
+        val pipedInput = PipedInputStream(pipedOutput)
+
+        CoroutineScope(Dispatchers.IO).launch {
+            try {
+                // Send initial state snapshot
+                val status = director.getStatus()
+                val initial = JSONObject().apply {
+                    put("type", "state")
+                    put("enabled", status.enabled)
+                    put("state", status.state.name)
+                    put("currentScene", status.currentScene ?: "")
+                    put("currentCue", status.currentCue ?: "")
+                    put("currentTake", status.takeNumber)
+                }
+                pipedOutput.write("data: $initial\n\n".toByteArray())
+                pipedOutput.flush()
+
+                // Collect ongoing events
+                director.events.collect { event ->
+                    val json = directorEventToJson(event)
+                    pipedOutput.write("data: $json\n\n".toByteArray())
+                    pipedOutput.flush()
+                }
+            } catch (e: Exception) {
+                Timber.tag(TAG).d("SSE client disconnected: ${e.message}")
+            } finally {
+                try { pipedOutput.close() } catch (_: Exception) {}
+            }
         }
-        val sseData = "data: ${initialEvent.toString()}\n\n"
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, "text/event-stream", sseData).apply {
+
+        return NanoHTTPD.newChunkedResponse(Status.OK, "text/event-stream", pipedInput).apply {
             addHeader("Cache-Control", "no-cache")
             addHeader("Connection", "keep-alive")
             addHeader("Access-Control-Allow-Origin", "*")
+        }
+    }
+
+    private fun directorEventToJson(event: DirectorManager.DirectorEvent): JSONObject {
+        return when (event) {
+            is DirectorManager.DirectorEvent.StateChanged -> JSONObject().apply {
+                put("type", "state_changed")
+                put("state", event.state.name)
+            }
+            is DirectorManager.DirectorEvent.ScriptLoaded -> JSONObject().apply {
+                put("type", "script_loaded")
+                put("scenes", event.script.scenes.size)
+                put("totalCues", event.script.totalCues)
+            }
+            is DirectorManager.DirectorEvent.CueExecuted -> JSONObject().apply {
+                put("type", "cue_executed")
+                put("cueType", event.cue.type.name)
+                put("cueText", event.cue.rawText)
+                put("success", event.success)
+            }
+            is DirectorManager.DirectorEvent.TakeStarted -> JSONObject().apply {
+                put("type", "take_started")
+                put("takeNumber", event.take.takeNumber)
+                put("sceneId", event.take.sceneId)
+            }
+            is DirectorManager.DirectorEvent.TakeEnded -> JSONObject().apply {
+                put("type", "take_ended")
+                put("takeNumber", event.take.takeNumber)
+                put("qualityScore", event.take.qualityScore)
+                put("durationMs", event.take.durationMs)
+            }
+            is DirectorManager.DirectorEvent.Error -> JSONObject().apply {
+                put("type", "error")
+                put("message", event.message)
+            }
+            is DirectorManager.DirectorEvent.ThermalWarning -> JSONObject().apply {
+                put("type", "thermal_warning")
+                put("temperature", event.temperature)
+                put("action", event.action)
+            }
         }
     }
 
