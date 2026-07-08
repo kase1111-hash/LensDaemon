@@ -107,8 +107,13 @@ class RtspServer(
         _state.value = RtspServerState.STARTING
 
         return try {
-            serverSocket = ServerSocket(port)
-            serverSocket?.soTimeout = ACCEPT_TIMEOUT_MS
+            // reuseAddress lets the server rebind immediately after a restart,
+            // when prior connections on this port may still be in TIME_WAIT
+            serverSocket = ServerSocket().apply {
+                reuseAddress = true
+                soTimeout = ACCEPT_TIMEOUT_MS
+                bind(java.net.InetSocketAddress(port))
+            }
             serverAddress = SdpGenerator().getLocalIpAddress()
 
             isRunning.set(true)

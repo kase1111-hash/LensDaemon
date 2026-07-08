@@ -302,19 +302,6 @@ class QualityMetricsCollector(
 }
 
 /**
- * Extension to create a MetricsSource from CameraControllerAdapter
- */
-fun CameraControllerAdapter.asMetricsSource(): QualityMetricsCollector.MetricsSource {
-    val adapter = this
-    return object : QualityMetricsCollector.MetricsSource {
-        override fun isFocusLocked(): Boolean = adapter.isFocusLocked()
-        override fun getNormalizedExposure(): Float = adapter.getNormalizedExposure()
-        override fun getMotionShakiness(): Float = adapter.getMotionShakiness()
-        override fun getAudioLevel(): Float = 0f // Audio not implemented in camera adapter
-    }
-}
-
-/**
  * Extension to create a MetricsSink from TakeManager
  */
 fun TakeManager.asMetricsSink(): QualityMetricsCollector.MetricsSink {

@@ -1,5 +1,6 @@
 package com.lensdaemon.director
 
+import android.animation.TimeInterpolator
 import android.animation.ValueAnimator
 import android.os.Handler
 import android.os.Looper
@@ -420,7 +421,7 @@ class TransitionAnimator {
     /**
      * Get interpolator for easing type
      */
-    private fun getInterpolator(easing: Int) = when (easing) {
+    private fun getInterpolator(easing: Int): TimeInterpolator = when (easing) {
         EASE_LINEAR -> LinearInterpolator()
         EASE_DECELERATE -> DecelerateInterpolator()
         EASE_ACCELERATE_DECELERATE -> AccelerateDecelerateInterpolator()

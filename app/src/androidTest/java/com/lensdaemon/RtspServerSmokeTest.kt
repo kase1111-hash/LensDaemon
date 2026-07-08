@@ -22,10 +22,13 @@ import java.net.Socket
 class RtspServerSmokeTest {
 
     private lateinit var rtspServer: RtspServer
-    private val testPort = 18554
+    private var testPort = 0
 
     @Before
     fun setUp() {
+        // Unique port per test: sockets from the previous test (sessions held
+        // by cancelled coroutines, TIME_WAIT peers) can keep the old port busy
+        testPort = java.net.ServerSocket(0).use { it.localPort }
         rtspServer = RtspServer(testPort)
     }
 
@@ -45,7 +48,7 @@ class RtspServerSmokeTest {
 
     @Test
     fun clientCanConnect() {
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         assertTrue("Socket should be connected", socket.isConnected)
@@ -56,7 +59,7 @@ class RtspServerSmokeTest {
 
     @Test
     fun optionsReturnsAllowedMethods() {
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         val writer = PrintWriter(socket.getOutputStream(), true)
@@ -81,13 +84,13 @@ class RtspServerSmokeTest {
     @Test
     fun describeReturnsSdp() {
         // Configure codec before starting
-        rtspServer.updateCodecConfig(
+        rtspServer.setCodecConfig(
             codec = VideoCodec.H264,
             sps = byteArrayOf(0x67, 0x42, 0x00, 0x1e, 0xab.toByte()),
             pps = byteArrayOf(0x68, 0xce.toByte(), 0x38, 0x80.toByte()),
             vps = null
         )
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         val writer = PrintWriter(socket.getOutputStream(), true)
@@ -107,7 +110,7 @@ class RtspServerSmokeTest {
 
     @Test
     fun playWithoutSetupReturnsError() {
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         val writer = PrintWriter(socket.getOutputStream(), true)
@@ -130,7 +133,7 @@ class RtspServerSmokeTest {
     @Test
     fun serverRejectsExcessClients() {
         rtspServer.maxClients = 2
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val sockets = mutableListOf<Socket>()
         try {

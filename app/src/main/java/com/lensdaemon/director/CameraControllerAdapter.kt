@@ -134,3 +134,19 @@ class CameraControllerAdapter(
         Timber.tag(TAG).d("Synced with camera: lens=$currentLens, zoom=$currentZoom")
     }
 }
+
+/**
+ * Extension to create a MetricsSource from CameraControllerAdapter.
+ *
+ * Lives in :app (not :director) because CameraControllerAdapter depends on
+ * CameraService; :director must not reference :app types.
+ */
+fun CameraControllerAdapter.asMetricsSource(): QualityMetricsCollector.MetricsSource {
+    val adapter = this
+    return object : QualityMetricsCollector.MetricsSource {
+        override fun isFocusLocked(): Boolean = adapter.isFocusLocked()
+        override fun getNormalizedExposure(): Float = adapter.getNormalizedExposure()
+        override fun getMotionShakiness(): Float = adapter.getMotionShakiness()
+        override fun getAudioLevel(): Float = 0f // Audio not implemented in camera adapter
+    }
+}

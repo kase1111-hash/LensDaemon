@@ -25,11 +25,11 @@ import java.io.ByteArrayInputStream
  * REST API routes dispatcher for LensDaemon web interface.
  *
  * Routes are delegated to per-module handlers:
- * - [StreamApiHandler]   -> /api/stream/*, /api/rtsp/*, /api/mpegts/*, /api/recording/*, /api/recordings, /api/storage/*
- * - [UploadApiHandler]   -> /api/upload/*
- * - [ThermalApiHandler]  -> /api/thermal/*
- * - [KioskApiHandler]    -> /api/kiosk/*
- * - [DirectorApiHandler] -> /api/director/*
+ * - [StreamApiHandler]   -> /api/stream, /api/rtsp, /api/mpegts, /api/recording, /api/recordings, /api/storage
+ * - [UploadApiHandler]   -> /api/upload
+ * - [ThermalApiHandler]  -> /api/thermal
+ * - [KioskApiHandler]    -> /api/kiosk
+ * - [DirectorApiHandler] -> /api/director
  *
  * Status, lens, camera, snapshot, config, and encoder routes remain inline.
  */

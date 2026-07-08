@@ -76,7 +76,7 @@ class ExposureController {
 
         val awbModes = characteristics.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
             ?: intArrayOf()
-        supportedWhiteBalanceModes = awbModes.mapNotNull { mode ->
+        supportedWhiteBalanceModes = awbModes.toList().mapNotNull { mode ->
             WhiteBalanceMode.entries.find { it.camera2Mode == mode }
         }
 

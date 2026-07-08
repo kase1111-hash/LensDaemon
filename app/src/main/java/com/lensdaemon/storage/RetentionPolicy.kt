@@ -178,7 +178,9 @@ class RetentionPolicy(
         // Get all matching files
         val files = getMatchingFiles(directory)
         if (files.isEmpty()) {
-            return RetentionResult(0, 0, 0, emptyList(), 0)
+            // Still clean up empty directories if configured
+            val dirsDeleted = if (config.deleteEmptyDirs) deleteEmptyDirectories(directory) else 0
+            return RetentionResult(0, 0, dirsDeleted, emptyList(), System.currentTimeMillis() - startTime)
         }
 
         // Sort by last modified (oldest first)

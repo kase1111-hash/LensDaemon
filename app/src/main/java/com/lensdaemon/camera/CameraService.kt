@@ -1213,17 +1213,17 @@ class CameraService : Service() {
      * Check if focus is currently locked.
      */
     fun isFocusLocked(): Boolean {
-        return _focusState.value == FocusState.LOCKED || _focusState.value == FocusState.FOCUS_SUCCESS
+        return _focusState.value == FocusState.FOCUSED
     }
 
     /**
      * Get normalized exposure value (0-1 range).
      */
     fun getNormalizedExposure(): Float {
-        val range = exposureController.exposureRange.value
+        val range = exposureController.getExposureCompensationRange()
         val current = currentConfig.exposureCompensation.toFloat()
-        if (range.endInclusive <= range.start) return 0.5f
-        return (current - range.start) / (range.endInclusive - range.start)
+        if (range.upper <= range.lower) return 0.5f
+        return (current - range.lower) / (range.upper - range.lower)
     }
 
     /**
@@ -1233,8 +1233,8 @@ class CameraService : Service() {
     fun getMotionShakiness(): Float {
         // Basic implementation - could be enhanced with sensor data
         // For now, return low value when OIS is active
-        return if (currentConfig.stabilizationMode == StabilizationMode.OIS ||
-                   currentConfig.stabilizationMode == StabilizationMode.OIS_AND_EIS) {
+        return if (currentConfig.stabilizationMode == StabilizationMode.OPTICAL ||
+                   currentConfig.stabilizationMode == StabilizationMode.HYBRID) {
             0.1f
         } else {
             0.3f // Assume some shake without OIS

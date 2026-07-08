@@ -62,7 +62,7 @@ class FocusController {
 
         val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
             ?: intArrayOf()
-        supportedFocusModes = afModes.mapNotNull { mode ->
+        supportedFocusModes = afModes.toList().mapNotNull { mode ->
             FocusMode.entries.find { it.camera2Mode == mode }
         }
 

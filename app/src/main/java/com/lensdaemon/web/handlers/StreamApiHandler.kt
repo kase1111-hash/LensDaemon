@@ -16,12 +16,12 @@ import org.json.JSONObject
  * API handler for stream, RTSP, recording, and storage endpoints.
  *
  * Handles:
- * - /api/stream/*     - Encoding start/stop/status
- * - /api/rtsp/*       - RTSP server control
- * - /api/mpegts/*     - MPEG-TS/UDP publisher control
- * - /api/recording/*  - Local recording control
- * - /api/recordings   - Recording file management
- * - /api/storage/*    - Storage status and cleanup
+ * - /api/stream     - Encoding start/stop/status
+ * - /api/rtsp       - RTSP server control
+ * - /api/mpegts     - MPEG-TS/UDP publisher control
+ * - /api/recording  - Local recording control
+ * - /api/recordings - Recording file management
+ * - /api/storage    - Storage status and cleanup
  */
 class StreamApiHandler {
 

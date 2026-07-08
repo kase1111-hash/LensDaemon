@@ -24,6 +24,10 @@ class BootReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "BootReceiver"
+        const val EXTRA_BOOT_START = "boot_start"
+        private const val PREFS_NAME = "lensdaemon_boot"
+        private const val KEY_LAST_BOOT_TIME = "last_boot_time"
+        private const val KEY_BOOT_COUNT = "boot_count"
     }
 
     private val handler = Handler(Looper.getMainLooper())
@@ -166,13 +170,6 @@ class BootReceiver : BroadcastReceiver() {
 
         Timber.tag(TAG).i("Boot #${bootCount + 1}, last boot: $lastBootTime")
     }
-
-    companion object {
-        const val EXTRA_BOOT_START = "boot_start"
-        private const val PREFS_NAME = "lensdaemon_boot"
-        private const val KEY_LAST_BOOT_TIME = "last_boot_time"
-        private const val KEY_BOOT_COUNT = "boot_count"
-    }
 }
 
 /**
@@ -189,6 +186,7 @@ class CrashRecoveryManager(
         private const val PREFS_NAME = "lensdaemon_crash"
         private const val KEY_CRASH_TIMES = "crash_times"
         private const val KEY_RESTART_COUNT = "restart_count"
+        const val EXTRA_CRASH_RESTART = "crash_restart"
     }
 
     private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
@@ -315,10 +313,6 @@ class CrashRecoveryManager(
             .remove(KEY_CRASH_TIMES)
             .remove(KEY_RESTART_COUNT)
             .apply()
-    }
-
-    companion object {
-        const val EXTRA_CRASH_RESTART = "crash_restart"
     }
 }
 

@@ -497,11 +497,6 @@ class TakeManager(
     fun getCurrentTakeNumber(): Int = _currentTake.value?.takeNumber ?: 0
 
     /**
-     * Current take number property for external access
-     */
-    val currentTakeNumber: Int get() = _currentTake.value?.takeNumber ?: takeCounter
-
-    /**
      * Link a take to its recording file
      */
     fun linkTakeToFile(takeNumber: Int, filePath: String) {
@@ -516,13 +511,6 @@ class TakeManager(
         } else {
             Timber.tag(TAG).w("Cannot link file - take #$takeNumber not found")
         }
-    }
-
-    /**
-     * Get takes for a specific scene
-     */
-    fun getTakesForScene(sceneId: String): List<RecordedTake> {
-        return _recordedTakes.value.filter { it.sceneId == sceneId }
     }
 
     /**
