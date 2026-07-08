@@ -497,11 +497,6 @@ class TakeManager(
     fun getCurrentTakeNumber(): Int = _currentTake.value?.takeNumber ?: 0
 
     /**
-     * Current take number property for external access
-     */
-    val currentTakeNumber: Int get() = _currentTake.value?.takeNumber ?: takeCounter
-
-    /**
      * Link a take to its recording file
      */
     fun linkTakeToFile(takeNumber: Int, filePath: String) {

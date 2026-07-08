@@ -288,7 +288,7 @@ class DirectorService : Service() {
                     is DirectorManager.DirectorEvent.CueExecuted -> {
                         onRecordingMarker?.invoke(TakeMarker(
                             type = MarkerType.CUE,
-                            takeNumber = directorManager?.getTakeManager()?.currentTakeNumber ?: 0,
+                            takeNumber = directorManager?.getTakeManager()?.getCurrentTakeNumber() ?: 0,
                             sceneId = directorManager?.currentSession?.value?.currentScene?.id ?: "",
                             timestampMs = System.currentTimeMillis(),
                             cueText = event.cue.rawText,
