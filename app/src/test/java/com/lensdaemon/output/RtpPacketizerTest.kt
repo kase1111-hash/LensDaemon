@@ -1603,7 +1603,10 @@ class RtpPacketizerTest {
 
     @Test
     fun `packetize with mixed start codes works`() {
-        val sps = byteArrayOf(0x67, 0x42, 0x00)
+        // NAL payloads must not end in 0x00 (rbsp_stop_one_bit guarantees a
+        // non-zero final byte); a trailing zero would be indistinguishable
+        // from the zero_byte of a following 4-byte start code.
+        val sps = byteArrayOf(0x67, 0x42, 0x1F)
         val pps = byteArrayOf(0x68, 0xCE.toByte())
 
         // Mix 4-byte and 3-byte start codes

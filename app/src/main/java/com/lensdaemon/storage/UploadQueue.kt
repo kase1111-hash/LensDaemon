@@ -108,7 +108,7 @@ data class UploadTask(
             put("progress", progress)
             put("retryCount", retryCount)
             put("maxRetries", maxRetries)
-            put("lastError", lastError)
+            put("lastError", lastError ?: JSONObject.NULL)
             put("createdAt", createdAt)
             put("lastAttemptAt", lastAttemptAt)
             put("completedAt", completedAt)
@@ -131,7 +131,7 @@ data class UploadTask(
                 progress = json.optInt("progress", 0),
                 retryCount = json.optInt("retryCount", 0),
                 maxRetries = json.optInt("maxRetries", 3),
-                lastError = json.optString("lastError", null),
+                lastError = if (json.isNull("lastError")) null else json.optString("lastError"),
                 createdAt = json.getLong("createdAt"),
                 lastAttemptAt = json.optLong("lastAttemptAt", 0),
                 completedAt = json.optLong("completedAt", 0),
