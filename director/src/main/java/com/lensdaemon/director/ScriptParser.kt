@@ -350,8 +350,8 @@ class ScriptParser(
         return when {
             str.contains("ESTABLISHING") -> ShotType.ESTABLISHING
             str.contains("EXTREME") || str == "ECU" -> ShotType.EXTREME_CLOSE
-            str.contains("CLOSE") -> ShotType.CLOSE_UP
             str.contains("MEDIUM_CLOSE") || str.contains("MCU") -> ShotType.MEDIUM_CLOSE
+            str.contains("CLOSE") -> ShotType.CLOSE_UP
             str.contains("MEDIUM") -> ShotType.MEDIUM
             str.contains("FULL") -> ShotType.FULL_SHOT
             str.contains("OVER") || str == "OTS" -> ShotType.OVER_SHOULDER
