@@ -22,10 +22,13 @@ import java.net.Socket
 class RtspServerSmokeTest {
 
     private lateinit var rtspServer: RtspServer
-    private val testPort = 18554
+    private var testPort = 0
 
     @Before
     fun setUp() {
+        // Unique port per test: sockets from the previous test (sessions held
+        // by cancelled coroutines, TIME_WAIT peers) can keep the old port busy
+        testPort = java.net.ServerSocket(0).use { it.localPort }
         rtspServer = RtspServer(testPort)
     }
 
