@@ -179,7 +179,7 @@ enum class EncoderState {
 /**
  * Encoder error types
  */
-sealed class EncoderError(val message: String) {
+sealed class EncoderError(message: String) : Exception(message) {
     data class ConfigurationError(val details: String) : EncoderError("Configuration failed: $details")
     data class CodecNotSupported(val codec: VideoCodec) : EncoderError("Codec not supported: ${codec.mimeType}")
     data class ResolutionNotSupported(val size: Size) : EncoderError("Resolution not supported: ${size.width}x${size.height}")

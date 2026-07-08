@@ -95,7 +95,11 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         }
         return try {
             scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-            socket = DatagramSocket(if (config.mode == MpegTsMode.LISTENER) config.port else null)
+            socket = if (config.mode == MpegTsMode.LISTENER) {
+                DatagramSocket(config.port)
+            } else {
+                DatagramSocket()
+            }
 
             when (config.mode) {
                 MpegTsMode.CALLER -> {

@@ -145,11 +145,11 @@ class WebServerService : Service() {
             apiRoutes?.thermalGovernor = thermalService?.getGovernor()
 
             // Wire thermal throttle callbacks to camera service
-            thermalService?.onReduceBitrate = { percent ->
-                val camera = cameraService ?: return@onReduceBitrate
-                val currentBitrate = camera.getEncoderStats()?.currentBitrateBps ?: 4_000_000
-                val newBitrate = (currentBitrate * (100 - percent) / 100).coerceAtLeast(500_000)
-                camera.updateEncoderBitrate(newBitrate)
+            thermalService?.onReduceBitrate = reduceBitrate@{ percent ->
+                val camera = cameraService ?: return@reduceBitrate
+                val currentBitrate = camera.getEncoderStats()?.currentBitrateBps ?: 4_000_000L
+                val newBitrate = (currentBitrate * (100 - percent) / 100).coerceAtLeast(500_000L)
+                camera.updateEncoderBitrate(newBitrate.toInt())
                 Timber.w("$TAG: Thermal throttle: reduced bitrate by $percent% to $newBitrate bps")
             }
 

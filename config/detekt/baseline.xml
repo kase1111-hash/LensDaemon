@@ -6,9 +6,12 @@
     <ID>ComplexCondition:DirectorApiHandler.kt$DirectorApiHandler$rawFileName.isEmpty() || rawFileName == "save" || rawFileName == "export" || rawFileName == "import"</ID>
     <ID>ComplexCondition:NalUnitParser.kt$NalUnitParser.Companion$data[offset] == 0.toByte() &amp;&amp; data[offset + 1] == 0.toByte() &amp;&amp; data[offset + 2] == 0.toByte() &amp;&amp; data[offset + 3] == 1.toByte()</ID>
     <ID>ComplexCondition:UploadApiHandler.kt$UploadApiHandler$server.isEmpty() || share.isEmpty() || username.isEmpty() || password.isEmpty()</ID>
+    <ID>CyclomaticComplexMethod:ApiRoutes.kt$ApiRoutes$fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response</ID>
+    <ID>CyclomaticComplexMethod:ApiRoutes.kt$ApiRoutes$private fun getStatus(): NanoHTTPD.Response</ID>
     <ID>CyclomaticComplexMethod:DirectorApiHandler.kt$DirectorApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
     <ID>CyclomaticComplexMethod:KioskConfig.kt$KioskConfigStore$fun loadConfig(): KioskConfig</ID>
     <ID>CyclomaticComplexMethod:LensDaemonCameraManager.kt$LensDaemonCameraManager$private fun enumerateCameras()</ID>
+    <ID>CyclomaticComplexMethod:StreamApiHandler.kt$StreamApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
     <ID>CyclomaticComplexMethod:ThermalApiHandler.kt$ThermalApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
     <ID>CyclomaticComplexMethod:UploadApiHandler.kt$UploadApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
     <ID>EqualsNullCall:RtpPacketizerTest.kt$RtpPacketizerTest$equals(null)</ID>
@@ -71,6 +74,7 @@
     <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Upload processing started"}""")</ID>
     <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Upload processing stopped"}""")</ID>
     <ID>NestedBlockDepth:LensDaemonCameraManager.kt$LensDaemonCameraManager$private fun enumerateCameras()</ID>
+    <ID>ReturnCount:ApiRoutes.kt$ApiRoutes$fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response</ID>
     <ID>ReturnCount:ScriptParser.kt$ScriptParser$private fun parseExplicitCue(line: String, lineNumber: Int): DirectorCue?</ID>
     <ID>ReturnCount:VideoEncoder.kt$VideoEncoder$fun initialize(): Result&lt;Surface&gt;</ID>
     <ID>SwallowedException:BatteryBypass.kt$BatteryBypass$e: Exception</ID>
@@ -85,6 +89,7 @@
     <ID>SwallowedException:RemoteLlmClient.kt$RemoteLlmClient$e: Exception</ID>
     <ID>SwallowedException:RtspServer.kt$RtspServer$e: SocketException</ID>
     <ID>SwallowedException:RtspSession.kt$RtspSession$e: java.net.SocketTimeoutException</ID>
+    <ID>SwallowedException:StreamApiHandler.kt$StreamApiHandler$e: Exception</ID>
     <ID>SwallowedException:ThermalMonitor.kt$ThermalMonitor$e: Exception</ID>
     <ID>SwallowedException:ThermalProfile.kt$ThermalProfileManager$e: Exception</ID>
     <ID>SwallowedException:ThermalStressTest.kt$ThermalStressTest$e: Exception</ID>
@@ -103,26 +108,6 @@
     <ID>TooManyFunctions:ThermalGovernor.kt$ThermalGovernor : ThermalMonitorListener</ID>
     <ID>TooManyFunctions:UploadService.kt$UploadService : ServiceUploadEventListener</ID>
     <ID>TooManyFunctions:WebServerService.kt$WebServerService : Service</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import android.content.Context</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import android.os.Build</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.camera.CameraService</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.camera.LensType</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.director.DirectorManager</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.encoder.EncoderState</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.kiosk.KioskManager</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.storage.UploadService</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.thermal.ThermalGovernor</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.DirectorApiHandler</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.KioskApiHandler</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.StreamApiHandler</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.ThermalApiHandler</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.UploadApiHandler</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import fi.iki.elonen.NanoHTTPD</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import fi.iki.elonen.NanoHTTPD.Response.Status</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import java.io.ByteArrayInputStream</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import org.json.JSONArray</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import org.json.JSONObject</ID>
-    <ID>UnusedImports:ApiRoutes.kt$import timber.log.Timber</ID>
     <ID>UnusedImports:ExposureController.kt$import android.hardware.camera2.CameraMetadata</ID>
     <ID>UnusedImports:FocusController.kt$import android.graphics.PointF</ID>
     <ID>UnusedImports:FocusController.kt$import android.hardware.camera2.CameraMetadata</ID>
@@ -144,17 +129,6 @@
     <ID>UnusedImports:ScreenController.kt$import android.os.Build</ID>
     <ID>UnusedImports:SdpGenerator.kt$import java.net.InetAddress</ID>
     <ID>UnusedImports:SmbClient.kt$import com.hierynomus.mserref.NtStatus</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.camera.CameraService</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.encoder.EncoderConfig</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.encoder.VideoCodec</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.output.MpegTsMode</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.output.MpegTsUdpConfig</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.output.SegmentDuration</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.web.WebServer</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import fi.iki.elonen.NanoHTTPD</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import fi.iki.elonen.NanoHTTPD.Response.Status</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import org.json.JSONArray</ID>
-    <ID>UnusedImports:StreamApiHandler.kt$import org.json.JSONObject</ID>
     <ID>UnusedImports:TakeManager.kt$import kotlin.math.min</ID>
     <ID>UnusedImports:UploadTaskTest.kt$import java.io.File</ID>
     <ID>UnusedImports:WebServer.kt$import java.io.InputStream</ID>

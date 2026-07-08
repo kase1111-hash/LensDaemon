@@ -368,7 +368,7 @@ class DirectorService : Service() {
 
         return try {
             val file = File(getScriptsDirectory(), name)
-            file.writeText(script.rawText)
+            file.writeText(script.rawScript)
             Timber.tag(TAG).i("Script saved: $name")
             true
         } catch (e: Exception) {

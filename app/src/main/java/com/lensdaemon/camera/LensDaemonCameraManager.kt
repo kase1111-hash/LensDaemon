@@ -201,6 +201,23 @@ class LensDaemonCameraManager(private val context: Context) {
     }
 
     /**
+     * Check whether the currently opened camera supports face detection.
+     */
+    fun supportsFaceDetection(): Boolean {
+        val device = cameraDevice ?: return false
+        return try {
+            val characteristics = cameraManager.getCameraCharacteristics(device.id)
+            val modes = characteristics.get(
+                CameraCharacteristics.STATISTICS_INFO_AVAILABLE_FACE_DETECT_MODES
+            )
+            modes != null && modes.any { it != CameraMetadata.STATISTICS_FACE_DETECT_MODE_OFF }
+        } catch (e: CameraAccessException) {
+            Timber.w(e, "Failed to query face detection support")
+            false
+        }
+    }
+
+    /**
      * Get capabilities for a specific camera.
      */
     fun getCameraCapabilities(cameraId: String): CameraCapabilities? {
@@ -266,10 +283,10 @@ class LensDaemonCameraManager(private val context: Context) {
                 ) ?: 1f,
                 exposureCompensationRange = exposureRange.lower..exposureRange.upper,
                 exposureCompensationStep = exposureStep,
-                supportedFocusModes = afModes.mapNotNull { mode ->
+                supportedFocusModes = afModes.toList().mapNotNull { mode ->
                     FocusMode.entries.find { it.camera2Mode == mode }
                 },
-                supportedWhiteBalanceModes = awbModes.mapNotNull { mode ->
+                supportedWhiteBalanceModes = awbModes.toList().mapNotNull { mode ->
                     WhiteBalanceMode.entries.find { it.camera2Mode == mode }
                 },
                 hasFlash = characteristics.get(CameraCharacteristics.FLASH_INFO_AVAILABLE) ?: false,

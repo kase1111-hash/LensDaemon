@@ -280,7 +280,7 @@ fun NanoHTTPD.jsonResponse(
     status: NanoHTTPD.Response.Status,
     json: String
 ): NanoHTTPD.Response {
-    return newFixedLengthResponse(status, WebServer.MIME_JSON, json)
+    return NanoHTTPD.newFixedLengthResponse(status, WebServer.MIME_JSON, json)
 }
 
 /**

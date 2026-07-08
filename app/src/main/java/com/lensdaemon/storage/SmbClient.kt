@@ -1,6 +1,7 @@
 package com.lensdaemon.storage
 
 import com.hierynomus.mserref.NtStatus
+import com.hierynomus.msdtyp.AccessMask
 import com.hierynomus.msfscc.FileAttributes
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2CreateOptions
@@ -148,9 +149,7 @@ class SmbClient(
 
             val remoteFile = diskShare.openFile(
                 fullPath,
-                EnumSet.of(
-                    com.hierynomus.mssmb2.SMB2ShareAccess.FILE_SHARE_WRITE
-                ),
+                EnumSet.of(AccessMask.GENERIC_WRITE),
                 EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
                 SMB2ShareAccess.ALL,
                 SMB2CreateDisposition.FILE_OVERWRITE_IF,

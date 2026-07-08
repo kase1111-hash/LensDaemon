@@ -339,10 +339,11 @@ class DirectorApiHandler(
             put("sceneId", currentScene.id)
             put("sceneLabel", currentScene.label)
             put("recommendation", comparison.recommendation)
-            put("bestTake", if (comparison.bestTake != null) {
+            val bestTake = comparison.bestTake
+            put("bestTake", if (bestTake != null) {
                 JSONObject().apply {
-                    put("takeNumber", comparison.bestTake.takeNumber)
-                    put("qualityScore", comparison.bestTake.qualityScore)
+                    put("takeNumber", bestTake.takeNumber)
+                    put("qualityScore", bestTake.qualityScore)
                 }
             } else null)
             put("rankings", JSONArray().apply {
@@ -632,7 +633,7 @@ class DirectorApiHandler(
         }
         val json = JSONObject().apply {
             put("success", true)
-            put("script", session.script.rawText)
+            put("script", session.script.rawScript)
             put("scenes", session.script.scenes.size)
             put("totalCues", session.script.totalCues)
         }

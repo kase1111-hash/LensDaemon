@@ -69,7 +69,6 @@ class UploadApiHandler {
                 put("uploadingCount", queueStats.uploadingCount)
                 put("completedCount", queueStats.completedCount)
                 put("failedCount", queueStats.failedCount)
-                put("cancelledCount", queueStats.cancelledCount)
                 put("totalBytes", queueStats.totalBytes)
                 put("uploadedBytes", queueStats.uploadedBytes)
                 put("currentProgress", queueStats.currentProgress)
@@ -96,7 +95,7 @@ class UploadApiHandler {
                         put("bytesUploaded", task.bytesUploaded)
                         put("progress", task.progress)
                         put("retryCount", task.retryCount)
-                        put("error", task.error ?: "")
+                        put("error", task.lastError ?: "")
                     })
                 }
             })
