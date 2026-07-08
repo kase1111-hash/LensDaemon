@@ -45,7 +45,7 @@ class RtspServerSmokeTest {
 
     @Test
     fun clientCanConnect() {
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         assertTrue("Socket should be connected", socket.isConnected)
@@ -56,7 +56,7 @@ class RtspServerSmokeTest {
 
     @Test
     fun optionsReturnsAllowedMethods() {
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         val writer = PrintWriter(socket.getOutputStream(), true)
@@ -87,7 +87,7 @@ class RtspServerSmokeTest {
             pps = byteArrayOf(0x68, 0xce.toByte(), 0x38, 0x80.toByte()),
             vps = null
         )
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         val writer = PrintWriter(socket.getOutputStream(), true)
@@ -107,7 +107,7 @@ class RtspServerSmokeTest {
 
     @Test
     fun playWithoutSetupReturnsError() {
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val socket = Socket("localhost", testPort)
         val writer = PrintWriter(socket.getOutputStream(), true)
@@ -130,7 +130,7 @@ class RtspServerSmokeTest {
     @Test
     fun serverRejectsExcessClients() {
         rtspServer.maxClients = 2
-        rtspServer.start()
+        assertTrue("RTSP server should start", rtspServer.start())
 
         val sockets = mutableListOf<Socket>()
         try {
