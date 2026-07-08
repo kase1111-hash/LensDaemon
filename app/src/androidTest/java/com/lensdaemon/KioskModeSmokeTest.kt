@@ -40,7 +40,7 @@ class KioskModeSmokeTest {
 
     @Test
     fun kioskStateReportsCorrectly() {
-        val state = kioskManager.getKioskState()
+        val state = kioskManager.kioskState.value
         assertNotNull("Kiosk state should not be null", state)
         // Without Device Owner, state should be NOT_DEVICE_OWNER or DISABLED
         assertTrue(

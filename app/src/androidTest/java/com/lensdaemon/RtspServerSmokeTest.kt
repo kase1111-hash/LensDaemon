@@ -81,7 +81,7 @@ class RtspServerSmokeTest {
     @Test
     fun describeReturnsSdp() {
         // Configure codec before starting
-        rtspServer.updateCodecConfig(
+        rtspServer.setCodecConfig(
             codec = VideoCodec.H264,
             sps = byteArrayOf(0x67, 0x42, 0x00, 0x1e, 0xab.toByte()),
             pps = byteArrayOf(0x68, 0xce.toByte(), 0x38, 0x80.toByte()),

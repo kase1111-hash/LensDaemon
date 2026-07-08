@@ -43,7 +43,7 @@ class EncoderServiceSmokeTest {
         val binder: IBinder = serviceRule.bindService(intent)
         val service = (binder as EncoderService.EncoderBinder).getService()
 
-        assertFalse("Should not be encoding initially", service.isEncoding())
+        assertFalse("Should not be encoding initially", service.isEncoding.value)
     }
 
     @Test
