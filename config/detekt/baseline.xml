@@ -1,5 +1,188 @@
 <?xml version="1.0" ?>
 <SmellBaseline>
-    <ManuallySuppressedIssues/>
-    <CurrentIssues/>
+  <ManuallySuppressedIssues></ManuallySuppressedIssues>
+  <CurrentIssues>
+    <ID>ComplexCondition:ApiHandlerUtils.kt$ApiHandlerUtils$fileName.contains("/") || fileName.contains("\\") || fileName.contains("..") || fileName.contains("\u0000")</ID>
+    <ID>ComplexCondition:DirectorApiHandler.kt$DirectorApiHandler$rawFileName.isEmpty() || rawFileName == "save" || rawFileName == "export" || rawFileName == "import"</ID>
+    <ID>ComplexCondition:NalUnitParser.kt$NalUnitParser.Companion$data[offset] == 0.toByte() &amp;&amp; data[offset + 1] == 0.toByte() &amp;&amp; data[offset + 2] == 0.toByte() &amp;&amp; data[offset + 3] == 1.toByte()</ID>
+    <ID>ComplexCondition:UploadApiHandler.kt$UploadApiHandler$server.isEmpty() || share.isEmpty() || username.isEmpty() || password.isEmpty()</ID>
+    <ID>CyclomaticComplexMethod:DirectorApiHandler.kt$DirectorApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
+    <ID>CyclomaticComplexMethod:KioskConfig.kt$KioskConfigStore$fun loadConfig(): KioskConfig</ID>
+    <ID>CyclomaticComplexMethod:LensDaemonCameraManager.kt$LensDaemonCameraManager$private fun enumerateCameras()</ID>
+    <ID>CyclomaticComplexMethod:ThermalApiHandler.kt$ThermalApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
+    <ID>CyclomaticComplexMethod:UploadApiHandler.kt$UploadApiHandler$fun handleRequest(uri: String, method: NanoHTTPD.Method, body: JSONObject?): NanoHTTPD.Response?</ID>
+    <ID>EqualsNullCall:RtpPacketizerTest.kt$RtpPacketizerTest$equals(null)</ID>
+    <ID>FunctionOnlyReturningConstant:RecordingCoordinator.kt$RecordingCoordinator$fun getEncoderConfig(): EncoderConfig?</ID>
+    <ID>ImplicitDefaultLocale:DirectorConfig.kt$ParsedScript$String.format("%d:%02d", minutes, seconds)</ID>
+    <ID>ImplicitDefaultLocale:DirectorConfig.kt$RecordedTake$String.format("%02d:%02d.%03d", minutes, seconds, millis)</ID>
+    <ID>ImplicitDefaultLocale:FileWriter.kt$FileWriter$String.format("%03d", segmentIndex)</ID>
+    <ID>ImplicitDefaultLocale:LocalStorage.kt$String.format("%.1f MB", this / (1024f * 1024f))</ID>
+    <ID>ImplicitDefaultLocale:LocalStorage.kt$String.format("%.2f GB", this / (1024f * 1024f * 1024f))</ID>
+    <ID>ImplicitDefaultLocale:MainActivity.kt$MainActivity$String.format( "%d.%d.%d.%d", ipAddress and 0xff, ipAddress shr 8 and 0xff, ipAddress shr 16 and 0xff, ipAddress shr 24 and 0xff )</ID>
+    <ID>ImplicitDefaultLocale:MainActivity.kt$MainActivity$String.format("%.0fx", zoom)</ID>
+    <ID>ImplicitDefaultLocale:MainActivity.kt$MainActivity$String.format("%.1fx", zoom)</ID>
+    <ID>ImplicitDefaultLocale:SdpGenerator.kt$SdpGenerator$String.format( "%02X%02X%02X", sps[1].toInt() and 0xFF, sps[2].toInt() and 0xFF, sps[3].toInt() and 0xFF )</ID>
+    <ID>ImplicitDefaultLocale:SdpGenerator.kt$SdpGenerator$String.format("%02X%02X%02X", profile, constraints, level)</ID>
+    <ID>ImplicitDefaultLocale:ShotMapper.kt$ShotMapper$String.format("%.1f", newZoom)</ID>
+    <ID>ImplicitDefaultLocale:TakeManager.kt$TakeManager.SessionStats$String.format("%d:%02d", minutes, seconds)</ID>
+    <ID>ImplicitDefaultLocale:TakeManager.kt$TakeManager.SessionStats$String.format("%d:%02d:%02d", hours, minutes, seconds)</ID>
+    <ID>ImplicitDefaultLocale:ZoomController.kt$ZoomController$String.format("%.0fx", zoom)</ID>
+    <ID>ImplicitDefaultLocale:ZoomController.kt$ZoomController$String.format("%.1fx", zoom)</ID>
+    <ID>LargeClass:CameraService.kt$CameraService : Service</ID>
+    <ID>LargeClass:NalUnitParserTest.kt$NalUnitParserTest</ID>
+    <ID>LargeClass:RtpPacketizerTest.kt$RtpPacketizerTest</ID>
+    <ID>LargeClass:ScriptParserTest.kt$ScriptParserTest</ID>
+    <ID>LargeClass:ShotMapperTest.kt$ShotMapperTest</ID>
+    <ID>LongMethod:ScriptParser.kt$ScriptParser$private fun parseExplicitCue(line: String, lineNumber: Int): DirectorCue?</ID>
+    <ID>LongParameterList:SdpGenerator.kt$SdpGenerator$( serverAddress: String, serverPort: Int, sessionName: String, config: EncoderConfig, vps: ByteArray? = null, sps: ByteArray? = null, pps: ByteArray? = null, trackId: String = "video" )</ID>
+    <ID>LongParameterList:SdpGenerator.kt$SdpGenerator$( serverAddress: String, serverPort: Int, sessionName: String, config: EncoderConfig, vps: ByteArray?, sps: ByteArray?, pps: ByteArray?, trackId: String = "video" )</ID>
+    <ID>LoopWithTooManyJumpStatements:DirectorManager.kt$DirectorManager$while</ID>
+    <ID>LoopWithTooManyJumpStatements:LensDaemonCameraManager.kt$LensDaemonCameraManager$for</ID>
+    <ID>LoopWithTooManyJumpStatements:RtspServerSmokeTest.kt$RtspServerSmokeTest$while</ID>
+    <ID>LoopWithTooManyJumpStatements:UploadQueue.kt$UploadQueue$while</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "Failed to parse script"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "fileName": "$actualFileName", "message": "Script saved"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid quality. Use: UNMARKED, GOOD, BAD, CIRCLE, HOLD"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "fileName and script are required"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "sceneIndex is required and must be &gt;= 0"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "takeNumber and filePath are required"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$val baseName = ApiHandlerUtils.sanitizeFileName(rawFileName) ?: return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid file name"}""")</ID>
+    <ID>MaxLineLength:DirectorApiHandler.kt$DirectorApiHandler$val fileName = ApiHandlerUtils.sanitizeFileName(rawFileName) ?: return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid file name"}""")</ID>
+    <ID>MaxLineLength:KioskApiHandler.kt$KioskApiHandler$restartStreamOnReconnect = networkJson.optBoolean("restartStreamOnReconnect", currentConfig.networkRecovery.restartStreamOnReconnect)</ID>
+    <ID>MaxLineLength:ScriptParser.kt$ScriptParser.Companion$"""\[SHOT[:\s]+(ESTABLISHING|WIDE|FULL[_\s]?SHOT|MEDIUM[_\s]?CLOSE|MEDIUM|CLOSE[_\s]?UP|EXTREME[_\s]?CLOSE[_\s]?UP|ECU|OVER[_\s]?SHOULDER|OTS)\]"""</ID>
+    <ID>MaxLineLength:ShotMapperTest.kt$ShotMapperTest$DirectorCue(type = CueType.EXPOSURE, rawText = "[EXPOSURE: BRIGHT]", exposurePreset = ExposurePreset.BRIGHT, lineNumber = 1)</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Failed to enqueue file. Check if file exists."}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "S3 connection test failed"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "S3 connection test timed out"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "SMB connection test failed"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": false, "error": "SMB connection test timed out"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "S3 connection successful"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "SMB connection successful"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid destination: $destinationStr. Use S3 or SMB"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "bucket, accessKeyId, and secretAccessKey are required"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "endpoint is required for this backend type"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "server, share, username, and password are required"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "S3 not configured"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "SMB not configured"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Pending uploads cleared"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Retrying failed uploads"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "S3 credentials cleared"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "SMB credentials cleared"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Upload processing started"}""")</ID>
+    <ID>MaxLineLength:UploadApiHandler.kt$UploadApiHandler$return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Upload processing stopped"}""")</ID>
+    <ID>NestedBlockDepth:LensDaemonCameraManager.kt$LensDaemonCameraManager$private fun enumerateCameras()</ID>
+    <ID>ReturnCount:ScriptParser.kt$ScriptParser$private fun parseExplicitCue(line: String, lineNumber: Int): DirectorCue?</ID>
+    <ID>ReturnCount:VideoEncoder.kt$VideoEncoder$fun initialize(): Result&lt;Surface&gt;</ID>
+    <ID>SwallowedException:BatteryBypass.kt$BatteryBypass$e: Exception</ID>
+    <ID>SwallowedException:CameraService.kt$CameraService$e: Exception</ID>
+    <ID>SwallowedException:CredentialStore.kt$CredentialStore$e: Exception</ID>
+    <ID>SwallowedException:DirectorApiHandler.kt$DirectorApiHandler$e: Exception</ID>
+    <ID>SwallowedException:DirectorConfig.kt$DirectorConfigStore$e: Exception</ID>
+    <ID>SwallowedException:KioskApiHandler.kt$KioskApiHandler$e: Exception</ID>
+    <ID>SwallowedException:KioskConfig.kt$KioskConfigStore$e: Exception</ID>
+    <ID>SwallowedException:MjpegStreamer.kt$MjpegStreamer.&lt;no name provided&gt;$e: IOException</ID>
+    <ID>SwallowedException:MjpegStreamer.kt$MjpegStreamer.MjpegClient$e: Exception</ID>
+    <ID>SwallowedException:RemoteLlmClient.kt$RemoteLlmClient$e: Exception</ID>
+    <ID>SwallowedException:RtspServer.kt$RtspServer$e: SocketException</ID>
+    <ID>SwallowedException:RtspSession.kt$RtspSession$e: java.net.SocketTimeoutException</ID>
+    <ID>SwallowedException:ThermalMonitor.kt$ThermalMonitor$e: Exception</ID>
+    <ID>SwallowedException:ThermalProfile.kt$ThermalProfileManager$e: Exception</ID>
+    <ID>SwallowedException:ThermalStressTest.kt$ThermalStressTest$e: Exception</ID>
+    <ID>SwallowedException:UploadApiHandler.kt$UploadApiHandler$e: Exception</ID>
+    <ID>SwallowedException:UploadApiHandler.kt$UploadApiHandler$e: kotlinx.coroutines.TimeoutCancellationException</ID>
+    <ID>SwallowedException:VideoEncoder.kt$VideoEncoder$e: Exception</ID>
+    <ID>SwallowedException:VideoEncoder.kt$VideoEncoder.&lt;no name provided&gt;$e: Exception</ID>
+    <ID>SwallowedException:WebServer.kt$WebServer$e: Exception</ID>
+    <ID>SwallowedException:WebServer.kt$WebServer$e: IOException</ID>
+    <ID>TooManyFunctions:CameraService.kt$CameraService : Service</ID>
+    <ID>TooManyFunctions:DirectorApiHandler.kt$DirectorApiHandler</ID>
+    <ID>TooManyFunctions:DirectorManager.kt$DirectorManager</ID>
+    <ID>TooManyFunctions:DirectorService.kt$DirectorService : Service</ID>
+    <ID>TooManyFunctions:EncoderService.kt$EncoderService : Service</ID>
+    <ID>TooManyFunctions:KioskManager.kt$KioskManager</ID>
+    <ID>TooManyFunctions:ThermalGovernor.kt$ThermalGovernor : ThermalMonitorListener</ID>
+    <ID>TooManyFunctions:UploadService.kt$UploadService : ServiceUploadEventListener</ID>
+    <ID>TooManyFunctions:WebServerService.kt$WebServerService : Service</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import android.content.Context</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import android.os.Build</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.camera.CameraService</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.camera.LensType</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.director.DirectorManager</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.encoder.EncoderState</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.kiosk.KioskManager</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.storage.UploadService</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.thermal.ThermalGovernor</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.DirectorApiHandler</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.KioskApiHandler</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.StreamApiHandler</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.ThermalApiHandler</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import com.lensdaemon.web.handlers.UploadApiHandler</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import fi.iki.elonen.NanoHTTPD</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import fi.iki.elonen.NanoHTTPD.Response.Status</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import java.io.ByteArrayInputStream</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import org.json.JSONArray</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import org.json.JSONObject</ID>
+    <ID>UnusedImports:ApiRoutes.kt$import timber.log.Timber</ID>
+    <ID>UnusedImports:ExposureController.kt$import android.hardware.camera2.CameraMetadata</ID>
+    <ID>UnusedImports:FocusController.kt$import android.graphics.PointF</ID>
+    <ID>UnusedImports:FocusController.kt$import android.hardware.camera2.CameraMetadata</ID>
+    <ID>UnusedImports:KioskManager.kt$import android.content.Intent</ID>
+    <ID>UnusedImports:KioskManager.kt$import kotlinx.coroutines.launch</ID>
+    <ID>UnusedImports:LensController.kt$import android.hardware.camera2.CaptureRequest</ID>
+    <ID>UnusedImports:LensController.kt$import android.os.Build</ID>
+    <ID>UnusedImports:LensDaemonApp.kt$import android.os.Build</ID>
+    <ID>UnusedImports:LensDaemonCameraManager.kt$import android.util.Size</ID>
+    <ID>UnusedImports:MpegTsCoordinator.kt$import com.lensdaemon.output.MpegTsMode</ID>
+    <ID>UnusedImports:QualityMetricsCollector.kt$import java.util.concurrent.atomic.AtomicBoolean</ID>
+    <ID>UnusedImports:RetentionPolicyTest.kt$import org.junit.After</ID>
+    <ID>UnusedImports:RtpPacketizer.kt$import com.lensdaemon.encoder.H264NalType</ID>
+    <ID>UnusedImports:RtpPacketizer.kt$import com.lensdaemon.encoder.H265NalType</ID>
+    <ID>UnusedImports:RtpPacketizer.kt$import java.nio.ByteBuffer</ID>
+    <ID>UnusedImports:RtpPacketizer.kt$import java.util.concurrent.atomic.AtomicLong</ID>
+    <ID>UnusedImports:RtpPacketizer.kt$import timber.log.Timber</ID>
+    <ID>UnusedImports:RtspCoordinator.kt$import com.lensdaemon.encoder.EncoderConfig</ID>
+    <ID>UnusedImports:ScreenController.kt$import android.os.Build</ID>
+    <ID>UnusedImports:SdpGenerator.kt$import java.net.InetAddress</ID>
+    <ID>UnusedImports:SmbClient.kt$import com.hierynomus.mserref.NtStatus</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.camera.CameraService</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.encoder.EncoderConfig</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.encoder.VideoCodec</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.output.MpegTsMode</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.output.MpegTsUdpConfig</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.output.SegmentDuration</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import com.lensdaemon.web.WebServer</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import fi.iki.elonen.NanoHTTPD</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import fi.iki.elonen.NanoHTTPD.Response.Status</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import org.json.JSONArray</ID>
+    <ID>UnusedImports:StreamApiHandler.kt$import org.json.JSONObject</ID>
+    <ID>UnusedImports:TakeManager.kt$import kotlin.math.min</ID>
+    <ID>UnusedImports:UploadTaskTest.kt$import java.io.File</ID>
+    <ID>UnusedImports:WebServer.kt$import java.io.InputStream</ID>
+    <ID>UnusedImports:WebServerService.kt$import kotlinx.coroutines.launch</ID>
+    <ID>UnusedParameter:BootReceiver.kt$BootReceiver$config: KioskConfig</ID>
+    <ID>UnusedParameter:ButtonOverrideHandler.kt$ButtonOverrideHandler$event: KeyEvent</ID>
+    <ID>UnusedParameter:FocusController.kt$FocusController$previewSize: Size</ID>
+    <ID>UnusedParameter:NalUnitParser.kt$NalUnitParser$sps: ByteArray</ID>
+    <ID>UnusedParameter:PreviewSurfaceProvider.kt$PreviewSurfaceProvider$viewHeight: Int</ID>
+    <ID>UnusedParameter:PreviewSurfaceProvider.kt$PreviewSurfaceProvider$viewWidth: Int</ID>
+    <ID>UnusedParameter:SdpGenerator.kt$SdpGenerator$config: EncoderConfig</ID>
+    <ID>UnusedParameter:WebServer.kt$WebServer$session: IHTTPSession</ID>
+    <ID>UnusedPrivateMember:LocalStorage.kt$LocalStorage$private fun notifyStorageError(error: String)</ID>
+    <ID>UnusedPrivateMember:ScreenController.kt$ScreenController$private fun isDeviceOwner(): Boolean</ID>
+    <ID>UnusedPrivateProperty:CameraServiceSmokeTest.kt$CameraServiceSmokeTest$val stats = service.getEncoderStats()</ID>
+    <ID>UnusedPrivateProperty:DirectorManager.kt$DirectorManager$val errors = scriptParser.getErrors()</ID>
+    <ID>UnusedPrivateProperty:DirectorManager.kt$DirectorManager$val warnings = scriptParser.validateScript(parsedScript)</ID>
+    <ID>UnusedPrivateProperty:FocusController.kt$FocusController.Companion$private const val FOCUS_LOCK_TIMEOUT_MS = 3000L</ID>
+    <ID>UnusedPrivateProperty:KioskModeSmokeTest.kt$KioskModeSmokeTest$val adminComponent = ComponentName(context, AdminReceiver::class.java)</ID>
+    <ID>UnusedPrivateProperty:NalUnitParser.kt$NalUnitParser.Companion$// Start code patterns private val START_CODE_3 = byteArrayOf(0x00, 0x00, 0x01)</ID>
+    <ID>UnusedPrivateProperty:RtcpParser.kt$RtcpParser$// RTCP packet types private const val RTCP_SR = 200 // Sender Report</ID>
+    <ID>UnusedPrivateProperty:RtcpParser.kt$RtcpParser$i</ID>
+    <ID>UnusedPrivateProperty:RtcpParser.kt$RtcpParser$private const val RTCP_BYE = 203 // Goodbye</ID>
+    <ID>UnusedPrivateProperty:RtpPacketizer.kt$RtpPacketizer.Companion$private const val TAG = "RtpPacketizer"</ID>
+    <ID>UnusedPrivateProperty:ScriptParser.kt$ScriptParser.Companion$private val DOF_PATTERN = Pattern.compile( """\[DOF[:\s]+(SHALLOW|DEEP|AUTO)\]""", Pattern.CASE_INSENSITIVE )</ID>
+    <ID>UnusedPrivateProperty:ThermalMonitor.kt$ThermalMonitor$// System services private val batteryManager = context.getSystemService(Context.BATTERY_SERVICE) as BatteryManager</ID>
+    <ID>UnusedPrivateProperty:TransitionAnimator.kt$TransitionAnimator$private val handler = Handler(Looper.getMainLooper())</ID>
+    <ID>UnusedPrivateProperty:VideoEncoder.kt$VideoEncoder$val frameCount = framesEncoded.incrementAndGet()</ID>
+    <ID>UnusedPrivateProperty:VideoEncoder.kt$VideoEncoder.Companion$private const val TIMEOUT_US = 10_000L // 10ms timeout for dequeue operations</ID>
+  </CurrentIssues>
 </SmellBaseline>

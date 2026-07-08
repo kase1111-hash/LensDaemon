@@ -519,13 +519,6 @@ class TakeManager(
     }
 
     /**
-     * Get takes for a specific scene
-     */
-    fun getTakesForScene(sceneId: String): List<RecordedTake> {
-        return _recordedTakes.value.filter { it.sceneId == sceneId }
-    }
-
-    /**
      * Get takes with recording files
      */
     fun getTakesWithFiles(): List<RecordedTake> {
