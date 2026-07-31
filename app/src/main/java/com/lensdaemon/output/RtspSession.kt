@@ -12,7 +12,10 @@ import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.net.Socket
+import java.net.SocketTimeoutException
 import java.util.UUID
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -39,6 +42,23 @@ class RtspSession(
     companion object {
         private const val TAG = "RtspSession"
         private const val READ_TIMEOUT_MS = 60_000
+
+        /**
+         * Frames buffered per client before the slowest picture is discarded.
+         * Roughly two seconds at 30 fps: enough to ride out a WiFi hiccup,
+         * short enough that a recovering viewer catches up to live quickly.
+         */
+        private const val OUTBOUND_QUEUE_CAPACITY = 60
+
+        /**
+         * If no frame write completes within this window while frames are
+         * queueing, the peer is treated as gone and the session is closed.
+         * Java sockets have no write timeout, so closing the socket is the only
+         * way to unblock a write that is stuck on a full send buffer.
+         */
+        private const val STALLED_CLIENT_TIMEOUT_MS = 10_000L
+
+        private const val WRITER_POLL_MS = 250L
     }
 
     // Session identification
@@ -81,7 +101,20 @@ class RtspSession(
     // Statistics
     private val packetsSent = AtomicLong(0)
     private val bytesSent = AtomicLong(0)
+    private val framesDropped = AtomicLong(0)
     private var startTimeMs = 0L
+
+    /**
+     * Outbound frames are handed to a per-session writer thread rather than
+     * written on the caller's thread. The encoder dispatches frames to every
+     * output in turn, so a blocking write here would stall RTSP delivery to all
+     * other viewers, the MPEG-TS publisher and the recorder along with it.
+     */
+    private val outboundQueue = ArrayBlockingQueue<EncodedFrame>(OUTBOUND_QUEUE_CAPACITY)
+    private var writerThread: Thread? = null
+
+    @Volatile
+    private var lastWriteCompletedMs: Long = System.currentTimeMillis()
 
     // RTCP feedback
     private var rtcpSocket: DatagramSocket? = null
@@ -138,7 +171,16 @@ class RtspSession(
         sessionScope.launch {
             try {
                 while (isRunning.get() && !socket.isClosed) {
-                    val request = readRequest() ?: break
+                    val request = try {
+                        readRequest()
+                    } catch (e: SocketTimeoutException) {
+                        // Silence is not a failure. RFC 2326 lets ongoing RTP stand
+                        // in for a keepalive, and plenty of players send no commands
+                        // at all while playing. Genuinely dead sessions are reaped by
+                        // the server's idle-eviction loop instead.
+                        continue
+                    } ?: break
+
                     lastActivityMs = System.currentTimeMillis()
                     val response = handleRequest(request)
                     sendResponse(response)
@@ -180,6 +222,9 @@ class RtspSession(
             }
 
             return RtspRequest.parse(sb.toString())
+        } catch (e: SocketTimeoutException) {
+            // Surfaced to the request loop, which keeps the session alive.
+            throw e
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Error reading request")
             return null
@@ -347,6 +392,7 @@ class RtspSession(
         state = SessionState.PLAYING
         isPlaying.set(true)
         startTimeMs = System.currentTimeMillis()
+        startWriterLoop()
 
         // RTP-Info header
         val seq = rtpPacketizer?.getSequenceNumber() ?: 0
@@ -415,25 +461,73 @@ class RtspSession(
     }
 
     /**
-     * Send encoded frame to client
+     * Queue an encoded frame for delivery to this client.
+     *
+     * Never blocks: a client that cannot keep up loses frames rather than
+     * holding up the encoder and every other output.
      */
     fun sendFrame(frame: EncodedFrame) {
         if (!isPlaying.get()) return
-        val packetizer = rtpPacketizer ?: return
+        if (rtpPacketizer == null) return
 
-        try {
-            val packets = packetizer.packetize(frame.data, frame.presentationTimeUs)
+        if (outboundQueue.offer(frame)) return
 
-            for (packet in packets) {
-                sendRtpPacket(packet)
+        // Backlog is full. Discard the oldest picture so the client is always
+        // working toward live rather than falling further behind.
+        outboundQueue.poll()
+        framesDropped.incrementAndGet()
+        outboundQueue.offer(frame)
+
+        // Frames are piling up and nothing is draining: the peer has stopped
+        // reading. Close the socket, which also unblocks the stuck write.
+        val stalledMs = System.currentTimeMillis() - lastWriteCompletedMs
+        if (stalledMs > STALLED_CLIENT_TIMEOUT_MS) {
+            Timber.tag(TAG).w(
+                "Session $sessionId stalled: no frame written for ${stalledMs / 1000}s, " +
+                    "${framesDropped.get()} frames dropped. Disconnecting client."
+            )
+            close()
+        }
+    }
+
+    /**
+     * Drains the outbound queue onto the socket. Blocking writes are confined
+     * to this thread, so a wedged client costs only its own session.
+     */
+    private fun startWriterLoop() {
+        if (writerThread != null) return
+        lastWriteCompletedMs = System.currentTimeMillis()
+
+        writerThread = Thread({
+            while (isRunning.get() && !socket.isClosed) {
+                val frame = try {
+                    outboundQueue.poll(WRITER_POLL_MS, TimeUnit.MILLISECONDS)
+                } catch (e: InterruptedException) {
+                    break
+                } ?: continue
+
+                val packetizer = rtpPacketizer ?: continue
+                try {
+                    val packets = packetizer.packetize(frame.data, frame.presentationTimeUs)
+                    for (packet in packets) {
+                        sendRtpPacket(packet)
+                    }
+                    packetsSent.addAndGet(packets.size.toLong())
+                    bytesSent.addAndGet(frame.size.toLong())
+
+                    val now = System.currentTimeMillis()
+                    lastWriteCompletedMs = now
+                    lastActivityMs = now
+                } catch (e: Exception) {
+                    if (isRunning.get()) {
+                        Timber.e(e, "$TAG: Error sending frame to session $sessionId")
+                    }
+                }
             }
-
-            packetsSent.addAndGet(packets.size.toLong())
-            bytesSent.addAndGet(frame.size.toLong())
-            lastActivityMs = System.currentTimeMillis()
-
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Error sending frame to session $sessionId")
+            Timber.tag(TAG).d("Session $sessionId writer loop exited")
+        }, "rtsp-writer-$sessionId").apply {
+            isDaemon = true
+            start()
         }
     }
 
@@ -514,7 +608,8 @@ class RtspSession(
             durationMs = durationMs,
             fractionLost = lastFractionLost,
             cumulativeLost = lastCumulativeLost,
-            jitter = lastJitter
+            jitter = lastJitter,
+            framesDropped = framesDropped.get()
         )
     }
 
@@ -529,6 +624,8 @@ class RtspSession(
         state = SessionState.TEARDOWN
         isPlaying.set(false)
 
+        // Closing the socket is what unblocks a writer stuck on a full send
+        // buffer, so it has to happen before waiting on that thread.
         try {
             rtcpSocket?.close()
             udpSocket?.close()
@@ -538,6 +635,10 @@ class RtspSession(
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Error closing session")
         }
+
+        outboundQueue.clear()
+        writerThread?.interrupt()
+        writerThread = null
 
         sessionScope.cancel()
         onSessionClosed(this)
@@ -556,7 +657,9 @@ data class SessionStats(
     val durationMs: Long,
     val fractionLost: Int = 0,
     val cumulativeLost: Int = 0,
-    val jitter: Long = 0
+    val jitter: Long = 0,
+    /** Frames discarded because this client could not keep up with the stream. */
+    val framesDropped: Long = 0
 ) {
     val bitrateBps: Long
         get() = if (durationMs > 0) (bytesSent * 8 * 1000) / durationMs else 0
