@@ -58,6 +58,19 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         private const val H265_STREAM_TYPE = 0x24
         private const val PAT_PMT_INTERVAL_MS = 500L
         private const val TS_PACKETS_PER_DATAGRAM = 7
+
+        /** PTS/PCR are 33-bit fields on a 90 kHz clock; both wrap every ~26.5 hours. */
+        private const val PTS_MASK = 0x1FFFFFFFFL
+        private const val PTS_CLOCK_HZ = 90_000L
+
+        /** Bytes an adaptation field carrying a PCR occupies: flags(1) + PCR(6). */
+        private const val AF_PCR_DATA_LEN = 7
+
+        /** Payload bytes available in a TS packet with no adaptation field. */
+        private const val TS_MAX_PAYLOAD = TS_PACKET_SIZE - 4
+
+        /** Payload bytes available once a PCR adaptation field is present. */
+        private const val TS_PAYLOAD_WITH_PCR = TS_PACKET_SIZE - 5 - AF_PCR_DATA_LEN
     }
 
     private val isRunning = AtomicBoolean(false)
@@ -66,6 +79,9 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
 
     private var scope: CoroutineScope? = null
     private var socket: DatagramSocket? = null
+
+    /** Written by the listener coroutine, read by the encoder's frame thread. */
+    @Volatile
     private var remoteAddress: InetSocketAddress? = null
 
     private var codec: VideoCodec = VideoCodec.H264
@@ -76,6 +92,14 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
     private var continuityCounters = IntArray(8192)
     private var lastPatPmtTime = 0L
     private var startTimeMs = 0L
+
+    /**
+     * Encoder timestamps are boot-relative and can start anywhere, so the stream
+     * is rebased to its first frame. That keeps PTS/PCR near zero at start and
+     * makes the 33-bit wrap land ~26.5 hours into the session rather than at an
+     * arbitrary point determined by device uptime.
+     */
+    private var ptsBaseUs = -1L
     private var bytesSent = 0L
     private var packetsSent = 0L
     private var framesSent = 0L
@@ -121,6 +145,7 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
             startTimeMs = System.currentTimeMillis()
             continuityCounters = IntArray(8192)
             lastPatPmtTime = 0L
+            ptsBaseUs = -1L
             bytesSent = 0L
             packetsSent = 0L
             framesSent = 0L
@@ -154,8 +179,15 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
                 lastPatPmtTime = now
             }
 
-            val pesPacket = createPesPacket(frame)
-            val tsPackets = packetizeToTs(VIDEO_PID, pesPacket, frame.isKeyFrame)
+            if (ptsBaseUs < 0) ptsBaseUs = frame.presentationTimeUs
+            val pts90kHz = mediaPts90kHz(frame.presentationTimeUs)
+            // PCR shares the media clock with PTS, trailing it by the configured
+            // decoder buffer delay. A PCR rides the first packet of every frame so
+            // the interval stays well inside the 100 ms ISO 13818-1 ceiling.
+            val pcr90kHz = (pts90kHz - config.latencyMs * PTS_CLOCK_HZ / 1000L) and PTS_MASK
+
+            val pesPacket = createPesPacket(frame, pts90kHz)
+            val tsPackets = packetizeToTs(VIDEO_PID, pesPacket, frame.isKeyFrame, pcr90kHz)
             sendTsPackets(tsPackets, target)
 
             framesSent++
@@ -274,9 +306,20 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
 
     // --- PES and TS packetization ---
 
-    private fun createPesPacket(frame: EncodedFrame): ByteArray {
+    /**
+     * Convert an encoder timestamp to the stream's 33-bit 90 kHz presentation
+     * clock, rebased to the first frame published. The PTS offset keeps the
+     * clock non-negative once PCR is placed a buffer delay behind it.
+     */
+    private fun mediaPts90kHz(presentationTimeUs: Long): Long {
+        val base = if (ptsBaseUs < 0) presentationTimeUs else ptsBaseUs
+        val mediaUs = presentationTimeUs - base
+        val offsetTicks = config.latencyMs * PTS_CLOCK_HZ / 1000L
+        return ((mediaUs * PTS_CLOCK_HZ / 1_000_000L) + offsetTicks) and PTS_MASK
+    }
+
+    private fun createPesPacket(frame: EncodedFrame, pts90kHz: Long): ByteArray {
         val accessUnit = if (frame.isKeyFrame) buildKeyframeAU(frame.data) else frame.data
-        val pts90kHz = frame.presentationTimeUs * 90 / 1000
         val pesPayloadLen = 3 + 5 + accessUnit.size  // flags(2) + hdrLen(1) + PTS(5) + data
         val lengthField = if (pesPayloadLen > 0xFFFF) 0 else pesPayloadLen
 
@@ -315,7 +358,21 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         buf.put((0x01 or ((pts and 0x7F).toInt() shl 1)).toByte())
     }
 
-    private fun packetizeToTs(pid: Int, payload: ByteArray, isKeyFrame: Boolean): List<ByteArray> {
+    /**
+     * Split a PES packet into 188-byte TS packets.
+     *
+     * Every packet is filled exactly: the adaptation field absorbs whatever the
+     * payload does not, so a demuxer reading `188 - payload_offset` bytes gets
+     * precisely the bytes that were written and never trailing garbage.
+     *
+     * @param pcr90kHz PCR to place on the first packet, or null to omit it.
+     */
+    private fun packetizeToTs(
+        pid: Int,
+        payload: ByteArray,
+        isKeyFrame: Boolean,
+        pcr90kHz: Long?
+    ): List<ByteArray> {
         val packets = mutableListOf<ByteArray>()
         var offset = 0
         var first = true
@@ -324,45 +381,61 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
             val pkt = ByteArray(TS_PACKET_SIZE)
             val cc = nextContinuityCounter(pid)
             val remaining = payload.size - offset
+            val withPcr = first && pcr90kHz != null
 
-            // TS header
             pkt[0] = TS_SYNC_BYTE
             pkt[1] = ((if (first) 0x40 else 0x00) or ((pid shr 8) and 0x1F)).toByte()
             pkt[2] = (pid and 0xFF).toByte()
 
-            var headerSize = 4
+            // Decide the adaptation field size so header + field + payload == 188.
+            val toCopy: Int
+            val useAdaptation: Boolean
+            val adaptationLen: Int   // value of the adaptation_field_length byte
 
-            if (first && isKeyFrame) {
-                // Adaptation field with random access indicator + PCR
-                pkt[3] = (0x30 or (cc and 0x0F)).toByte()
-                pkt[4] = 0x07  // adaptation field length
-                pkt[5] = 0x50  // random_access=1, PCR_flag=1
-                val pcr = System.currentTimeMillis() * 90
-                pkt[6] = ((pcr shr 25) and 0xFF).toByte()
-                pkt[7] = ((pcr shr 17) and 0xFF).toByte()
-                pkt[8] = ((pcr shr 9) and 0xFF).toByte()
-                pkt[9] = ((pcr shr 1) and 0xFF).toByte()
-                pkt[10] = (((pcr and 0x01).toInt() shl 7) or 0x7E).toByte()
-                pkt[11] = 0x00
-                headerSize = 12
-            } else if (remaining < TS_PACKET_SIZE - 4) {
-                // Last packet needs stuffing via adaptation field
-                val stuffing = TS_PACKET_SIZE - 4 - remaining - 2 // -2 for adapt_len + flags
-                if (stuffing >= 0) {
-                    pkt[3] = (0x30 or (cc and 0x0F)).toByte()
-                    pkt[4] = (stuffing + 1).toByte()
-                    pkt[5] = 0x00
-                    for (i in 0 until stuffing) pkt[6 + i] = 0xFF.toByte()
-                    headerSize = 6 + stuffing
-                } else {
-                    pkt[3] = (0x10 or (cc and 0x0F)).toByte()
-                }
+            if (withPcr) {
+                toCopy = remaining.coerceAtMost(TS_PAYLOAD_WITH_PCR)
+                useAdaptation = true
+                adaptationLen = AF_PCR_DATA_LEN + (TS_PAYLOAD_WITH_PCR - toCopy)
             } else {
-                pkt[3] = (0x10 or (cc and 0x0F)).toByte()
+                toCopy = remaining.coerceAtMost(TS_MAX_PAYLOAD)
+                when (val padding = TS_MAX_PAYLOAD - toCopy) {
+                    0 -> { useAdaptation = false; adaptationLen = 0 }
+                    // A single spare byte is consumed by the length byte alone,
+                    // which declares a zero-length adaptation field.
+                    1 -> { useAdaptation = true; adaptationLen = 0 }
+                    else -> { useAdaptation = true; adaptationLen = padding - 1 }
+                }
             }
 
-            val toCopy = remaining.coerceAtMost(TS_PACKET_SIZE - headerSize)
-            System.arraycopy(payload, offset, pkt, headerSize, toCopy)
+            pkt[3] = ((if (useAdaptation) 0x30 else 0x10) or (cc and 0x0F)).toByte()
+            var w = 4
+
+            if (useAdaptation) {
+                pkt[w++] = adaptationLen.toByte()
+                if (adaptationLen > 0) {
+                    var flags = 0
+                    if (first && isKeyFrame) flags = flags or 0x40 // random_access_indicator
+                    if (withPcr) flags = flags or 0x10             // PCR_flag
+                    pkt[w++] = flags.toByte()
+
+                    if (withPcr) {
+                        val pcr = pcr90kHz!! and PTS_MASK
+                        pkt[w++] = ((pcr shr 25) and 0xFF).toByte()
+                        pkt[w++] = ((pcr shr 17) and 0xFF).toByte()
+                        pkt[w++] = ((pcr shr 9) and 0xFF).toByte()
+                        pkt[w++] = ((pcr shr 1) and 0xFF).toByte()
+                        // low bit of the 33-bit base, 6 reserved bits, PCR ext bit 8
+                        pkt[w++] = (((pcr and 0x01).toInt() shl 7) or 0x7E).toByte()
+                        pkt[w++] = 0x00 // PCR extension low byte
+                    }
+
+                    // Anything left in the declared field is stuffing.
+                    val stuffing = adaptationLen - 1 - (if (withPcr) 6 else 0)
+                    repeat(stuffing) { pkt[w++] = 0xFF.toByte() }
+                }
+            }
+
+            System.arraycopy(payload, offset, pkt, w, toCopy)
             offset += toCopy
             packets.add(pkt)
             first = false
