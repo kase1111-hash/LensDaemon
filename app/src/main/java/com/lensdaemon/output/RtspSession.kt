@@ -171,15 +171,7 @@ class RtspSession(
         sessionScope.launch {
             try {
                 while (isRunning.get() && !socket.isClosed) {
-                    val request = try {
-                        readRequest()
-                    } catch (e: SocketTimeoutException) {
-                        // Silence is not a failure. RFC 2326 lets ongoing RTP stand
-                        // in for a keepalive, and plenty of players send no commands
-                        // at all while playing. Genuinely dead sessions are reaped by
-                        // the server's idle-eviction loop instead.
-                        continue
-                    } ?: break
+                    val request = awaitRequest() ?: break
 
                     lastActivityMs = System.currentTimeMillis()
                     val response = handleRequest(request)
@@ -193,6 +185,28 @@ class RtspSession(
                 close()
             }
         }
+    }
+
+    /**
+     * Block until the client sends a request. Returns null once the peer has
+     * hung up or the session is closing.
+     *
+     * Silence is not a failure. RFC 2326 lets ongoing RTP stand in for a
+     * keepalive, and plenty of players send no commands at all while playing,
+     * so a read timeout simply waits again. Genuinely dead sessions are reaped
+     * by the server's idle-eviction loop instead.
+     */
+    private fun awaitRequest(): RtspRequest? {
+        while (isRunning.get() && !socket.isClosed) {
+            try {
+                return readRequest()
+            } catch (e: SocketTimeoutException) {
+                Timber.tag(TAG).v(
+                    "Session $sessionId: no RTSP command for ${READ_TIMEOUT_MS / 1000}s (${e.message}); still alive"
+                )
+            }
+        }
+        return null
     }
 
     /**
@@ -499,35 +513,51 @@ class RtspSession(
         lastWriteCompletedMs = System.currentTimeMillis()
 
         writerThread = Thread({
-            while (isRunning.get() && !socket.isClosed) {
-                val frame = try {
-                    outboundQueue.poll(WRITER_POLL_MS, TimeUnit.MILLISECONDS)
-                } catch (e: InterruptedException) {
-                    break
-                } ?: continue
-
-                val packetizer = rtpPacketizer ?: continue
-                try {
-                    val packets = packetizer.packetize(frame.data, frame.presentationTimeUs)
-                    for (packet in packets) {
-                        sendRtpPacket(packet)
-                    }
-                    packetsSent.addAndGet(packets.size.toLong())
-                    bytesSent.addAndGet(frame.size.toLong())
-
-                    val now = System.currentTimeMillis()
-                    lastWriteCompletedMs = now
-                    lastActivityMs = now
-                } catch (e: Exception) {
-                    if (isRunning.get()) {
-                        Timber.e(e, "$TAG: Error sending frame to session $sessionId")
-                    }
-                }
+            val self = Thread.currentThread()
+            while (isRunning.get() && !socket.isClosed && !self.isInterrupted) {
+                pollOutboundFrame()?.let { writeFrame(it) }
             }
             Timber.tag(TAG).d("Session $sessionId writer loop exited")
         }, "rtsp-writer-$sessionId").apply {
             isDaemon = true
             start()
+        }
+    }
+
+    /**
+     * Wait briefly for the next queued frame. Returns null when nothing arrived
+     * in time or the writer thread was interrupted; the interrupt flag is
+     * restored so the writer loop condition sees it and exits.
+     */
+    private fun pollOutboundFrame(): EncodedFrame? {
+        return try {
+            outboundQueue.poll(WRITER_POLL_MS, TimeUnit.MILLISECONDS)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            null
+        }
+    }
+
+    /**
+     * Packetize one frame and write it to the client on the writer thread.
+     */
+    private fun writeFrame(frame: EncodedFrame) {
+        val packetizer = rtpPacketizer ?: return
+        try {
+            val packets = packetizer.packetize(frame.data, frame.presentationTimeUs)
+            for (packet in packets) {
+                sendRtpPacket(packet)
+            }
+            packetsSent.addAndGet(packets.size.toLong())
+            bytesSent.addAndGet(frame.size.toLong())
+
+            val now = System.currentTimeMillis()
+            lastWriteCompletedMs = now
+            lastActivityMs = now
+        } catch (e: Exception) {
+            if (isRunning.get()) {
+                Timber.e(e, "$TAG: Error sending frame to session $sessionId")
+            }
         }
     }
 

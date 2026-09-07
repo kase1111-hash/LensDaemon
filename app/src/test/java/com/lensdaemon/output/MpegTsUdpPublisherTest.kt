@@ -1,10 +1,16 @@
 package com.lensdaemon.output
 
 import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.VideoCodec
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayOutputStream
+import java.net.DatagramPacket
+import java.net.DatagramSocket
+import java.net.InetAddress
+import java.net.SocketTimeoutException
 
 /**
  * Unit tests for [MpegTsUdpPublisher]'s transport stream packetization.
@@ -37,6 +43,11 @@ class MpegTsUdpPublisherTest {
         private const val LATENCY_MS = 120L
 
         private const val FLAG_KEY_FRAME = 1
+        private const val FLAG_CODEC_CONFIG = 2
+
+        private val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
+        private val SPS = byteArrayOf(0x67, 0x42, 0x00, 0x1f, 0xe5.toByte(), 0x40, 0x5a)
+        private val PPS = byteArrayOf(0x68, 0xce.toByte(), 0x38, 0x80.toByte())
     }
 
     private val publisher = MpegTsUdpPublisher(MpegTsUdpConfig())
@@ -199,6 +210,153 @@ class MpegTsUdpPublisherTest {
         val bootUptimeUs = 5L * 24 * 3600 * 1_000_000
         val first = method.invoke(fresh, bootUptimeUs) as Long
         assertEquals("stream should start at the configured offset", LATENCY_MS * 90, first)
+    }
+
+    // -----------------------------------------------------------------
+    // Parameter sets on the wire
+    // -----------------------------------------------------------------
+
+    @Test
+    fun `keyframes carry the parameter sets learned from the codec-config buffer`() {
+        // Mirrors the real start order: the publisher is configured from a freshly
+        // initialized encoder that has produced nothing yet, and the encoder's
+        // codec-config buffer arrives afterwards through the frame listener.
+        val idr = nal(0x65, 600)
+        val p = nal(0x41, 200)
+        val es = elementaryStreamsOnTheWire(
+            configure = false,
+            frames = listOf(
+                EncodedFrame(START_CODE + SPS + START_CODE + PPS, 0L, FLAG_CODEC_CONFIG),
+                EncodedFrame(idr, 33_333L, FLAG_KEY_FRAME),
+                EncodedFrame(p, 66_666L, 0)
+            )
+        )
+
+        assertEquals("codec-config buffer must not become a PES of its own", 2, es.size)
+        assertArrayEqualsMsg("keyframe should be prefixed with SPS and PPS", START_CODE + SPS + START_CODE + PPS + idr, es[0])
+        assertArrayEqualsMsg("non-keyframe should be sent as-is", p, es[1])
+    }
+
+    @Test
+    fun `keyframes that already carry parameter sets in band are not duplicated`() {
+        val inBand = START_CODE + SPS + START_CODE + PPS + nal(0x65, 600)
+        val es = elementaryStreamsOnTheWire(
+            configure = true,
+            frames = listOf(EncodedFrame(inBand, 0L, FLAG_KEY_FRAME))
+        )
+
+        assertEquals(1, es.size)
+        assertArrayEqualsMsg("in-band parameter sets should be left alone", inBand, es[0])
+    }
+
+    @Test
+    fun `in-band parameter sets replace the ones the publisher was configured with`() {
+        val newSps = byteArrayOf(0x67, 0x64, 0x00, 0x28, 0xac.toByte(), 0x2b)
+        val newPps = byteArrayOf(0x68, 0xee.toByte(), 0x3c, 0xb0.toByte())
+        val idr = nal(0x65, 300)
+        val es = elementaryStreamsOnTheWire(
+            configure = true,
+            frames = listOf(
+                // The encoder was reconfigured: new parameter sets arrive in band once...
+                EncodedFrame(START_CODE + newSps + START_CODE + newPps + idr, 0L, FLAG_KEY_FRAME),
+                // ...and the next bare keyframe must be described by the new ones.
+                EncodedFrame(idr, 33_333L, FLAG_KEY_FRAME)
+            )
+        )
+
+        assertEquals(2, es.size)
+        assertArrayEqualsMsg("second keyframe should carry the refreshed sets", START_CODE + newSps + START_CODE + newPps + idr, es[1])
+    }
+
+    @Test
+    fun `listener-mode publisher keeps codec config that arrives before any viewer`() {
+        val listener = MpegTsUdpPublisher(MpegTsUdpConfig(mode = MpegTsMode.LISTENER, port = 0))
+        assertTrue(listener.start())
+        try {
+            listener.sendFrame(EncodedFrame(START_CODE + SPS + START_CODE + PPS, 0L, FLAG_CODEC_CONFIG))
+        } finally {
+            listener.stop()
+        }
+
+        val spsField = MpegTsUdpPublisher::class.java.getDeclaredField("sps").apply { isAccessible = true }
+        val ppsField = MpegTsUdpPublisher::class.java.getDeclaredField("pps").apply { isAccessible = true }
+        assertArrayEqualsMsg("SPS should be cached without a viewer", SPS, spsField.get(listener) as ByteArray)
+        assertArrayEqualsMsg("PPS should be cached without a viewer", PPS, ppsField.get(listener) as ByteArray)
+    }
+
+    @Test
+    fun `PCR on the wire trails the PTS of the same frame by the configured latency`() {
+        val bootUptimeUs = 3L * 24 * 3600 * 1_000_000
+        val frames = (0 until 5).map { i ->
+            val key = i == 0
+            EncodedFrame(nal(if (key) 0x65 else 0x41, 400), bootUptimeUs + i * 33_333L, if (key) FLAG_KEY_FRAME else 0)
+        }
+        val packets = videoPacketsOnTheWire(configure = true, frames = frames)
+        val firstPackets = packets.filter { (it[1].toInt() and 0x40) != 0 }
+        assertEquals(5, firstPackets.size)
+
+        for (pkt in firstPackets) {
+            val pcr = readPcr(pkt)
+            assertNotNull("every frame's first packet should carry a PCR", pcr)
+            val off = payloadOffset(pkt)!!
+            val pts = readPts(pkt.copyOfRange(off, TS_PACKET_SIZE))
+            assertNotNull("PES header with PTS expected at payload start", pts)
+            assertEquals("PCR should trail PTS by the buffer delay", LATENCY_MS * 90, (pts!! - pcr!!) and PTS_MASK)
+        }
+    }
+
+    /** A NAL unit of [type] with a start code and [payloadSize] bytes of body. */
+    private fun nal(type: Int, payloadSize: Int): ByteArray =
+        START_CODE + byteArrayOf(type.toByte()) + ByteArray(payloadSize) { (0x10 + it % 0xE0).toByte() }
+
+    /** Publishes [frames] in caller mode to a loopback socket and returns the video PID's TS packets in order. */
+    private fun videoPacketsOnTheWire(configure: Boolean, frames: List<EncodedFrame>): List<ByteArray> {
+        DatagramSocket(0, InetAddress.getLoopbackAddress()).use { receiver ->
+            receiver.soTimeout = 300
+            val caller = MpegTsUdpPublisher(
+                MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = receiver.localPort)
+            )
+            if (configure) caller.setCodecConfig(VideoCodec.H264, SPS, PPS)
+            assertTrue("publisher should start", caller.start())
+            try {
+                frames.forEach { caller.sendFrame(it) }
+            } finally {
+                caller.stop()
+            }
+
+            val packets = mutableListOf<ByteArray>()
+            val buf = ByteArray(65535)
+            while (true) {
+                val datagram = DatagramPacket(buf, buf.size)
+                try {
+                    receiver.receive(datagram)
+                } catch (expected: SocketTimeoutException) {
+                    break
+                }
+                assertEquals("datagram should hold whole TS packets", 0, datagram.length % TS_PACKET_SIZE)
+                for (off in 0 until datagram.length step TS_PACKET_SIZE) {
+                    packets.add(buf.copyOfRange(off, off + TS_PACKET_SIZE))
+                }
+            }
+            return packets.filter { ((it[1].toInt() and 0x1F) shl 8) or (it[2].toInt() and 0xFF) == VIDEO_PID }
+        }
+    }
+
+    /** The elementary stream of every PES on the video PID, in order, as a demuxer would reassemble it. */
+    private fun elementaryStreamsOnTheWire(configure: Boolean, frames: List<EncodedFrame>): List<ByteArray> {
+        val pesList = mutableListOf<ByteArray>()
+        var current: ByteArrayOutputStream? = null
+        for (pkt in videoPacketsOnTheWire(configure, frames)) {
+            if ((pkt[1].toInt() and 0x40) != 0) {
+                current?.let { pesList.add(it.toByteArray()) }
+                current = ByteArrayOutputStream()
+            }
+            val off = payloadOffset(pkt) ?: continue
+            current?.write(pkt, off, TS_PACKET_SIZE - off)
+        }
+        current?.let { pesList.add(it.toByteArray()) }
+        // 9-byte PES header plus the 5-byte PTS field precede the access unit.
+        return pesList.map { it.copyOfRange(14, it.size) }
     }
 
     // -----------------------------------------------------------------
