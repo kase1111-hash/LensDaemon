@@ -1,6 +1,7 @@
 package com.lensdaemon.output
 
 import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.NalUnitParser
 import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
@@ -89,6 +90,9 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
     private var pps: ByteArray? = null
     private var vps: ByteArray? = null
 
+    /** Extracts parameter sets from codec-config buffers and in-band keyframes. */
+    private var nalParser = NalUnitParser(isHevc = false)
+
     private var continuityCounters = IntArray(8192)
     private var lastPatPmtTime = 0L
     private var startTimeMs = 0L
@@ -109,6 +113,7 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         this.sps = sps
         this.pps = pps
         this.vps = vps
+        nalParser = NalUnitParser(isHevc = codec == VideoCodec.H265)
         Timber.d("$TAG: Codec config set - codec=$codec, sps=${sps?.size}, pps=${pps?.size}, vps=${vps?.size}")
     }
 
@@ -169,8 +174,18 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
 
     fun sendFrame(frame: EncodedFrame) {
         if (!isRunning.get()) return
+        if (frame.isConfigFrame) {
+            // MediaCodec hands over SPS/PPS (and VPS) in a codec-config buffer
+            // only once the first frame has been encoded, which is after this
+            // publisher was configured from whatever the encoder had cached at
+            // the time: nothing, on a freshly initialized encoder. Keep them so
+            // every keyframe is self-describing. This runs before the peer check
+            // so a listener-mode publisher still learns them while it is waiting
+            // for its first viewer.
+            cacheParameterSets(frame.data)
+            return
+        }
         val target = remoteAddress ?: return
-        if (frame.isConfigFrame) return
 
         try {
             val now = System.currentTimeMillis()
@@ -336,7 +351,15 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         return buf.array()
     }
 
+    /**
+     * Prefix a keyframe with the parameter sets a decoder needs to start from
+     * it. Encoders that already inline SPS/PPS into their IDR buffers are left
+     * alone; their in-band copies refresh the cache instead, so a later change
+     * of resolution or profile is carried forward.
+     */
     private fun buildKeyframeAU(frameData: ByteArray): ByteArray {
+        if (cacheParameterSets(frameData)) return frameData
+
         val startCode = byteArrayOf(0x00, 0x00, 0x00, 0x01)
         val parts = mutableListOf<ByteArray>()
         if (codec == VideoCodec.H265) vps?.let { parts.add(startCode); parts.add(it) }
@@ -348,6 +371,17 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         var off = 0
         for (part in parts) { System.arraycopy(part, 0, result, off, part.size); off += part.size }
         return result
+    }
+
+    /**
+     * Cache any SPS/PPS/VPS carried in [data]. Returns true if it carried any.
+     */
+    private fun cacheParameterSets(data: ByteArray): Boolean {
+        val units = nalParser.parse(data)
+        nalParser.sps?.let { sps = it }
+        nalParser.pps?.let { pps = it }
+        nalParser.vps?.let { vps = it }
+        return units.any { it.isConfigData }
     }
 
     private fun writePts(buf: ByteBuffer, pts: Long) {
