@@ -4,9 +4,11 @@ import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
 import timber.log.Timber
-import java.io.BufferedReader
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.EOFException
+import java.io.IOException
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
@@ -59,6 +61,10 @@ class RtspSession(
         private const val STALLED_CLIENT_TIMEOUT_MS = 10_000L
 
         private const val WRITER_POLL_MS = 250L
+
+        /** First byte of an interleaved binary frame on the control connection (RFC 2326 section 10.12). */
+        private const val INTERLEAVED_MAGIC = '$'.code
+        private const val INTERLEAVED_HEADER_LEN = 3
     }
 
     // Session identification
@@ -89,7 +95,7 @@ class RtspSession(
     // I/O streams
     private var inputStream: InputStream? = null
     private var outputStream: OutputStream? = null
-    private var reader: BufferedReader? = null
+    private var input: BufferedInputStream? = null
 
     // Coroutine scope for this session
     private val sessionScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -135,7 +141,7 @@ class RtspSession(
             socket.soTimeout = READ_TIMEOUT_MS
             inputStream = socket.getInputStream()
             outputStream = socket.getOutputStream()
-            reader = BufferedReader(InputStreamReader(inputStream ?: return))
+            input = BufferedInputStream(inputStream ?: return)
             Timber.i("$TAG: Session $sessionId initialized from ${clientAddress.hostAddress}:$clientPort")
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to initialize session")
@@ -210,38 +216,76 @@ class RtspSession(
     }
 
     /**
-     * Read RTSP request from client
+     * Read the next RTSP request from the control connection.
+     *
+     * A TCP-interleaved client sends its RTCP receiver reports on this same
+     * connection as binary frames ("$", channel, length, data; RFC 2326
+     * section 10.12). Those are consumed here, folded into the session
+     * statistics, and never reach the request parser.
+     *
+     * Returns null once the peer has hung up or sent something unparseable.
+     * A read timeout while waiting at a message boundary propagates so the
+     * caller can keep waiting; one that strikes mid-message leaves the stream
+     * out of sync and is treated as a dead connection.
      */
     private fun readRequest(): RtspRequest? {
-        val sb = StringBuilder()
-        var contentLength = 0
+        val input = this.input ?: return null
 
-        try {
-            // Read headers
-            var line = reader?.readLine() ?: return null
-            while (line.isNotEmpty()) {
-                sb.append(line).append("\r\n")
-                if (line.startsWith("Content-Length:", ignoreCase = true)) {
-                    contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
-                }
-                line = reader?.readLine() ?: return null
-            }
-            sb.append("\r\n")
+        var first = input.read()
+        while (first == INTERLEAVED_MAGIC) {
+            consumeInterleavedFrame(input)
+            first = input.read()
+        }
+        if (first < 0) return null
 
-            // Read body if present
-            if (contentLength > 0) {
-                val body = CharArray(contentLength)
-                reader?.read(body, 0, contentLength)
-                sb.append(body)
-            }
-
-            return RtspRequest.parse(sb.toString())
+        return try {
+            readRtspMessage(input, first)
         } catch (e: SocketTimeoutException) {
-            // Surfaced to the request loop, which keeps the session alive.
-            throw e
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Error reading request")
-            return null
+            Timber.w("$TAG: Session $sessionId stalled mid-request (${e.message}); dropping connection")
+            null
+        } catch (e: IOException) {
+            if (isRunning.get()) {
+                Timber.e(e, "$TAG: Error reading request")
+            }
+            null
+        }
+    }
+
+    /**
+     * Consume one interleaved frame and apply any RTCP receiver reports it
+     * carries. Anything the client sends counts as liveness.
+     */
+    private fun consumeInterleavedFrame(input: InputStream) {
+        val header = ByteArray(INTERLEAVED_HEADER_LEN)
+        readFully(input, header)
+        val channel = header[0].toInt() and 0xFF
+        val length = ((header[1].toInt() and 0xFF) shl 8) or (header[2].toInt() and 0xFF)
+        val data = ByteArray(length)
+        readFully(input, data)
+
+        lastActivityMs = System.currentTimeMillis()
+        if (channel == transportParams?.interleavedRtcpChannel) {
+            applyReceiverReports(RtcpParser.parseReceiverReports(data))
+        } else {
+            Timber.tag(TAG).v("Session $sessionId: ignoring $length-byte interleaved frame on channel $channel")
+        }
+    }
+
+    /**
+     * Fold client receiver reports into the session's loss and jitter metrics.
+     */
+    private fun applyReceiverReports(reports: List<RtcpParser.ReceiverReport>) {
+        for (report in reports) {
+            lastFractionLost = report.fractionLost
+            lastCumulativeLost = report.cumulativeLost
+            lastJitter = report.jitter
+            lastActivityMs = System.currentTimeMillis()
+
+            if (report.lossPercent > 5f) {
+                Timber.tag(TAG).w(
+                    "Session $sessionId: loss=${report.lossPercent}%, jitter=${report.jitter}"
+                )
+            }
         }
     }
 
@@ -368,21 +412,7 @@ class RtspSession(
             while (isRunning.get() && !socket.isClosed) {
                 try {
                     socket.receive(packet)
-                    val reports = RtcpParser.parseReceiverReports(
-                        buf.copyOf(packet.length)
-                    )
-                    for (report in reports) {
-                        lastFractionLost = report.fractionLost
-                        lastCumulativeLost = report.cumulativeLost
-                        lastJitter = report.jitter
-                        lastActivityMs = System.currentTimeMillis()
-
-                        if (report.lossPercent > 5f) {
-                            Timber.tag(TAG).w(
-                                "Session $sessionId: loss=${report.lossPercent}%, jitter=${report.jitter}"
-                            )
-                        }
-                    }
+                    applyReceiverReports(RtcpParser.parseReceiverReports(buf.copyOf(packet.length)))
                 } catch (e: java.net.SocketTimeoutException) {
                     // Expected — loop and check isRunning
                 } catch (e: Exception) {
@@ -465,9 +495,14 @@ class RtspSession(
      */
     private fun sendResponse(response: RtspResponse) {
         try {
-            val data = response.build()
-            outputStream?.write(data.toByteArray())
-            outputStream?.flush()
+            val data = response.build().toByteArray()
+            val out = outputStream ?: return
+            // Interleaved RTP shares this stream with the writer thread. Hold
+            // the same lock so a response never lands inside an RTP frame.
+            synchronized(out) {
+                out.write(data)
+                out.flush()
+            }
             Timber.v("$TAG: Sent response to $sessionId")
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Error sending response")
@@ -553,7 +588,18 @@ class RtspSession(
 
             val now = System.currentTimeMillis()
             lastWriteCompletedMs = now
-            lastActivityMs = now
+            // Over TCP a completed write proves the peer's host is still there,
+            // so it stands in for a keepalive. Over UDP it proves nothing: a
+            // datagram to a vanished peer never fails, so a silent UDP viewer
+            // must keep sending RTCP or RTSP keepalives or be evicted as idle.
+            if (transportParams?.mode == RtspTransportMode.TCP_INTERLEAVED) {
+                lastActivityMs = now
+            }
+        } catch (e: IOException) {
+            if (isRunning.get()) {
+                Timber.w("$TAG: Session $sessionId: write failed (${e.message}); closing")
+                close()
+            }
         } catch (e: Exception) {
             if (isRunning.get()) {
                 Timber.e(e, "$TAG: Error sending frame to session $sessionId")
@@ -594,23 +640,23 @@ class RtspSession(
     /**
      * Send TCP interleaved packet
      * Format: $ + channel (1 byte) + length (2 bytes) + data
+     *
+     * A failed write means the connection is gone; the IOException propagates
+     * so the writer loop can close the session instead of counting the frame
+     * as delivered.
      */
     private fun sendInterleavedPacket(data: ByteArray, channel: Int) {
-        try {
-            val header = ByteArray(4)
-            header[0] = '$'.code.toByte()
-            header[1] = channel.toByte()
-            header[2] = (data.size shr 8).toByte()
-            header[3] = (data.size and 0xFF).toByte()
+        val header = ByteArray(4)
+        header[0] = '$'.code.toByte()
+        header[1] = channel.toByte()
+        header[2] = (data.size shr 8).toByte()
+        header[3] = (data.size and 0xFF).toByte()
 
-            val out = outputStream ?: return
-            synchronized(out) {
-                out.write(header)
-                out.write(data)
-                out.flush()
-            }
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Error sending interleaved packet")
+        val out = outputStream ?: return
+        synchronized(out) {
+            out.write(header)
+            out.write(data)
+            out.flush()
         }
     }
 
@@ -695,4 +741,68 @@ data class SessionStats(
         get() = if (durationMs > 0) (bytesSent * 8 * 1000) / durationMs else 0
     val lossPercent: Float
         get() = (fractionLost / 256f) * 100f
+}
+
+/** Longest header line accepted from a client before the connection is dropped. */
+private const val MAX_LINE_BYTES = 8192
+
+/** Largest request body accepted from a client. */
+private const val MAX_BODY_BYTES = 65536
+
+/**
+ * Read one RTSP message whose first byte, [firstByte], has already been
+ * consumed. Returns null if the stream ends first.
+ */
+private fun readRtspMessage(input: InputStream, firstByte: Int): RtspRequest? {
+    val sb = StringBuilder()
+    var contentLength = 0
+
+    var line = readAsciiLine(input, firstByte) ?: return null
+    while (line.isNotEmpty()) {
+        sb.append(line).append("\r\n")
+        if (line.startsWith("Content-Length:", ignoreCase = true)) {
+            contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
+        }
+        line = readAsciiLine(input) ?: return null
+    }
+    sb.append("\r\n")
+
+    if (contentLength > MAX_BODY_BYTES) {
+        throw IOException("RTSP body of $contentLength bytes exceeds $MAX_BODY_BYTES")
+    }
+    if (contentLength > 0) {
+        val body = ByteArray(contentLength)
+        readFully(input, body)
+        sb.append(String(body, Charsets.ISO_8859_1))
+    }
+    return RtspRequest.parse(sb.toString())
+}
+
+/**
+ * Read one CRLF-terminated line as ISO-8859-1 without its terminator.
+ * [firstByte], when non-negative, is a byte already consumed that starts the
+ * line. Returns null at end of stream.
+ */
+private fun readAsciiLine(input: InputStream, firstByte: Int = -1): String? {
+    val bytes = ByteArrayOutputStream()
+    var b = if (firstByte >= 0) firstByte else input.read()
+    while (b >= 0 && b != '\n'.code) {
+        bytes.write(b)
+        if (bytes.size() > MAX_LINE_BYTES) {
+            throw IOException("RTSP header line exceeds $MAX_LINE_BYTES bytes")
+        }
+        b = input.read()
+    }
+    if (b < 0 && bytes.size() == 0) return null
+    return String(bytes.toByteArray(), Charsets.ISO_8859_1).removeSuffix("\r")
+}
+
+/** Fill [buffer] completely or throw [EOFException]. */
+private fun readFully(input: InputStream, buffer: ByteArray) {
+    var offset = 0
+    while (offset < buffer.size) {
+        val n = input.read(buffer, offset, buffer.size - offset)
+        if (n < 0) throw EOFException("Connection closed after $offset of ${buffer.size} bytes")
+        offset += n
+    }
 }

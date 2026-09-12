@@ -10,6 +10,7 @@ import timber.log.Timber
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -240,8 +241,11 @@ class RtspServer(
                 val clientSocket = withContext(Dispatchers.IO) {
                     try {
                         serverSocket?.accept()
+                    } catch (ignored: SocketTimeoutException) {
+                        // Accept timeout: loop so a stop() is noticed promptly
+                        null
                     } catch (e: SocketException) {
-                        // Timeout or socket closed
+                        // Socket closed
                         null
                     }
                 }
