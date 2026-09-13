@@ -34,6 +34,12 @@ import kotlin.coroutines.suspendCoroutine
  */
 class LensDaemonCameraManager(private val context: Context) {
 
+    companion object {
+        private const val SESSION_CLOSE_TIMEOUT_MS = 1000L
+        private const val SESSION_CREATE_ATTEMPTS = 2
+        private const val SESSION_RETRY_DELAY_MS = 150L
+    }
+
     private val cameraManager: CameraManager =
         context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
@@ -72,6 +78,10 @@ class LensDaemonCameraManager(private val context: Context) {
 
     /** Serializes session (re)configuration so surface changes never interleave. */
     private val sessionMutex = Mutex()
+
+    /** The session being closed by a reconfigure, so its onClosed can be awaited. */
+    @Volatile
+    private var closingSession: Pair<CameraCaptureSession, CompletableDeferred<Unit>>? = null
 
     /**
      * Receives each captured YUV image, still open, on the camera thread.
@@ -544,6 +554,9 @@ class LensDaemonCameraManager(private val context: Context) {
                 if (captureSession == session) {
                     captureSession = null
                 }
+                closingSession?.let { (closing, signal) ->
+                    if (closing === session) signal.complete(Unit)
+                }
             }
         }
     }
@@ -651,6 +664,8 @@ class LensDaemonCameraManager(private val context: Context) {
 
         Timber.i("Reconfiguring capture session: $reason")
         _cameraState.value = CameraState.CONFIGURING
+        val closed = CompletableDeferred<Unit>()
+        closingSession = session to closed
         try {
             session.stopRepeating()
             session.close()
@@ -659,13 +674,25 @@ class LensDaemonCameraManager(private val context: Context) {
         }
         captureSession = null
 
-        return try {
-            createSession(device, activeSurfaces())
-        } catch (e: Exception) {
-            Timber.e(e, "Failed to reconfigure capture session")
-            _cameraState.value = CameraState.ERROR
-            false
+        // Some camera HALs (the emulator's among them) refuse a new stream
+        // configuration while the previous session still holds its buffers,
+        // so wait for it to report closed before configuring the next one.
+        if (withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { closed.await() } == null) {
+            Timber.w("Previous capture session did not report closed within $SESSION_CLOSE_TIMEOUT_MS ms")
         }
+        closingSession = null
+
+        repeat(SESSION_CREATE_ATTEMPTS) { attempt ->
+            try {
+                if (createSession(device, activeSurfaces())) return true
+            } catch (e: Exception) {
+                Timber.w(e, "Capture session configuration failed (attempt ${attempt + 1})")
+            }
+            delay(SESSION_RETRY_DELAY_MS)
+        }
+        Timber.e("Failed to reconfigure capture session")
+        _cameraState.value = CameraState.ERROR
+        return false
     }
 
     /**

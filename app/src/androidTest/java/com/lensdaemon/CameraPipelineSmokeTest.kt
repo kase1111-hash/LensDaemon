@@ -9,7 +9,9 @@ import android.media.MediaFormat
 import android.os.Handler
 import android.os.HandlerThread
 import android.util.Size
+import android.os.ParcelFileDescriptor
 import androidx.test.core.app.ApplicationProvider
+import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.GrantPermissionRule
 import com.lensdaemon.camera.CaptureConfig
@@ -127,7 +129,8 @@ class CameraPipelineSmokeTest {
         val frames = CountDownLatch(5)
         encoder.setFrameCallback { frame -> if (!frame.isConfigFrame) frames.countDown() }
 
-        runBlocking { assertTrue("encoder surface should attach to the live session", manager.addEncoderSurface(encoderSurface)) }
+        val attached = runBlocking { manager.addEncoderSurface(encoderSurface) }
+        assertTrue("encoder surface should attach to the live session\n" + recentCameraLog(), attached)
         assertTrue("encoder should start", encoder.start())
         assertTrue("encoder should receive frames after the session was rebuilt", frames.await(20, TimeUnit.SECONDS))
 
@@ -139,6 +142,20 @@ class CameraPipelineSmokeTest {
             Handler(consumerThread.looper)
         )
         assertTrue("preview should keep running after the encoder was detached", previewFrames.await(10, TimeUnit.SECONDS))
+    }
+
+    /** Recent camera-related logcat lines, for failure diagnostics. */
+    private fun recentCameraLog(): String {
+        return try {
+            val pfd = InstrumentationRegistry.getInstrumentation().uiAutomation
+                .executeShellCommand("logcat -d -t 400")
+            ParcelFileDescriptor.AutoCloseInputStream(pfd).bufferedReader().readLines()
+                .filter { line -> Regex("Camera|LensDaemon|Reconfig|Session|Encoder|configure").containsMatchIn(line) }
+                .takeLast(60)
+                .joinToString("\n")
+        } catch (e: Exception) {
+            "(logcat unavailable: ${e.message})"
+        }
     }
 
     @Test
