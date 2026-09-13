@@ -73,6 +73,13 @@ class LensDaemonCameraManager(private val context: Context) {
     /** Serializes session (re)configuration so surface changes never interleave. */
     private val sessionMutex = Mutex()
 
+    /**
+     * Receives each captured YUV image, still open, on the camera thread.
+     * Must return quickly; the image is closed when the callback returns.
+     */
+    @Volatile
+    var onImageAvailable: ((android.media.Image) -> Unit)? = null
+
     init {
         enumerateCameras()
     }
@@ -446,6 +453,13 @@ class LensDaemonCameraManager(private val context: Context) {
             setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
+                    onImageAvailable?.let { hook ->
+                        try {
+                            hook(image)
+                        } catch (e: Exception) {
+                            Timber.w(e, "Image hook failed")
+                        }
+                    }
                     val frame = CameraFrame(
                         timestamp = image.timestamp,
                         width = image.width,

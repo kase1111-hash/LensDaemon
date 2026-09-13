@@ -64,6 +64,8 @@ class CameraService : Service() {
                 action = ACTION_STOP_PREVIEW
             }
         }
+
+        private const val SNAPSHOT_TIMEOUT_MS = 3000L
     }
 
     private val binder = LocalBinder()
@@ -104,6 +106,9 @@ class CameraService : Service() {
      * each frame several times.
      */
     private val encoderFrameListener: (EncodedFrame) -> Unit = { frame -> dispatchEncodedFrame(frame) }
+
+    // Preview frames for the dashboard (MJPEG stream and snapshots)
+    private val previewFrameGrabber = PreviewFrameGrabber()
 
     // Encoder state observable
     private val _encoderState = MutableStateFlow(EncoderState.IDLE)
@@ -157,6 +162,7 @@ class CameraService : Service() {
 
         val systemCameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         lensDaemonCameraManager = LensDaemonCameraManager(applicationContext)
+        lensDaemonCameraManager.onImageAvailable = previewFrameGrabber::onImage
 
         // Initialize lens controller with available lenses
         lensController = LensController(systemCameraManager, lensDaemonCameraManager.availableLenses)
@@ -874,6 +880,30 @@ class CameraService : Service() {
      * Get encoder surface for multi-surface capture.
      */
     fun getEncoderSurface(): Surface? = encoderSurface
+
+    // ==================== Preview frames (MJPEG / snapshot) ====================
+
+    /**
+     * Route JPEG preview frames to [sink] while [demand] reports that someone
+     * is watching (for example the MJPEG stream has clients).
+     */
+    fun setPreviewFrameSink(demand: () -> Boolean, sink: (ByteArray) -> Unit) {
+        previewFrameGrabber.streamDemand = demand
+        previewFrameGrabber.streamSink = sink
+    }
+
+    fun clearPreviewFrameSink() {
+        previewFrameGrabber.streamSink = null
+        previewFrameGrabber.streamDemand = { false }
+    }
+
+    /**
+     * Capture the next preview frame as a JPEG. Blocks the calling thread
+     * (never the main thread) and returns null if the camera delivers nothing
+     * within [timeoutMs].
+     */
+    fun captureSnapshot(timeoutMs: Long = SNAPSHOT_TIMEOUT_MS): ByteArray? =
+        previewFrameGrabber.captureSnapshot(timeoutMs)
 
     /**
      * Get SPS data for streaming setup.

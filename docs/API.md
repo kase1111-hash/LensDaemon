@@ -4,7 +4,7 @@ Base URL: `http://{device-ip}:8080`
 
 ## Authentication
 
-Authentication is optional and controlled by the `apiToken` configuration property. When enabled, include the token with every request using one of two methods:
+Authentication is optional and off by default. A Bearer token can be set programmatically through `WebServerService.setApiToken` (it is persisted in the app's private preferences); there is no dashboard UI or API endpoint for it yet, and the bundled dashboard does not send a token, so enable it only for headless API use. When enabled, include the token with every request using one of two methods:
 
 **Header (preferred):**
 ```

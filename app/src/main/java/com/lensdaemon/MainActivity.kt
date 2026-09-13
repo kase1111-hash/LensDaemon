@@ -29,6 +29,7 @@ import com.lensdaemon.camera.CameraState
 import com.lensdaemon.camera.FocusState
 import com.lensdaemon.camera.LensType
 import com.lensdaemon.databinding.ActivityMainBinding
+import com.lensdaemon.web.WebServerService
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import timber.log.Timber
@@ -53,21 +54,32 @@ class MainActivity : AppCompatActivity() {
     private val focusHandler = Handler(Looper.getMainLooper())
     private val hideFocusIndicatorRunnable = Runnable { hideFocusIndicator() }
 
-    private val requiredPermissions = arrayOf(
-        Manifest.permission.CAMERA,
-        Manifest.permission.RECORD_AUDIO,
-        Manifest.permission.POST_NOTIFICATIONS
-    )
+    /**
+     * Only permissions the app actually uses and the platform knows about.
+     * Requesting an undeclared permission (audio is not captured) or the
+     * notification permission on Android 12 and below is refused outright and
+     * used to stop the launch flow before the camera ever started.
+     */
+    private val requiredPermissions: Array<String> = buildList {
+        add(Manifest.permission.CAMERA)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+    }.toTypedArray()
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
-        val allGranted = permissions.entries.all { it.value }
-        if (allGranted) {
-            Timber.i("All permissions granted")
+        val denied = permissions.filterValues { !it }.keys
+        val cameraGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        if (cameraGranted) {
+            if (denied.isNotEmpty()) {
+                Timber.w("Optional permissions denied: $denied")
+            }
             startCameraService()
         } else {
-            Timber.w("Some permissions denied: ${permissions.filter { !it.value }.keys}")
+            Timber.w("Camera permission denied")
             showPermissionDeniedMessage()
         }
     }
@@ -307,6 +319,10 @@ class MainActivity : AppCompatActivity() {
 
         // Bind to service
         bindService(intent, serviceConnection, Context.BIND_AUTO_CREATE)
+
+        // The dashboard and REST API run in their own foreground service; the
+        // documented flow is "open the app, then browse to http://<ip>:8080".
+        ContextCompat.startForegroundService(this, WebServerService.createStartIntent(this))
     }
 
     private fun onCameraServiceConnected() {
@@ -422,7 +438,7 @@ class MainActivity : AppCompatActivity() {
     private fun showPermissionDeniedMessage() {
         Toast.makeText(
             this,
-            "Camera and audio permissions are required for streaming",
+            "Camera permission is required for streaming",
             Toast.LENGTH_LONG
         ).show()
         binding.tvStatus.text = "Permissions required"

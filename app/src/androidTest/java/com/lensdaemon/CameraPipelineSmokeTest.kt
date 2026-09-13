@@ -15,6 +15,8 @@ import androidx.test.rule.GrantPermissionRule
 import com.lensdaemon.camera.CaptureConfig
 import com.lensdaemon.camera.LensDaemonCameraManager
 import com.lensdaemon.camera.LensType
+import com.lensdaemon.camera.PreviewFrameGrabber
+import android.graphics.BitmapFactory
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.encoder.VideoEncoder
@@ -193,5 +195,31 @@ class CameraPipelineSmokeTest {
         } finally {
             extractor.release()
         }
+    }
+
+    @Test
+    fun previewFramesCanBeGrabbedAsJpegSnapshots() {
+        val grabber = PreviewFrameGrabber()
+        manager.onImageAvailable = grabber::onImage
+
+        runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("preview should start", manager.startPreview(previewReader.surface, CaptureConfig(resolution = size)))
+        }
+
+        val jpeg = grabber.captureSnapshot(10_000)
+        assertNotNull("a snapshot should be captured from the live preview", jpeg)
+        assertTrue("snapshot should be a JPEG", jpeg!!.size > 2 && jpeg[0] == 0xFF.toByte() && jpeg[1] == 0xD8.toByte())
+
+        val bitmap = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
+        assertNotNull("snapshot should decode", bitmap)
+        assertEquals(size.width, bitmap!!.width)
+        assertEquals(size.height, bitmap.height)
+
+        // Stream frames flow only while there is demand, and are rate limited
+        val streamed = CountDownLatch(3)
+        grabber.streamSink = { streamed.countDown() }
+        grabber.streamDemand = { true }
+        assertTrue("stream frames should arrive while demanded", streamed.await(10, TimeUnit.SECONDS))
     }
 }
