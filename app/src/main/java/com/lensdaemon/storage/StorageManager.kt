@@ -115,6 +115,17 @@ class StorageManager(
 
     private var retentionJob: Job? = null
     private var videoFormat: MediaFormat? = null
+    private var sps: ByteArray? = null
+    private var pps: ByteArray? = null
+    private var vps: ByteArray? = null
+
+    /** Forwarded to the file writer: invoked whenever a segment needs a keyframe to open. */
+    @Volatile
+    var onKeyFrameRequest: (() -> Unit)? = null
+        set(value) {
+            field = value
+            fileWriter?.onKeyFrameRequest = value
+        }
 
     private val listeners = mutableListOf<RecordingListener>()
 
@@ -130,9 +141,15 @@ class StorageManager(
      * Set the video format from encoder output
      * Must be called before starting recording
      */
-    fun setVideoFormat(format: MediaFormat) {
+    fun setVideoFormat(format: MediaFormat, sps: ByteArray? = null, pps: ByteArray? = null, vps: ByteArray? = null) {
         this.videoFormat = format
+        // Parameter sets let a segment open before the stream has carried them
+        // (a recording started mid-stream), when the format itself has no csd.
+        this.sps = sps
+        this.pps = pps
+        this.vps = vps
         fileWriter?.setVideoFormat(format)
+        fileWriter?.setParameterSets(sps, pps, vps)
         Timber.tag(TAG).d("Video format set")
     }
 
@@ -175,6 +192,8 @@ class StorageManager(
         val writer = FileWriter(context, writerConfig)
         writer.addListener(this)
         writer.setVideoFormat(format)
+        writer.setParameterSets(sps, pps, vps)
+        writer.onKeyFrameRequest = onKeyFrameRequest
 
         if (!writer.startRecording()) {
             Timber.tag(TAG).e("Failed to start file writer")

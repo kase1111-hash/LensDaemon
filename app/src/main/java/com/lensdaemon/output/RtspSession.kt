@@ -158,15 +158,20 @@ class RtspSession(
         pps: ByteArray?,
         vps: ByteArray? = null
     ) {
+        val codecChanged = this.codec != codec
         this.codec = codec
         this.sps = sps
         this.pps = pps
         this.vps = vps
 
-        // Create appropriate packetizer
-        rtpPacketizer = when (codec) {
-            VideoCodec.H264 -> RtpPacketizerFactory.createH264Packetizer()
-            VideoCodec.H265 -> RtpPacketizerFactory.createH265Packetizer()
+        // Keep a playing session's packetizer (SSRC, sequence and timestamp
+        // base) when only the parameter sets change: replacing it mid-stream
+        // looks like a brand new source to the player.
+        if (rtpPacketizer == null || codecChanged) {
+            rtpPacketizer = when (codec) {
+                VideoCodec.H264 -> RtpPacketizerFactory.createH264Packetizer()
+                VideoCodec.H265 -> RtpPacketizerFactory.createH265Packetizer()
+            }
         }
     }
 
@@ -230,24 +235,28 @@ class RtspSession(
      */
     private fun readRequest(): RtspRequest? {
         val input = this.input ?: return null
-
-        var first = input.read()
-        while (first == INTERLEAVED_MAGIC) {
-            consumeInterleavedFrame(input)
-            first = input.read()
-        }
-        if (first < 0) return null
-
-        return try {
-            readRtspMessage(input, first)
+        var atBoundary = true
+        try {
+            var first = input.read()
+            while (first == INTERLEAVED_MAGIC) {
+                atBoundary = false
+                consumeInterleavedFrame(input)
+                atBoundary = true
+                first = input.read()
+            }
+            if (first < 0) return null
+            atBoundary = false
+            return readRtspMessage(input, first)
         } catch (e: SocketTimeoutException) {
-            Timber.w("$TAG: Session $sessionId stalled mid-request (${e.message}); dropping connection")
-            null
+            // Silence at a message boundary is fine: the caller keeps waiting.
+            if (atBoundary) throw e
+            Timber.w("$TAG: Session $sessionId stalled mid-message (${e.message}); dropping connection")
+            return null
         } catch (e: IOException) {
             if (isRunning.get()) {
-                Timber.e(e, "$TAG: Error reading request")
+                Timber.w("$TAG: Session $sessionId connection ended (${e.message})")
             }
-            null
+            return null
         }
     }
 

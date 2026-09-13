@@ -162,6 +162,10 @@ class VideoEncoder(
         if (_state.value != EncoderState.IDLE) {
             return Result.failure(IllegalStateException("Encoder not in IDLE state"))
         }
+        if (mediaCodec != null) {
+            // A stopped codec is still held: release it before building a new one
+            release()
+        }
 
         _state.value = EncoderState.CONFIGURING
 
@@ -219,15 +223,16 @@ class VideoEncoder(
     }
 
     /**
-     * Start encoding
+     * Start encoding.
+     * @return true if the codec is now running
      */
-    fun start() {
+    fun start(): Boolean {
         if (_state.value != EncoderState.READY) {
-            Timber.w("$TAG: Cannot start - not in READY state")
-            return
+            Timber.w("$TAG: Cannot start - not in READY state (${_state.value})")
+            return false
         }
 
-        try {
+        return try {
             isRunning.set(true)
             isPaused.set(false)
             framesEncoded.set(0)
@@ -243,15 +248,20 @@ class VideoEncoder(
             _stats.value = EncoderStats(startTimeMs = encodingStartTime)
 
             Timber.i("$TAG: Encoding started")
-
+            true
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to start encoder")
             _state.value = EncoderState.ERROR
+            false
         }
     }
 
     /**
-     * Stop encoding
+     * Stop encoding.
+     *
+     * A stopped MediaCodec cannot simply be started again: it must be
+     * configured afresh and hands out a new input surface. The encoder is
+     * therefore left in IDLE and callers build a new one for the next session.
      */
     fun stop() {
         if (_state.value != EncoderState.ENCODING) {
@@ -268,7 +278,7 @@ class VideoEncoder(
             // Stop codec
             mediaCodec?.stop()
 
-            _state.value = EncoderState.READY
+            _state.value = EncoderState.IDLE
             Timber.i("$TAG: Encoding stopped. Frames: ${framesEncoded.get()}, Dropped: ${framesDropped.get()}")
 
         } catch (e: Exception) {

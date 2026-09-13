@@ -97,6 +97,14 @@ class CameraService : Service() {
     @Volatile private var encoderBound = false
     private var encoderSurface: Surface? = null
 
+    /**
+     * The one dispatch hook registered on the encoder service. It is
+     * re-registered (remove, then add) on every encoder initialization so
+     * start/stop cycles never stack duplicate listeners that would deliver
+     * each frame several times.
+     */
+    private val encoderFrameListener: (EncodedFrame) -> Unit = { frame -> dispatchEncodedFrame(frame) }
+
     // Encoder state observable
     private val _encoderState = MutableStateFlow(EncoderState.IDLE)
     val encoderState: StateFlow<EncoderState> = _encoderState
@@ -692,18 +700,41 @@ class CameraService : Service() {
             return false
         }
 
-        encoderSurface = encoderService?.initializeEncoder(config)
-        if (encoderSurface == null) {
+        val surface = encoderService?.initializeEncoder(config)
+        if (surface == null) {
             Timber.e("Failed to initialize encoder")
             return false
         }
+        encoderSurface = surface
 
-        // Set up frame listener to dispatch to registered listeners
-        encoderService?.addFrameListener { frame ->
-            dispatchEncodedFrame(frame)
+        // Dispatch encoded frames to the registered outputs, exactly once per frame
+        encoderService?.removeFrameListener(encoderFrameListener)
+        encoderService?.addFrameListener(encoderFrameListener)
+
+        // Hand the encoder's input surface to the camera. The capture session is
+        // rebuilt with it as a target; until that completes the codec simply
+        // waits for its first frame.
+        serviceScope.launch {
+            if (!lensDaemonCameraManager.addEncoderSurface(surface)) {
+                Timber.e("Camera could not attach the encoder surface; nothing will be encoded")
+            }
         }
 
         Timber.i("Encoder initialized: ${config.width}x${config.height} @ ${config.bitrateBps}bps")
+        return true
+    }
+
+    /**
+     * Start the initialized encoder and mark streaming active.
+     * @return false if the encoder refused to start
+     */
+    private fun beginEncoding(): Boolean {
+        if (encoderService?.startEncoding() != true) {
+            Timber.e("Encoder failed to start")
+            return false
+        }
+        isStreamingActive = true
+        updateNotification()
         return true
     }
 
@@ -735,19 +766,17 @@ class CameraService : Service() {
             return
         }
 
-        if (encoderSurface == null) {
-            // Initialize encoder with default config
-            if (!initializeEncoder()) {
-                Timber.e("Failed to initialize encoder for streaming")
-                return
-            }
+        // A stopped MediaCodec cannot be restarted, so anything but a freshly
+        // initialized encoder is replaced.
+        val freshEncoder = encoderSurface != null && encoderService?.encoderState?.value == EncoderState.READY
+        if (!freshEncoder && !initializeEncoder()) {
+            Timber.e("Failed to initialize encoder for streaming")
+            return
         }
 
-        // Start encoding
-        encoderService?.startEncoding()
-        isStreamingActive = true
-        updateNotification()
-        Timber.i("Streaming started")
+        if (beginEncoding()) {
+            Timber.i("Streaming started")
+        }
     }
 
     /**
@@ -765,11 +794,9 @@ class CameraService : Service() {
             return
         }
 
-        // Start encoding
-        encoderService?.startEncoding()
-        isStreamingActive = true
-        updateNotification()
-        Timber.i("Streaming started with config: ${config.width}x${config.height}")
+        if (beginEncoding()) {
+            Timber.i("Streaming started with config: ${config.width}x${config.height}")
+        }
     }
 
     /**
@@ -778,19 +805,34 @@ class CameraService : Service() {
     fun stopStreaming() {
         if (!isStreamingActive) return
 
-        encoderService?.stopEncoding()
         isStreamingActive = false
         updateNotification()
-        Timber.i("Streaming stopped")
+
+        // Detach the encoder surface from the camera first so it never renders
+        // into a dead surface, then drop the encoder: a stopped MediaCodec
+        // cannot be restarted, so the next start builds a fresh one.
+        serviceScope.launch {
+            lensDaemonCameraManager.removeEncoderSurface()
+            if (!isStreamingActive) {
+                encoderService?.stopEncoding()
+                encoderService?.releaseEncoder()
+                encoderSurface = null
+            }
+            Timber.i("Streaming stopped")
+        }
     }
 
     /**
      * Release encoder resources.
      */
     fun releaseEncoder() {
-        encoderService?.releaseEncoder()
-        encoderSurface = null
-        Timber.i("Encoder released")
+        isStreamingActive = false
+        serviceScope.launch {
+            lensDaemonCameraManager.removeEncoderSurface()
+            encoderService?.releaseEncoder()
+            encoderSurface = null
+            Timber.i("Encoder released")
+        }
     }
 
     /**
@@ -949,8 +991,9 @@ class CameraService : Service() {
             return false
         }
 
-        encoderService?.startEncoding()
-        isStreamingActive = true
+        if (!beginEncoding()) {
+            return false
+        }
 
         val rtspStarted = startRtspServer(rtspPort)
         if (!rtspStarted) {
@@ -1011,8 +1054,9 @@ class CameraService : Service() {
             return false
         }
 
-        encoderService?.startEncoding()
-        isStreamingActive = true
+        if (!beginEncoding()) {
+            return false
+        }
 
         val started = startMpegTsPublisher(mpegtsConfig)
         if (!started) {
@@ -1054,8 +1098,12 @@ class CameraService : Service() {
 
         val format = encoderService?.getOutputFormat()
         if (format != null) {
-            recordingCoordinator.setVideoFormat(format)
+            // The format lacks csd until the encoder has produced output; the
+            // cached parameter sets (or the stream itself) complete it.
+            recordingCoordinator.setVideoFormat(format, getSps(), getPps(), getVps())
         }
+        // Every segment opens on a requested keyframe
+        recordingCoordinator.onKeyFrameRequest = { encoderService?.requestKeyFrame() }
 
         frameDistributor.addListener(recordingCoordinator.frameListener)
 
@@ -1074,8 +1122,9 @@ class CameraService : Service() {
             if (!initializeEncoder(config)) {
                 return false
             }
-            encoderService?.startEncoding()
-            isStreamingActive = true
+            if (!beginEncoding()) {
+                return false
+            }
         }
 
         if (!recordingCoordinator.isInitialized()) {

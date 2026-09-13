@@ -5,6 +5,9 @@ import android.media.MediaFormat
 import android.os.Build
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
+import com.lensdaemon.encoder.NalUnitParser
+import com.lensdaemon.encoder.VideoCodec
+import java.nio.ByteBuffer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -163,6 +166,24 @@ class FileWriter(
     private var videoFormat: MediaFormat? = null
     private var segmentJob: Job? = null
 
+    /**
+     * Parameter sets used to complete a track format that carries no csd
+     * (the encoder's configured format, before it has produced any output).
+     * Learned from codec-config buffers and in-band keyframes, or set by
+     * [setParameterSets].
+     */
+    private var sps: ByteArray? = null
+    private var pps: ByteArray? = null
+    private var vps: ByteArray? = null
+    private val nalParser = NalUnitParser(isHevc = config.encoderConfig.codec == VideoCodec.H265)
+
+    /** True until the current segment has been opened on its first keyframe. */
+    private val awaitingKeyFrame = AtomicBoolean(false)
+
+    /** Invoked whenever a segment starts and needs an IDR to begin decodably. */
+    @Volatile
+    var onKeyFrameRequest: (() -> Unit)? = null
+
     private val isRecording = AtomicBoolean(false)
     private val isPaused = AtomicBoolean(false)
 
@@ -194,6 +215,18 @@ class FileWriter(
         synchronized(lock) {
             this.videoFormat = format
             Timber.tag(TAG).d("Video format set: $format")
+        }
+    }
+
+    /**
+     * Supply SPS/PPS (and VPS for H.265) so a segment can open before the
+     * stream has carried them, e.g. a recording started mid-stream.
+     */
+    fun setParameterSets(sps: ByteArray?, pps: ByteArray?, vps: ByteArray?) {
+        synchronized(lock) {
+            sps?.let { this.sps = it }
+            pps?.let { this.pps = it }
+            vps?.let { this.vps = it }
         }
     }
 
@@ -330,9 +363,15 @@ class FileWriter(
 
         val muxer = currentMuxer ?: return false
 
-        // Handle codec config data - update format for new segments
         if (frame.isConfigFrame) {
-            return true // Skip, format is already set
+            learnParameterSets(frame.data)
+            return true
+        }
+
+        // A segment must begin on a keyframe or the first GOP is undecodable
+        if (awaitingKeyFrame.get()) {
+            if (!frame.isKeyFrame) return false
+            if (!openSegmentOnKeyFrame(muxer, frame)) return false
         }
 
         val success = muxer.writeVideoFrame(frame)
@@ -448,30 +487,86 @@ class FileWriter(
             return false
         }
 
-        if (muxer.addVideoTrack(format) < 0) {
-            Timber.tag(TAG).e("Failed to add video track")
-            muxer.release()
-            notifyListeners(RecordingEvent.Error("Failed to add video track"))
-            return false
-        }
-
-        if (!muxer.start()) {
-            Timber.tag(TAG).e("Failed to start muxer")
-            muxer.release()
-            notifyListeners(RecordingEvent.Error("Failed to start muxer"))
-            return false
-        }
-
+        // The video track is added and the muxer started on the segment's first
+        // keyframe (see writeFrame), once the parameter sets are known.
         currentMuxer = muxer
         segmentStartTimeMs = System.currentTimeMillis()
         segmentFrames.set(0)
         segmentBytes.set(0)
+        awaitingKeyFrame.set(true)
+        onKeyFrameRequest?.invoke()
 
         if (segmentIndex > 0) {
             notifyListeners(RecordingEvent.NewSegmentStarted(outputFile.absolutePath, segmentIndex))
         }
 
         return true
+    }
+
+    /**
+     * Add the video track, completing csd from the keyframe's in-band or the
+     * cached parameter sets, and start the muxer.
+     */
+    private fun openSegmentOnKeyFrame(muxer: Mp4Muxer, keyFrame: EncodedFrame): Boolean {
+        synchronized(lock) {
+            if (!awaitingKeyFrame.get()) return true
+
+            learnParameterSets(keyFrame.data)
+            val format = trackFormatWithCsd()
+            if (format == null) {
+                Timber.tag(TAG).w("Keyframe arrived before any parameter sets; waiting for the next one")
+                onKeyFrameRequest?.invoke()
+                return false
+            }
+
+            if (muxer.state == MuxerState.INITIALIZED) {
+                if (muxer.addVideoTrack(format) < 0 || !muxer.start()) {
+                    Timber.tag(TAG).e("Failed to start muxer for ${muxer.getOutputPath()}")
+                    notifyListeners(RecordingEvent.Error("Failed to start muxer"))
+                    return false
+                }
+            }
+            awaitingKeyFrame.set(false)
+            return true
+        }
+    }
+
+    /** Cache any SPS/PPS/VPS carried in [data]. */
+    private fun learnParameterSets(data: ByteArray) {
+        nalParser.parse(data)
+        nalParser.sps?.let { sps = it }
+        nalParser.pps?.let { pps = it }
+        nalParser.vps?.let { vps = it }
+    }
+
+    /**
+     * The track format for MediaMuxer: the encoder's output format when it
+     * already carries csd, otherwise one built from the cached parameter sets.
+     * Null when neither is available yet.
+     */
+    private fun trackFormatWithCsd(): MediaFormat? {
+        val base = videoFormat ?: return null
+        if (base.containsKey("csd-0")) return base
+
+        val cachedSps = sps ?: return null
+        val cachedPps = pps ?: return null
+        val codec = config.encoderConfig.codec
+        val width = if (base.containsKey(MediaFormat.KEY_WIDTH)) base.getInteger(MediaFormat.KEY_WIDTH) else config.encoderConfig.width
+        val height = if (base.containsKey(MediaFormat.KEY_HEIGHT)) base.getInteger(MediaFormat.KEY_HEIGHT) else config.encoderConfig.height
+        val startCode = byteArrayOf(0, 0, 0, 1)
+
+        return MediaFormat.createVideoFormat(codec.mimeType, width, height).apply {
+            when (codec) {
+                VideoCodec.H264 -> {
+                    setByteBuffer("csd-0", ByteBuffer.wrap(startCode + cachedSps))
+                    setByteBuffer("csd-1", ByteBuffer.wrap(startCode + cachedPps))
+                }
+                VideoCodec.H265 -> {
+                    val vpsPart = vps?.let { startCode + it } ?: ByteArray(0)
+                    setByteBuffer("csd-0", ByteBuffer.wrap(vpsPart + startCode + cachedSps + startCode + cachedPps))
+                }
+            }
+        }
     }
 
     /**
