@@ -123,22 +123,32 @@ class FrameProcessor(
     }
 
     /**
-     * Start processing frames
+     * Start processing frames.
+     * @return true if the encoder is now running
      */
-    fun start() {
-        if (_state.value != ProcessorState.READY && _state.value != ProcessorState.PAUSED) {
-            Timber.w("$TAG: Cannot start - not in READY or PAUSED state")
-            return
+    fun start(): Boolean {
+        if (_state.value == ProcessorState.PAUSED) {
+            resume()
+            return true
+        }
+        if (_state.value != ProcessorState.READY) {
+            Timber.w("$TAG: Cannot start - not in READY state (${_state.value})")
+            return false
+        }
+
+        if (encoder?.start() != true) {
+            Timber.e("$TAG: Encoder failed to start")
+            _state.value = ProcessorState.ERROR
+            return false
         }
 
         isRunning.set(true)
         processedFrames.set(0)
         droppedFrames.set(0)
 
-        encoder?.start()
-
         _state.value = ProcessorState.PROCESSING
         Timber.i("$TAG: Frame processing started")
+        return true
     }
 
     /**
@@ -154,7 +164,8 @@ class FrameProcessor(
 
         encoder?.stop()
 
-        _state.value = ProcessorState.READY
+        // The stopped codec cannot be restarted; a new processor is needed
+        _state.value = ProcessorState.IDLE
         Timber.i("$TAG: Frame processing stopped. Processed: ${processedFrames.get()}, Dropped: ${droppedFrames.get()}")
     }
 

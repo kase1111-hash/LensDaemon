@@ -42,6 +42,13 @@ class RecordingCoordinator(
     /** Callback for notification updates when recording state changes */
     var onStateChanged: (() -> Unit)? = null
 
+    /** Invoked whenever a recording segment needs a keyframe to open. */
+    var onKeyFrameRequest: (() -> Unit)? = null
+        set(value) {
+            field = value
+            storageManager?.onKeyFrameRequest = value
+        }
+
     fun initialize(
         encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
         segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
@@ -87,12 +94,17 @@ class RecordingCoordinator(
             }
         })
 
+        storageManager?.onKeyFrameRequest = onKeyFrameRequest
         Timber.i("Storage manager initialized")
         return true
     }
 
-    fun setVideoFormat(format: MediaFormat) {
-        storageManager?.setVideoFormat(format)
+    /**
+     * Set the encoder's format plus SPS/PPS(/VPS) so a segment can open before
+     * the stream has carried them.
+     */
+    fun setVideoFormat(format: MediaFormat, sps: ByteArray? = null, pps: ByteArray? = null, vps: ByteArray? = null) {
+        storageManager?.setVideoFormat(format, sps, pps, vps)
     }
 
     fun startRecording(): Boolean {

@@ -196,19 +196,25 @@ class EncoderService : Service() {
     }
 
     /**
-     * Start encoding
+     * Start encoding.
+     * @return true if the encoder is now running
      */
-    fun startEncoding() {
-        if (frameProcessor == null) {
+    fun startEncoding(): Boolean {
+        val processor = frameProcessor
+        if (processor == null) {
             Timber.w("$TAG: Cannot start - encoder not initialized")
-            return
+            return false
         }
 
-        frameProcessor?.start()
+        if (!processor.start()) {
+            Timber.e("$TAG: Encoder did not start; initialize a new encoder first")
+            return false
+        }
         _isEncoding.value = true
         _encoderState.value = EncoderState.ENCODING
         updateNotification("Encoding: ${currentConfig?.width}x${currentConfig?.height}")
         Timber.i("$TAG: Encoding started")
+        return true
     }
 
     /**
@@ -217,8 +223,9 @@ class EncoderService : Service() {
     fun stopEncoding() {
         frameProcessor?.stop()
         _isEncoding.value = false
-        _encoderState.value = EncoderState.READY
-        updateNotification("Encoder paused")
+        // A stopped codec cannot be restarted: the next start needs initializeEncoder()
+        _encoderState.value = EncoderState.IDLE
+        updateNotification("Encoder stopped")
         Timber.i("$TAG: Encoding stopped")
     }
 

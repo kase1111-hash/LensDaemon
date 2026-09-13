@@ -162,6 +162,10 @@ class VideoEncoder(
         if (_state.value != EncoderState.IDLE) {
             return Result.failure(IllegalStateException("Encoder not in IDLE state"))
         }
+        if (mediaCodec != null) {
+            // A stopped codec is still held: release it before building a new one
+            release()
+        }
 
         _state.value = EncoderState.CONFIGURING
 
@@ -183,14 +187,20 @@ class VideoEncoder(
             mediaCodec = MediaCodec.createByCodecName(encoderInfo.name)
 
             // Configure with format
-            val format = config.toMediaFormat()
-            Timber.d("$TAG: Configuring with format: $format")
+            val format = config.toMediaFormat().also { sanitizeForEncoder(it, capabilities, encoderInfo.name) }
+            Timber.i("$TAG: Configuring ${encoderInfo.name} with format: $format")
 
             val codec = mediaCodec ?: return Result.failure(
                 IllegalStateException("MediaCodec creation returned null")
             )
 
-            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            if (!tryConfigure(codec, format)) {
+                // Some encoders reject tuning keys they do not document as
+                // unsupported. The minimal format is honoured by every encoder.
+                Timber.w("$TAG: ${encoderInfo.name} rejected the requested format; retrying with a minimal one")
+                codec.reset()
+                codec.configure(minimalFormat(), null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            }
 
             // Create input surface
             inputSurface = codec.createInputSurface()
@@ -219,15 +229,68 @@ class VideoEncoder(
     }
 
     /**
-     * Start encoding
+     * Drop or complete format keys the chosen encoder cannot honour. Software
+     * encoders often support only the Baseline profile and some hardware
+     * encoders reject CQ or CBR; asking for what they lack makes configure()
+     * fail outright instead of degrading gracefully.
      */
-    fun start() {
-        if (_state.value != EncoderState.READY) {
-            Timber.w("$TAG: Cannot start - not in READY state")
-            return
+    private fun sanitizeForEncoder(
+        format: MediaFormat,
+        capabilities: MediaCodecInfo.CodecCapabilities,
+        encoderName: String
+    ) {
+        if (format.containsKey(MediaFormat.KEY_PROFILE)) {
+            val profile = format.getInteger(MediaFormat.KEY_PROFILE)
+            val levels = capabilities.profileLevels.filter { it.profile == profile }
+            if (levels.isEmpty()) {
+                Timber.w("$TAG: $encoderName does not support profile $profile; letting it choose")
+                format.removeKey(MediaFormat.KEY_PROFILE)
+            } else if (!format.containsKey(MediaFormat.KEY_LEVEL)) {
+                // A profile must be accompanied by a level; the highest one the
+                // encoder advertises never under-constrains the stream.
+                format.setInteger(MediaFormat.KEY_LEVEL, levels.maxOf { it.level })
+            }
+        }
+        if (format.containsKey(MediaFormat.KEY_BITRATE_MODE)) {
+            val mode = format.getInteger(MediaFormat.KEY_BITRATE_MODE)
+            if (!capabilities.encoderCapabilities.isBitrateModeSupported(mode)) {
+                Timber.w("$TAG: $encoderName does not support bitrate mode $mode; using its default")
+                format.removeKey(MediaFormat.KEY_BITRATE_MODE)
+            }
+        }
+    }
+
+    /** True if the codec accepted [format]; false if it rejected it. */
+    private fun tryConfigure(codec: MediaCodec, format: MediaFormat): Boolean {
+        return try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            true
+        } catch (e: Exception) {
+            Timber.w("$TAG: configure() rejected format (${e.message})")
+            false
+        }
+    }
+
+    /** The smallest format every encoder honours: size, bitrate, frame rate, GOP and surface input. */
+    private fun minimalFormat(): MediaFormat =
+        MediaFormat.createVideoFormat(config.codec.mimeType, config.width, config.height).apply {
+            setInteger(MediaFormat.KEY_BIT_RATE, config.bitrateBps)
+            setInteger(MediaFormat.KEY_FRAME_RATE, config.frameRate)
+            setInteger(MediaFormat.KEY_I_FRAME_INTERVAL, config.keyframeIntervalSec)
+            setInteger(MediaFormat.KEY_COLOR_FORMAT, MediaCodecInfo.CodecCapabilities.COLOR_FormatSurface)
         }
 
-        try {
+    /**
+     * Start encoding.
+     * @return true if the codec is now running
+     */
+    fun start(): Boolean {
+        if (_state.value != EncoderState.READY) {
+            Timber.w("$TAG: Cannot start - not in READY state (${_state.value})")
+            return false
+        }
+
+        return try {
             isRunning.set(true)
             isPaused.set(false)
             framesEncoded.set(0)
@@ -243,15 +306,20 @@ class VideoEncoder(
             _stats.value = EncoderStats(startTimeMs = encodingStartTime)
 
             Timber.i("$TAG: Encoding started")
-
+            true
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to start encoder")
             _state.value = EncoderState.ERROR
+            false
         }
     }
 
     /**
-     * Stop encoding
+     * Stop encoding.
+     *
+     * A stopped MediaCodec cannot simply be started again: it must be
+     * configured afresh and hands out a new input surface. The encoder is
+     * therefore left in IDLE and callers build a new one for the next session.
      */
     fun stop() {
         if (_state.value != EncoderState.ENCODING) {
@@ -268,7 +336,7 @@ class VideoEncoder(
             // Stop codec
             mediaCodec?.stop()
 
-            _state.value = EncoderState.READY
+            _state.value = EncoderState.IDLE
             Timber.i("$TAG: Encoding stopped. Frames: ${framesEncoded.get()}, Dropped: ${framesDropped.get()}")
 
         } catch (e: Exception) {

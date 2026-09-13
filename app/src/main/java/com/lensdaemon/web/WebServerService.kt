@@ -89,6 +89,15 @@ class WebServerService : Service() {
             // Connect camera service to API routes
             apiRoutes?.cameraService = cameraService
 
+            // Live preview and snapshots for the dashboard: frames are only
+            // converted to JPEG while the MJPEG stream has viewers or a
+            // snapshot is pending.
+            cameraService?.setPreviewFrameSink(
+                demand = { (mjpegStreamer?.getClientCount() ?: 0) > 0 },
+                sink = { jpeg -> mjpegStreamer?.pushFrame(jpeg) }
+            )
+            setSnapshotCallback { cameraService?.captureSnapshot() }
+
             // Set up AI Director integration
             setupDirectorIntegration()
 
@@ -96,6 +105,8 @@ class WebServerService : Service() {
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
+            cameraService?.clearPreviewFrameSink()
+            apiRoutes?.onSnapshotRequest = null
             cameraService = null
             cameraBound = false
             apiRoutes?.cameraService = null

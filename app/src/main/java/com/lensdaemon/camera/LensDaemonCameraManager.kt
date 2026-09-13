@@ -20,6 +20,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 import java.util.concurrent.Executors
 import kotlin.coroutines.resume
@@ -31,6 +33,12 @@ import kotlin.coroutines.suspendCoroutine
  * Handles camera enumeration, session management, and frame capture.
  */
 class LensDaemonCameraManager(private val context: Context) {
+
+    companion object {
+        private const val SESSION_CLOSE_TIMEOUT_MS = 1000L
+        private const val SESSION_CREATE_ATTEMPTS = 2
+        private const val SESSION_RETRY_DELAY_MS = 150L
+    }
 
     private val cameraManager: CameraManager =
         context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -67,6 +75,20 @@ class LensDaemonCameraManager(private val context: Context) {
     private var currentConfig = CaptureConfig()
     private var previewSurface: Surface? = null
     private var encoderSurface: Surface? = null
+
+    /** Serializes session (re)configuration so surface changes never interleave. */
+    private val sessionMutex = Mutex()
+
+    /** The session being closed by a reconfigure, so its onClosed can be awaited. */
+    @Volatile
+    private var closingSession: Pair<CameraCaptureSession, CompletableDeferred<Unit>>? = null
+
+    /**
+     * Receives each captured YUV image, still open, on the camera thread.
+     * Must return quickly; the image is closed when the callback returns.
+     */
+    @Volatile
+    var onImageAvailable: ((android.media.Image) -> Unit)? = null
 
     init {
         enumerateCameras()
@@ -413,12 +435,13 @@ class LensDaemonCameraManager(private val context: Context) {
     }
 
     /**
-     * Configure camera session with preview surface.
+     * Configure the capture session with the preview surface, the frame-access
+     * ImageReader and, when one is attached, the encoder's input surface.
      */
     suspend fun startPreview(
         previewSurface: Surface,
         config: CaptureConfig = CaptureConfig()
-    ): Boolean {
+    ): Boolean = sessionMutex.withLock {
         val device = cameraDevice ?: run {
             Timber.e("Camera not opened")
             return false
@@ -440,6 +463,13 @@ class LensDaemonCameraManager(private val context: Context) {
             setOnImageAvailableListener({ reader ->
                 val image = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
                 try {
+                    onImageAvailable?.let { hook ->
+                        try {
+                            hook(image)
+                        } catch (e: Exception) {
+                            Timber.w(e, "Image hook failed")
+                        }
+                    }
                     val frame = CameraFrame(
                         timestamp = image.timestamp,
                         width = image.width,
@@ -455,9 +485,16 @@ class LensDaemonCameraManager(private val context: Context) {
             }, cameraHandler)
         }
 
-        val surfaces = listOfNotNull(previewSurface, imageReader?.surface)
+        return createSession(device, activeSurfaces())
+    }
 
-        return suspendCoroutine { continuation ->
+    /** All surfaces the session must target right now. */
+    private fun activeSurfaces(): List<Surface> =
+        listOfNotNull(previewSurface, imageReader?.surface, encoderSurface)
+
+    /** Create a capture session for [surfaces] and start the repeating request on it. */
+    private suspend fun createSession(device: CameraDevice, surfaces: List<Surface>): Boolean =
+        suspendCoroutine { continuation ->
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     val outputConfigs = surfaces.map { OutputConfiguration(it) }
@@ -482,7 +519,6 @@ class LensDaemonCameraManager(private val context: Context) {
                 continuation.resumeWithException(e)
             }
         }
-    }
 
     private fun createSessionCallback(
         continuation: kotlin.coroutines.Continuation<Boolean>
@@ -518,6 +554,9 @@ class LensDaemonCameraManager(private val context: Context) {
                 if (captureSession == session) {
                     captureSession = null
                 }
+                closingSession?.let { (closing, signal) ->
+                    if (closing === session) signal.complete(Unit)
+                }
             }
         }
     }
@@ -531,9 +570,13 @@ class LensDaemonCameraManager(private val context: Context) {
         val session = captureSession ?: return
         val preview = previewSurface ?: return
 
-        val requestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+        // TEMPLATE_RECORD tunes the pipeline for a steady frame rate once an
+        // encoder is attached; TEMPLATE_PREVIEW favours responsiveness otherwise.
+        val template = if (encoderSurface != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
+        val requestBuilder = device.createCaptureRequest(template).apply {
             addTarget(preview)
             imageReader?.surface?.let { addTarget(it) }
+            encoderSurface?.let { addTarget(it) }
 
             // Apply configuration
             set(CaptureRequest.CONTROL_AF_MODE, currentConfig.focusMode.camera2Mode)
@@ -589,13 +632,67 @@ class LensDaemonCameraManager(private val context: Context) {
     }
 
     /**
-     * Add an encoder surface for streaming/recording.
+     * Attach an encoder input surface as a capture target. If a session is
+     * already running it is rebuilt with the new surface; otherwise the surface
+     * is picked up by the next [startPreview]. The surface survives lens
+     * switches (which close and reopen the camera) until [removeEncoderSurface].
      */
-    suspend fun addEncoderSurface(surface: Surface): Boolean {
-        this.encoderSurface = surface
-        // Would need to reconfigure session with new surface
-        // For now, just store it - full implementation in Phase 4
-        return true
+    suspend fun addEncoderSurface(surface: Surface): Boolean = sessionMutex.withLock {
+        if (encoderSurface === surface) return@withLock true
+        encoderSurface = surface
+        reconfigureSessionIfActive("encoder surface attached")
+    }
+
+    /**
+     * Detach the encoder surface. Call this before releasing the encoder so
+     * the camera never renders into a dead surface.
+     */
+    suspend fun removeEncoderSurface(): Boolean = sessionMutex.withLock {
+        if (encoderSurface == null) return@withLock true
+        encoderSurface = null
+        reconfigureSessionIfActive("encoder surface detached")
+    }
+
+    /**
+     * Rebuild the capture session with the current surface set.
+     * Returns true when no session was active or the rebuild succeeded.
+     */
+    private suspend fun reconfigureSessionIfActive(reason: String): Boolean {
+        val device = cameraDevice ?: return true
+        val session = captureSession ?: return true
+        if (previewSurface == null) return true
+
+        Timber.i("Reconfiguring capture session: $reason")
+        _cameraState.value = CameraState.CONFIGURING
+        val closed = CompletableDeferred<Unit>()
+        closingSession = session to closed
+        try {
+            session.stopRepeating()
+            session.close()
+        } catch (e: Exception) {
+            Timber.w(e, "Error closing capture session before reconfigure")
+        }
+        captureSession = null
+
+        // Some camera HALs (the emulator's among them) refuse a new stream
+        // configuration while the previous session still holds its buffers,
+        // so wait for it to report closed before configuring the next one.
+        if (withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { closed.await() } == null) {
+            Timber.w("Previous capture session did not report closed within $SESSION_CLOSE_TIMEOUT_MS ms")
+        }
+        closingSession = null
+
+        repeat(SESSION_CREATE_ATTEMPTS) { attempt ->
+            try {
+                if (createSession(device, activeSurfaces())) return true
+            } catch (e: Exception) {
+                Timber.w(e, "Capture session configuration failed (attempt ${attempt + 1})")
+            }
+            delay(SESSION_RETRY_DELAY_MS)
+        }
+        Timber.e("Failed to reconfigure capture session")
+        _cameraState.value = CameraState.ERROR
+        return false
     }
 
     /**
@@ -617,7 +714,8 @@ class LensDaemonCameraManager(private val context: Context) {
         imageReader?.close()
         imageReader = null
         previewSurface = null
-        encoderSurface = null
+        // encoderSurface is kept: a lens switch closes and reopens the camera
+        // and the encoder must keep receiving frames afterwards.
 
         _currentLens.value = null
         _cameraState.value = CameraState.CLOSED
@@ -630,6 +728,7 @@ class LensDaemonCameraManager(private val context: Context) {
      */
     fun release() {
         closeCamera()
+        encoderSurface = null
         scope.cancel()
         cameraExecutor.shutdown()
     }

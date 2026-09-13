@@ -1,6 +1,7 @@
 package com.lensdaemon.output
 
 import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.NalUnitParser
 import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -10,6 +11,7 @@ import timber.log.Timber
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.SocketException
+import java.net.SocketTimeoutException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -215,6 +217,7 @@ class RtspServer(
      */
     fun sendFrame(frame: EncodedFrame) {
         if (!isRunning.get()) return
+        if (frame.isConfigFrame) learnParameterSets(frame.data)
 
         val playingSessions = sessions.values.filter { it.isPlaying() }
         if (playingSessions.isEmpty()) return
@@ -232,6 +235,24 @@ class RtspServer(
     }
 
     /**
+     * Learn SPS/PPS (and VPS) from the encoder's codec-config buffer so DESCRIBE
+     * advertises the current parameter sets even when the server was configured
+     * before the encoder produced them: right after start, or after an encoder
+     * restart that changed resolution or profile.
+     */
+    private fun learnParameterSets(data: ByteArray) {
+        val parser = NalUnitParser(isHevc = codec == VideoCodec.H265)
+        parser.parse(data)
+        val newSps = parser.sps ?: return
+        val newPps = parser.pps ?: return
+        val newVps = parser.vps ?: vps
+        if (newSps.contentEquals(sps) && newPps.contentEquals(pps) && newVps.contentEquals(vps)) return
+
+        updateCodecParams(newSps, newPps, newVps)
+        Timber.i("$TAG: Learned parameter sets from encoder (sps=${newSps.size}, pps=${newPps.size})")
+    }
+
+    /**
      * Accept loop for incoming connections
      */
     private suspend fun acceptLoop() {
@@ -240,8 +261,11 @@ class RtspServer(
                 val clientSocket = withContext(Dispatchers.IO) {
                     try {
                         serverSocket?.accept()
+                    } catch (ignored: SocketTimeoutException) {
+                        // Accept timeout: loop so a stop() is noticed promptly
+                        null
                     } catch (e: SocketException) {
-                        // Timeout or socket closed
+                        // Socket closed
                         null
                     }
                 }

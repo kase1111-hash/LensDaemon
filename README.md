@@ -37,7 +37,7 @@ One APK. Plug in power. Point at thing. Stream forever.
 
 | Feature | Description |
 |---------|-------------|
-| **Dual Protocol Streaming** | RTSP for universal compatibility, SRT for low-latency production |
+| **Dual Protocol Streaming** | RTSP for universal compatibility, MPEG-TS over UDP for low-latency ingest |
 | **Multi-Lens Control** | Switch wide/main/tele from any browser on your network |
 | **Network Storage** | Record to SMB/NFS shares or S3-compatible buckets |
 | **Thermal Dashboard** | Real-time CPU/battery temps, throttle state, encoding stats |
@@ -109,7 +109,7 @@ From any browser: `http://{device-ip}:8080`
 ### 4. Connect Your Software
 ```
 RTSP: rtsp://{device-ip}:8554/live
-SRT:  srt://{device-ip}:9000
+MPEG-TS/UDP: caller mode pushes to udp://{your-pc}:9000 (open udp://@:9000 in VLC or ffplay)
 ```
 
 Works with OBS, VLC, vMix, Blue Iris, Frigate, or any NVR that speaks RTSP.
