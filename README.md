@@ -124,7 +124,11 @@ Works with OBS, VLC, vMix, Blue Iris, Frigate, or any NVR that speaks RTSP.
 3. Untick **Restart playback when source becomes active**, and set **Network Buffering** to 0–1 MB for low latency.
 4. On WiFi with packet loss, use RTSP and enter `rtsp_transport=tcp` under **FFmpeg Options**: MPEG-TS over UDP has the lowest latency but no loss recovery.
 
-Video only: the phone's microphone is not captured, so use your usual mic in OBS.
+**Audio:** the phone's microphone goes out with the video as AAC (48 kHz, stereo
+where the phone has the microphones for it) on RTSP, MPEG-TS and recordings, timed
+on the camera's clock so it stays in sync. Allow the microphone when the app asks.
+If you use your own mic in OBS, untick **Phone microphone** in the dashboard.
+
 The stream keeps running with the phone's screen off or the app in the background.
 
 ---

@@ -14,6 +14,7 @@ import android.os.HandlerThread
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import com.lensdaemon.encoder.MediaClock
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -80,6 +81,15 @@ class LensDaemonCameraManager(private val context: Context) {
     /** The open camera's CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES. */
     private var availableFpsRanges: List<IntRange> = emptyList()
 
+    /**
+     * The clock this camera's frame timestamps (and so video presentation
+     * times) are on. Audio is stamped on the same clock to stay in sync.
+     * Known from the camera list before any camera opens.
+     */
+    @Volatile
+    var mediaClock: MediaClock = MediaClock.MONOTONIC
+        private set
+
     /** Serializes session (re)configuration so surface changes never interleave. */
     private val sessionMutex = Mutex()
 
@@ -104,6 +114,16 @@ class LensDaemonCameraManager(private val context: Context) {
 
     init {
         enumerateCameras()
+        _availableLenses.firstOrNull()?.let { mediaClock = queryMediaClock(it.cameraId) }
+    }
+
+    private fun queryMediaClock(cameraId: String): MediaClock = try {
+        val source = cameraManager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)
+        if (source == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) MediaClock.BOOTTIME else MediaClock.MONOTONIC
+    } catch (e: CameraAccessException) {
+        Timber.w(e, "Could not read the timestamp source of camera $cameraId")
+        mediaClock
     }
 
     /**
@@ -437,6 +457,7 @@ class LensDaemonCameraManager(private val context: Context) {
             Timber.i("Camera opened: ${lens.cameraId}")
             cameraDevice = camera
             availableFpsRanges = queryFpsRanges(lens.cameraId)
+            mediaClock = queryMediaClock(lens.cameraId)
             _currentLens.value = lens
             _cameraState.value = CameraState.OPENED
             if (settled.compareAndSet(false, true)) continuation.resume(true)

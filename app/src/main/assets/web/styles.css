@@ -260,6 +260,22 @@ main {
     color: var(--text-color);
 }
 
+.checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 0;
+    font-size: 0.9rem;
+    color: var(--text-color);
+    cursor: pointer;
+}
+
+.checkbox-row input {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--primary-color);
+}
+
 .stream-target {
     display: grid;
     grid-template-columns: 2fr 1fr;

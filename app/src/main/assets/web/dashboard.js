@@ -47,6 +47,8 @@ const elements = {
     bitrate: document.getElementById('bitrate'),
     framerate: document.getElementById('framerate'),
     codec: document.getElementById('codec'),
+    audioEnabled: document.getElementById('audio-enabled'),
+    audioState: document.getElementById('audio-state'),
     statFrames: document.getElementById('stat-frames'),
     statFps: document.getElementById('stat-fps'),
     statBitrate: document.getElementById('stat-bitrate'),
@@ -106,6 +108,9 @@ function setupEventListeners() {
     // RTSP control
     elements.btnRtspStart.addEventListener('click', startRtsp);
     elements.btnRtspStop.addEventListener('click', stopRtsp);
+
+    // Phone microphone
+    elements.audioEnabled.addEventListener('change', setAudioEnabled);
 
     // MPEG-TS/UDP control
     elements.btnMpegtsStart.addEventListener('click', startMpegTs);
@@ -250,6 +255,9 @@ async function fetchStatus() {
         // MPEG-TS status
         updateMpegTsStatus(status.mpegts);
 
+        // Microphone
+        updateAudioStatus(status.audio);
+
         // Zoom
         if (status.camera?.zoom) {
             elements.zoomSlider.value = status.camera.zoom;
@@ -324,6 +332,30 @@ function updateMpegTsStatus(mpegts) {
             ? `Sending to ${mpegts.remoteAddress}`
             : `Waiting for a receiver on port ${mpegts.port}`;
         elements.mpegtsStatus.className = 'status-text running';
+    }
+}
+
+// Update microphone status UI
+function updateAudioStatus(audio) {
+    if (!audio) return;
+
+    elements.audioEnabled.checked = audio.enabled;
+    if (!audio.permission) {
+        elements.audioState.textContent = 'No permission: allow the microphone on the phone';
+    } else if (!audio.enabled) {
+        elements.audioState.textContent = 'Off';
+    } else if (audio.active) {
+        const channels = audio.channels === 2 ? 'stereo' : 'mono';
+        elements.audioState.textContent = `On · AAC ${audio.sampleRate / 1000} kHz ${channels}`;
+    } else {
+        elements.audioState.textContent = 'On (starts with the stream)';
+    }
+}
+
+async function setAudioEnabled() {
+    const result = await apiCall('/api/audio', 'POST', { enabled: elements.audioEnabled.checked });
+    if (result) {
+        updateAudioStatus(result);
     }
 }
 

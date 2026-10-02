@@ -7,8 +7,11 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.content.pm.PackageManager
+import android.content.pm.ServiceInfo
 import android.hardware.camera2.CameraManager
 import android.os.Binder
+import android.os.Build
 import android.os.IBinder
 import android.util.Size
 import android.view.Surface
@@ -17,12 +20,17 @@ import androidx.core.app.NotificationCompat
 import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.AudioEncoder
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.EncoderService
 import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.encoder.EncoderStats
+import com.lensdaemon.encoder.MicrophonePcmSource
 import com.lensdaemon.encoder.VideoCodec
+import com.lensdaemon.encoder.toMuxerFormat
 import com.lensdaemon.output.MpegTsUdpConfig
 import com.lensdaemon.output.MpegTsUdpStats
 import com.lensdaemon.output.RecordingStats
@@ -80,6 +88,9 @@ class CameraService : Service() {
         }
 
         private const val SNAPSHOT_TIMEOUT_MS = 3000L
+
+        private const val PREFS_NAME = "lensdaemon_stream"
+        private const val PREF_AUDIO_ENABLED = "audio_enabled"
 
         /** Waits between attempts to reopen a camera that was lost while running. */
         private val CAMERA_RECOVERY_DELAYS_MS = listOf(1_000L, 2_000L, 5_000L, 10_000L, 30_000L, 30_000L)
@@ -151,7 +162,21 @@ class CameraService : Service() {
     val encoderState: StateFlow<EncoderState> = _encoderState
 
     // Frame distribution to all consumers (RTSP, recording, MPEG-TS, etc.)
-    private val frameDistributor = FrameDistributor()
+    private val frameDistributor = FrameDistributor<EncodedFrame>()
+
+    // Phone microphone: AAC frames to the same outputs, on the camera's clock
+    private val audioDistributor = FrameDistributor<EncodedAudioFrame>()
+    @Volatile private var audioEncoder: AudioEncoder? = null
+
+    /** Whether streams carry the phone's microphone (when RECORD_AUDIO is granted). Remembered across restarts. */
+    @Volatile var audioEnabled = true
+        private set
+
+    /** Set once onStartCommand has made this a foreground service. */
+    @Volatile private var startedInForeground = false
+
+    /** Whether the foreground service currently holds the microphone type. */
+    @Volatile private var foregroundHasMicrophone = false
 
     // Protocol coordinators (isolate transport concerns from camera service)
     private val rtspCoordinator = RtspCoordinator()
@@ -204,6 +229,7 @@ class CameraService : Service() {
         lensDaemonCameraManager = LensDaemonCameraManager(applicationContext)
         lensDaemonCameraManager.onImageAvailable = previewFrameGrabber::onImage
         lensDaemonCameraManager.onCameraLost = { scheduleCameraRecovery() }
+        audioEnabled = getSharedPreferences(PREFS_NAME, MODE_PRIVATE).getBoolean(PREF_AUDIO_ENABLED, true)
 
         // Initialize lens controller with available lenses
         lensController = LensController(systemCameraManager, lensDaemonCameraManager.availableLenses)
@@ -276,7 +302,7 @@ class CameraService : Service() {
         Timber.i("CameraService onStartCommand: ${intent?.action}")
 
         // Start as foreground service
-        startForeground(LensDaemonApp.NOTIFICATION_ID, createNotification())
+        startForegroundWithTypes()
 
         when (intent?.action) {
             ACTION_START_PREVIEW -> {
@@ -303,6 +329,43 @@ class CameraService : Service() {
         }
 
         return START_STICKY
+    }
+
+    /**
+     * Run in the foreground as a camera service, and as a microphone service
+     * too when RECORD_AUDIO is granted: from Android 11 a background app
+     * only hears silence from the microphone otherwise. The microphone type
+     * can be refused (e.g. when starting from the background), in which case
+     * the camera keeps running and audio may be silent.
+     */
+    private fun startForegroundWithTypes() {
+        val notification = createNotification()
+        val camera = ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
+        val withMicrophone = if (hasMicrophonePermission() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            camera or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+        } else {
+            camera
+        }
+        if (withMicrophone != camera && tryStartForeground(notification, withMicrophone)) {
+            foregroundHasMicrophone = true
+        } else {
+            Timber.i("Running as a camera service without the microphone type")
+            tryStartForeground(notification, camera)
+        }
+        startedInForeground = true
+    }
+
+    /** startForeground with [types]; false if the system refused them. */
+    private fun tryStartForeground(notification: Notification, types: Int): Boolean = try {
+        startForeground(LensDaemonApp.NOTIFICATION_ID, notification, types)
+        true
+    } catch (e: SecurityException) {
+        Timber.w(e, "Foreground service types $types refused")
+        false
+    } catch (e: IllegalStateException) {
+        // ForegroundServiceStartNotAllowedException: not allowed from the background
+        Timber.w(e, "Foreground service types $types refused")
+        false
     }
 
     override fun onDestroy() {
@@ -848,6 +911,7 @@ class CameraService : Service() {
             return false
         }
         isStreamingActive = true
+        startAudioIfWanted()
         updateNotification()
         return true
     }
@@ -946,7 +1010,7 @@ class CameraService : Service() {
         )
         val wasRecording = isRecordingActive()
         if (wasRecording) {
-            frameDistributor.removeListener(recordingCoordinator.frameListener)
+            detachRecorder()
             recordingCoordinator.stopRecording()
         }
 
@@ -968,6 +1032,7 @@ class CameraService : Service() {
             // stopStreaming() found the encoder already marked stopped, so
             // detach and release whatever is left of it here
             releaseEncoderAfterDetach(encoderSurface)
+            stopAudio()
             return false
         }
 
@@ -985,12 +1050,13 @@ class CameraService : Service() {
     fun stopStreaming() {
         encodingRequested = false
         if (isRecordingActive()) {
-            frameDistributor.removeListener(recordingCoordinator.frameListener)
+            detachRecorder()
             recordingCoordinator.stopRecording()
         }
         stopRtspServer()
         stopMpegTsPublisher()
         stopEncoder()
+        stopAudio()
     }
 
     /**
@@ -1017,8 +1083,75 @@ class CameraService : Service() {
         if (!isStreamingActive) return
 
         isStreamingActive = false
+        stopAudio()
         updateNotification()
         releaseEncoderAfterDetach(encoderSurface)
+    }
+
+    // ==================== Audio (phone microphone) ====================
+
+    /**
+     * Turn the phone's microphone on or off for every output. Takes effect
+     * at once while streaming: RTSP viewers that connect afterwards are
+     * offered (or not offered) an audio track, MPEG-TS re-announces its
+     * streams, and recordings change from their next segment.
+     */
+    @Synchronized
+    fun setAudioEnabled(enabled: Boolean) {
+        audioEnabled = enabled
+        getSharedPreferences(PREFS_NAME, MODE_PRIVATE).edit().putBoolean(PREF_AUDIO_ENABLED, enabled).apply()
+        if (!enabled) stopAudio() else if (isStreamingActive) startAudioIfWanted()
+    }
+
+    fun hasMicrophonePermission(): Boolean =
+        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    /** True while the microphone is being captured and encoded. */
+    fun isAudioActive(): Boolean = audioEncoder?.isRunning == true
+
+    /** The audio settings in use, or null when no audio is being captured. */
+    fun getAudioConfig(): AudioConfig? = audioEncoder?.takeIf { it.isRunning }?.config
+
+    fun getAudioFramesEncoded(): Long = audioEncoder?.getFramesEncoded() ?: 0
+
+    /**
+     * Start capturing the microphone alongside the running video, unless
+     * audio is switched off, the permission is missing or there is no
+     * microphone; streams then simply carry video only.
+     */
+    private fun startAudioIfWanted() {
+        if (!audioEnabled || audioEncoder?.isRunning == true) return
+        if (!hasMicrophonePermission()) {
+            Timber.i("Microphone permission not granted; streaming video only")
+            return
+        }
+        // An encoder whose thread died on an error: clear it before starting afresh
+        if (audioEncoder != null) stopAudio()
+        // A service started before the permission was granted needs the microphone type now
+        if (startedInForeground && !foregroundHasMicrophone) startForegroundWithTypes()
+
+        val source = MicrophonePcmSource(AudioConfig(), lensDaemonCameraManager.mediaClock)
+        val encoder = AudioEncoder(source, onFrame = audioDistributor::dispatch)
+        if (!encoder.start()) {
+            Timber.w("Microphone unavailable; streaming video only")
+            return
+        }
+        audioEncoder = encoder
+        publishAudioConfig(encoder.config)
+    }
+
+    private fun stopAudio() {
+        val encoder = audioEncoder ?: return
+        audioEncoder = null
+        publishAudioConfig(null)
+        encoder.stop()
+    }
+
+    /** Tell every output what audio there is (or that there is none). */
+    private fun publishAudioConfig(config: AudioConfig?) {
+        rtspCoordinator.setAudioConfig(config)
+        mpegTsCoordinator.setAudioConfig(config)
+        recordingCoordinator.setAudioFormat(config?.toMuxerFormat())
     }
 
     /**
@@ -1197,11 +1330,15 @@ class CameraService : Service() {
      */
     fun startRtspServer(port: Int = 8554): Boolean {
         frameDistributor.addListener(rtspCoordinator.frameListener)
+        audioDistributor.addListener(rtspCoordinator.audioListener)
         val success = rtspCoordinator.start(port)
         if (!success) {
             frameDistributor.removeListener(rtspCoordinator.frameListener)
+            audioDistributor.removeListener(rtspCoordinator.audioListener)
             return false
         }
+        rtspCoordinator.setMediaClock { lensDaemonCameraManager.mediaClock.nowUs() }
+        rtspCoordinator.setAudioConfig(getAudioConfig())
         // Configure after start: before it there is no server to configure.
         // Parameter sets the encoder has not produced yet are learned from
         // its codec-config buffer as it goes out.
@@ -1213,6 +1350,7 @@ class CameraService : Service() {
 
     fun stopRtspServer() {
         frameDistributor.removeListener(rtspCoordinator.frameListener)
+        audioDistributor.removeListener(rtspCoordinator.audioListener)
         rtspCoordinator.stop()
     }
 
@@ -1270,16 +1408,20 @@ class CameraService : Service() {
     fun startMpegTsPublisher(config: MpegTsUdpConfig = MpegTsUdpConfig()): Boolean {
         val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
         frameDistributor.addListener(mpegTsCoordinator.frameListener)
+        audioDistributor.addListener(mpegTsCoordinator.audioListener)
 
+        mpegTsCoordinator.setAudioConfig(getAudioConfig())
         val success = mpegTsCoordinator.start(config, codec, getSps(), getPps(), getVps())
         if (!success) {
             frameDistributor.removeListener(mpegTsCoordinator.frameListener)
+            audioDistributor.removeListener(mpegTsCoordinator.audioListener)
         }
         return success
     }
 
     fun stopMpegTsPublisher() {
         frameDistributor.removeListener(mpegTsCoordinator.frameListener)
+        audioDistributor.removeListener(mpegTsCoordinator.audioListener)
         mpegTsCoordinator.stop()
     }
 
@@ -1349,10 +1491,11 @@ class CameraService : Service() {
         recordingCoordinator.onKeyFrameRequest = { encoderService?.requestKeyFrame() }
 
         frameDistributor.addListener(recordingCoordinator.frameListener)
+        audioDistributor.addListener(recordingCoordinator.audioListener)
 
         val success = recordingCoordinator.startRecording()
         if (!success) {
-            frameDistributor.removeListener(recordingCoordinator.frameListener)
+            detachRecorder()
         }
         return success
     }
@@ -1382,10 +1525,16 @@ class CameraService : Service() {
      */
     @Synchronized
     fun stopRecording(): List<String> {
-        frameDistributor.removeListener(recordingCoordinator.frameListener)
+        detachRecorder()
         val segments = recordingCoordinator.stopRecording()
         stopEncoderIfUnused(Output.RECORDING)
         return segments
+    }
+
+    /** Stop feeding the recorder video and audio. */
+    private fun detachRecorder() {
+        frameDistributor.removeListener(recordingCoordinator.frameListener)
+        audioDistributor.removeListener(recordingCoordinator.audioListener)
     }
 
     /**
@@ -1437,7 +1586,7 @@ class CameraService : Service() {
     }
 
     fun releaseStorageManager() {
-        frameDistributor.removeListener(recordingCoordinator.frameListener)
+        detachRecorder()
         recordingCoordinator.release()
     }
 

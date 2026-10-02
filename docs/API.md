@@ -65,6 +65,15 @@ two seconds.
   "recording": {
     "active": false,
     "paused": false
+  },
+  "audio": {
+    "enabled": true,
+    "permission": true,
+    "active": true,
+    "sampleRate": 48000,
+    "channels": 2,
+    "bitrate": 128000,
+    "framesEncoded": 28125
   }
 }
 ```
@@ -108,6 +117,24 @@ an active recording continues in a new segment.
 ```
 
 Returns `500` with `"success": false` if the encoder could not be started.
+
+### GET /api/audio, POST /api/audio
+
+The phone's microphone, captured whenever the encoder runs and sent with the
+video as AAC-LC (48 kHz, stereo or mono depending on the phone, 128 kbps) on
+every output. Audio is stamped on the camera's clock, so it stays in sync with
+the picture. It needs the RECORD_AUDIO permission, granted on the phone; without
+it, or with audio switched off, streams carry video only.
+
+**Request (POST):** `{"enabled": false}` switches the microphone off (`true` on).
+It applies at once while streaming: RTSP clients that connect afterwards are
+offered (or not offered) an audio track, MPEG-TS receivers see the PMT change,
+and a recording changes from its next segment. The setting is kept across
+restarts.
+
+**Response (both):** the `audio` object shown under `/api/status`; `active` is
+false until the encoder runs, and the settings fields are present only while
+audio is being captured.
 
 ### POST /api/stream/stop
 
@@ -202,6 +229,11 @@ The RTSP server runs on port 8554 and supports up to 10 concurrent clients,
 over UDP or TCP (interleaved). Any path is accepted;
 `rtsp://<device-ip>:8554/stream` is the advertised one.
 
+With audio on, the SDP offers a second track, `trackID=1`: AAC as
+`MPEG4-GENERIC` (RFC 3640, AAC-hbr). Each track sends RTCP sender reports
+(on the RTCP port, or the odd interleaved channel over TCP), which is what
+players use to keep audio and video in sync.
+
 A viewer that connects to a running stream (OBS reconnecting, a second player)
 is sent nothing until a keyframe, which is requested from the encoder the moment
 it sends PLAY, and that keyframe carries the SPS/PPS it needs to decode. A
@@ -259,7 +291,9 @@ another output (or `/api/stream/start`) still uses it.
 Plain MPEG transport stream in UDP datagrams (7 TS packets each). There is no
 encryption and no retransmission, so use it on a wired or solid WiFi LAN. It
 has lower latency than RTSP in OBS. Each receiver starts on a keyframe with its
-parameter sets, and every picture carries an access unit delimiter.
+parameter sets, and every picture carries an access unit delimiter. With audio
+on, AAC travels as ADTS on PID 257 (stream type 0x0F) next to the video on PID
+256, on the same clock.
 
 ### POST /api/mpegts/start
 

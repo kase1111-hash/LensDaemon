@@ -1,11 +1,11 @@
 package com.lensdaemon.camera
 
-import com.lensdaemon.encoder.EncodedFrame
 import timber.log.Timber
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**
- * Thread-safe distributor for encoded video frames.
+ * Thread-safe distributor for encoded frames (video [com.lensdaemon.encoder.EncodedFrame]s
+ * or audio [com.lensdaemon.encoder.EncodedAudioFrame]s).
  *
  * Dispatches each frame to all registered listeners with per-listener
  * error isolation — one listener throwing does not skip the rest.
@@ -20,20 +20,20 @@ import java.util.concurrent.CopyOnWriteArrayList
  * itself. Outputs that can block are expected to hand off internally rather
  * than block here.
  */
-class FrameDistributor {
+class FrameDistributor<T> {
 
-    private val listeners = CopyOnWriteArrayList<(EncodedFrame) -> Unit>()
+    private val listeners = CopyOnWriteArrayList<(T) -> Unit>()
 
     /**
      * Register [listener]. Registering the same listener again is a no-op:
      * an output started twice (a repeated API call, the dashboard and the
      * phone both pressing Start) must not receive, and send, every frame twice.
      */
-    fun addListener(listener: (EncodedFrame) -> Unit) {
+    fun addListener(listener: (T) -> Unit) {
         listeners.addIfAbsent(listener)
     }
 
-    fun removeListener(listener: (EncodedFrame) -> Unit) {
+    fun removeListener(listener: (T) -> Unit) {
         listeners.remove(listener)
     }
 
@@ -41,7 +41,7 @@ class FrameDistributor {
         listeners.clear()
     }
 
-    fun dispatch(frame: EncodedFrame) {
+    fun dispatch(frame: T) {
         for (listener in listeners) {
             try {
                 listener(frame)

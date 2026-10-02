@@ -69,13 +69,14 @@ class MainActivity : AppCompatActivity() {
     private val hideFocusIndicatorRunnable = Runnable { hideFocusIndicator() }
 
     /**
-     * Only permissions the app actually uses and the platform knows about.
-     * Requesting an undeclared permission (audio is not captured) or the
-     * notification permission on Android 12 and below is refused outright and
-     * used to stop the launch flow before the camera ever started.
+     * Only permissions the app actually uses and the platform knows about:
+     * requesting the notification permission on Android 12 and below is
+     * refused outright. Only the camera is essential; without the microphone
+     * the streams carry video only.
      */
     private val requiredPermissions: Array<String> = buildList {
         add(Manifest.permission.CAMERA)
+        add(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -534,8 +535,11 @@ class MainActivity : AppCompatActivity() {
             } else {
                 "RTSP server off"
             }
+            val audio = service.getAudioConfig()
+                ?.let { " · AAC ${it.sampleRate / 1000} kHz ${if (it.channelCount == 2) "stereo" else "mono"}" }
+                ?: " · no audio"
             tvResolution.text = service.getEncoderConfig()
-                ?.let { "${it.width}x${it.height} @ ${it.frameRate}fps ${it.codec.name}" }
+                ?.let { "${it.width}x${it.height} @ ${it.frameRate}fps ${it.codec.name}$audio" }
                 .orEmpty()
             tvBitrate.text = service.getEncoderStats()
                 ?.let { String.format(Locale.US, "%.1f Mbps · %.0f fps", it.currentBitrateBps / 1_000_000.0, it.currentFps) }

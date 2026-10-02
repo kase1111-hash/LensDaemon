@@ -13,7 +13,7 @@ class FrameDistributorTest {
 
     @Test
     fun `an output registered twice still gets each frame once`() {
-        val distributor = FrameDistributor()
+        val distributor = FrameDistributor<EncodedFrame>()
         var received = 0
         val listener: (EncodedFrame) -> Unit = { received++ }
 
@@ -27,7 +27,7 @@ class FrameDistributorTest {
 
     @Test
     fun `one failing listener does not starve the others`() {
-        val distributor = FrameDistributor()
+        val distributor = FrameDistributor<EncodedFrame>()
         var received = 0
         distributor.addListener { throw IllegalStateException("boom") }
         distributor.addListener { received++ }

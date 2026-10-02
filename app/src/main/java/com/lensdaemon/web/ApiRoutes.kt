@@ -181,7 +181,7 @@ class ApiRoutes(
         // Delegate to per-module handlers by URI prefix
         when {
             uri.startsWith("/api/stream/") || uri.startsWith("/api/rtsp/") ||
-            uri.startsWith("/api/mpegts/") ||
+            uri.startsWith("/api/mpegts/") || uri == "/api/audio" ||
             uri.startsWith("/api/recording/") || uri.startsWith("/api/recordings") ||
             uri.startsWith("/api/storage/") -> {
                 streamHandler.handleRequest(uri, method, body)?.let { return it }
@@ -304,6 +304,9 @@ class ApiRoutes(
                     put("port", stats.port)
                 }
             })
+
+            // Microphone
+            camera?.let { put("audio", streamHandler.audioStatusJson(it)) }
 
             // Recording status
             put("recording", JSONObject().apply {

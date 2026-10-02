@@ -1115,6 +1115,13 @@ app/src/main/java/com/lensdaemon/camera/
                                  # the encoder frame rate so low light never drops fps
 ```
 
+- Audio: `encoder/AudioEncoder.kt` captures the microphone (`MicrophonePcmSource`,
+  camcorder source, 48 kHz, stereo or mono) and encodes AAC-LC on its own thread,
+  stamped on the camera's clock (`MediaClock`, from SENSOR_INFO_TIMESTAMP_SOURCE).
+  It starts and stops with the video encoder and feeds a second `FrameDistributor`:
+  RTSP offers it as `trackID=1` (`AacRtpPacketizer`, RFC 3640) with RTCP sender
+  reports per track (`RtcpSenderReport`, `RtspTrack`); MPEG-TS sends ADTS on PID
+  257; recordings add an AAC track to each segment. `/api/audio` switches it.
 - RTSP PLAY and new MPEG-TS receivers request a keyframe from the encoder.
 - The capture session runs with or without the on-screen preview surface
   (`LensDaemonCameraManager.setPreviewSurface`), so streaming survives the

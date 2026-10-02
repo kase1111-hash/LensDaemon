@@ -22,6 +22,7 @@ import java.net.UnknownHostException
  * - /api/stream     - Encoding start/stop/status
  * - /api/rtsp       - RTSP server control
  * - /api/mpegts     - MPEG-TS/UDP publisher control
+ * - /api/audio      - Phone microphone on/off and status
  * - /api/recording  - Local recording control
  * - /api/recordings - Recording file management
  * - /api/storage    - Storage status and cleanup
@@ -56,6 +57,10 @@ class StreamApiHandler {
             uri == "/api/mpegts/start" && method == NanoHTTPD.Method.POST -> startMpegTs(body)
             uri == "/api/mpegts/stop" && method == NanoHTTPD.Method.POST -> stopMpegTs()
             uri == "/api/mpegts/status" && method == NanoHTTPD.Method.GET -> getMpegTsStatus()
+
+            // Audio
+            uri == "/api/audio" && method == NanoHTTPD.Method.GET -> getAudio()
+            uri == "/api/audio" && method == NanoHTTPD.Method.POST -> setAudio(body)
 
             // Recording control
             uri == "/api/recording/start" && method == NanoHTTPD.Method.POST -> startRecording(body)
@@ -276,6 +281,35 @@ class StreamApiHandler {
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    // ==================== Audio ====================
+
+    private fun getAudio(): NanoHTTPD.Response {
+        val camera = cameraService ?: return cameraUnavailable()
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, audioStatusJson(camera).toString())
+    }
+
+    /** Body: {"enabled": true|false}. Applies to running streams at once. */
+    private fun setAudio(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return cameraUnavailable()
+        if (body == null || !body.has("enabled")) return ApiHandlerUtils.bodyRequired()
+        camera.setAudioEnabled(body.optBoolean("enabled", true))
+        val json = audioStatusJson(camera).put("success", true)
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /** Microphone state: switched on, permitted, and actually being captured (with its settings). */
+    fun audioStatusJson(camera: CameraService): JSONObject = JSONObject().apply {
+        put("enabled", camera.audioEnabled)
+        put("permission", camera.hasMicrophonePermission())
+        put("active", camera.isAudioActive())
+        camera.getAudioConfig()?.let { audio ->
+            put("sampleRate", audio.sampleRate)
+            put("channels", audio.channelCount)
+            put("bitrate", audio.bitrateBps)
+            put("framesEncoded", camera.getAudioFramesEncoded())
+        }
     }
 
     // ==================== Recording Control ====================
