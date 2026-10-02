@@ -27,6 +27,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also asks for the legacy 'tools' package, which current
+          # command-line tools no longer offer, failing the step. Gradle installs
+          # the platform and build-tools it needs itself.
+          packages: 'platform-tools'
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
@@ -106,6 +111,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also asks for the legacy 'tools' package, which current
+          # command-line tools no longer offer, failing the step. Gradle installs
+          # the platform and build-tools it needs itself.
+          packages: 'platform-tools'
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
