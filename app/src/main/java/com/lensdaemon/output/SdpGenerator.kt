@@ -1,10 +1,11 @@
 package com.lensdaemon.output
 
 import android.util.Base64
+import com.lensdaemon.encoder.Aac
+import com.lensdaemon.encoder.AudioConfig
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
-import timber.log.Timber
-import java.net.InetAddress
+import java.util.Locale
 
 /**
  * SDP (Session Description Protocol) generator for RTSP streaming
@@ -13,8 +14,6 @@ import java.net.InetAddress
 class SdpGenerator {
 
     companion object {
-        private const val TAG = "SdpGenerator"
-
         // SDP version
         private const val SDP_VERSION = "0"
 
@@ -24,6 +23,10 @@ class SdpGenerator {
         // RTP payload types for dynamic payloads (96-127)
         const val PAYLOAD_TYPE_H264 = 96
         const val PAYLOAD_TYPE_H265 = 97
+        const val PAYLOAD_TYPE_AAC = 98
+
+        /** Control URL suffix of the audio track; the video track is trackID=0. */
+        const val AUDIO_TRACK_ID = "trackID=1"
 
         // Clock rate for video (90kHz as per RTP spec)
         const val VIDEO_CLOCK_RATE = 90000
@@ -187,6 +190,27 @@ class SdpGenerator {
     }
 
     /**
+     * The media section for an AAC-LC track, appended after the video
+     * one (RFC 3640 mpeg4-generic,
+     * AAC-hbr): clock rate = sample rate, AudioSpecificConfig in hex, and the
+     * AU header layout [AacRtpPacketizer] writes.
+     */
+    fun audioMediaSection(audio: AudioConfig, trackId: String = AUDIO_TRACK_ID): String {
+        val config = Aac.audioSpecificConfig(audio.sampleRate, audio.channelCount)
+            .joinToString("") { "%02X".format(Locale.US, it.toInt() and 0xFF) }
+        val sb = StringBuilder()
+        sb.appendLine("m=audio 0 RTP/AVP $PAYLOAD_TYPE_AAC")
+        sb.appendLine("b=AS:${audio.bitrateBps / 1000}")
+        sb.appendLine("a=rtpmap:$PAYLOAD_TYPE_AAC MPEG4-GENERIC/${audio.sampleRate}/${audio.channelCount}")
+        sb.appendLine(
+            "a=fmtp:$PAYLOAD_TYPE_AAC streamtype=5; profile-level-id=15; mode=AAC-hbr; config=$config; " +
+                "sizelength=13; indexlength=3; indexdeltalength=3"
+        )
+        sb.appendLine("a=control:$trackId")
+        return sb.toString()
+    }
+
+    /**
      * Build H.264 fmtp (format parameters) string
      * RFC 6184 - RTP Payload Format for H.264 Video
      */
@@ -306,25 +330,7 @@ class SdpGenerator {
     }
 
     /**
-     * Get local IP address
+     * Get the LAN-reachable IPv4 address of this device.
      */
-    fun getLocalIpAddress(): String {
-        return try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val netInterface = interfaces.nextElement()
-                val addresses = netInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr = addresses.nextElement()
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress ?: "0.0.0.0"
-                    }
-                }
-            }
-            "0.0.0.0"
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Failed to get local IP")
-            "0.0.0.0"
-        }
-    }
+    fun getLocalIpAddress(): String = LocalNetwork.lanIpv4Address() ?: "0.0.0.0"
 }

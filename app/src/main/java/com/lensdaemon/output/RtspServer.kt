@@ -1,6 +1,9 @@
 package com.lensdaemon.output
 
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.NalUnitParser
 import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
@@ -88,6 +91,21 @@ class RtspServer(
     private var pps: ByteArray? = null
     private var vps: ByteArray? = null
 
+    /** Encoder settings advertised to clients in the SDP. */
+    @Volatile
+    private var streamConfig: EncoderConfig = EncoderConfig()
+
+    /** The AAC stream offered as a second track, or null for video only. */
+    @Volatile
+    private var audioConfig: AudioConfig? = null
+
+    /**
+     * Now, in microseconds, on the clock frame presentation times are
+     * stamped on (the camera's). Sender reports map it to wall-clock time.
+     */
+    @Volatile
+    var mediaClockUs: () -> Long = { System.nanoTime() / 1000 }
+
     // Server address
     private var serverAddress: String = "0.0.0.0"
 
@@ -116,7 +134,7 @@ class RtspServer(
                 soTimeout = ACCEPT_TIMEOUT_MS
                 bind(java.net.InetSocketAddress(port))
             }
-            serverAddress = SdpGenerator().getLocalIpAddress()
+            serverAddress = LocalNetwork.lanIpv4Address() ?: "0.0.0.0"
 
             isRunning.set(true)
             startTimeMs = System.currentTimeMillis()
@@ -197,6 +215,34 @@ class RtspServer(
         }
 
         Timber.d("$TAG: Codec config updated - codec=$codec, sps=${sps?.size}, pps=${pps?.size}, vps=${vps?.size}")
+    }
+
+    /**
+     * Set the encoder settings (frame rate, bitrate, profile) that DESCRIBE
+     * advertises. Without this every client is told about the defaults.
+     */
+    fun setStreamConfig(config: EncoderConfig) {
+        streamConfig = config
+        sessions.values.forEach { it.streamConfig = config }
+    }
+
+    /**
+     * Offer [config] as an audio track to clients that DESCRIBE from now on,
+     * or no audio track when null. Sessions already set up keep their tracks.
+     */
+    fun setAudioConfig(config: AudioConfig?) {
+        audioConfig = config
+        sessions.values.forEach { it.audioConfig = config }
+    }
+
+    /**
+     * Send an encoded AAC frame to every playing client that set up audio.
+     */
+    fun sendAudio(frame: EncodedAudioFrame) {
+        if (!isRunning.get()) return
+        for (session in sessions.values) {
+            if (session.isPlaying()) session.sendAudio(frame)
+        }
     }
 
     /**
@@ -300,12 +346,16 @@ class RtspServer(
             onSessionClosed = { closedSession ->
                 sessions.remove(closedSession.sessionId)
                 Timber.i("$TAG: Session ${closedSession.sessionId} removed, active: ${sessions.size}")
-            }
+            },
+            onStartedPlaying = { onClientStartsPlaying() },
+            mediaClockUs = { mediaClockUs() }
         )
 
         // Initialize session
         session.initialize()
         session.setCodecConfig(codec, sps, pps, vps)
+        session.streamConfig = streamConfig
+        session.audioConfig = audioConfig
 
         // Add to active sessions
         sessions[session.sessionId] = session
@@ -387,10 +437,12 @@ class RtspServer(
     }
 
     /**
-     * Get RTSP URL for this server
+     * Get RTSP URL for this server. The address is looked up afresh so the URL
+     * follows the device if its WiFi address changes while the server runs.
      */
     fun getRtspUrl(): String {
-        return "rtsp://$serverAddress:$port${RtspConstants.STREAM_PATH}"
+        val address = LocalNetwork.lanIpv4Address() ?: serverAddress
+        return "rtsp://$address:$port${RtspConstants.STREAM_PATH}"
     }
 
     /**

@@ -3,6 +3,7 @@ package com.lensdaemon
 import android.Manifest
 import android.content.Context
 import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import android.media.ImageReader
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -14,6 +15,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.GrantPermissionRule
+import com.lensdaemon.camera.CameraState
 import com.lensdaemon.camera.CaptureConfig
 import com.lensdaemon.camera.LensDaemonCameraManager
 import com.lensdaemon.camera.LensType
@@ -79,7 +81,13 @@ class CameraPipelineSmokeTest {
         consumerThread = HandlerThread("preview-consumer").apply { start() }
         // A PRIVATE ImageReader stands in for the on-screen preview and always
         // drains its buffers so the camera never stalls on the preview stream.
-        previewReader = ImageReader.newInstance(size.width, size.height, ImageFormat.PRIVATE, 3)
+        // It asks for GPU sampling like a real preview (SurfaceView/TextureView):
+        // without it the emulator's camera HAL renders the stream as RGB_888,
+        // overruns those buffers (crashing the camera provider now and then)
+        // and rejects the stream when a session rebuild reuses it.
+        previewReader = ImageReader.newInstance(
+            size.width, size.height, ImageFormat.PRIVATE, 3, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+        )
         previewReader.setOnImageAvailableListener(
             { reader -> reader.acquireLatestImage()?.close() },
             Handler(consumerThread.looper)
@@ -88,8 +96,9 @@ class CameraPipelineSmokeTest {
 
     @After
     fun tearDown() {
-        if (this::encoder.isInitialized) encoder.release()
+        // Camera first, so it never draws into a released encoder surface
         if (this::manager.isInitialized) manager.release()
+        if (this::encoder.isInitialized) encoder.release()
         if (this::previewReader.isInitialized) previewReader.close()
         if (this::consumerThread.isInitialized) consumerThread.quitSafely()
     }
@@ -135,13 +144,91 @@ class CameraPipelineSmokeTest {
         assertTrue("encoder should receive frames after the session was rebuilt", frames.await(20, TimeUnit.SECONDS))
 
         // Detaching must rebuild the session again without the encoder and leave the preview alive.
-        runBlocking { assertTrue("encoder surface should detach", manager.removeEncoderSurface()) }
+        val detached = runBlocking { manager.removeEncoderSurface() }
+        assertTrue("encoder surface should detach\n" + recentCameraLog(), detached)
         val previewFrames = CountDownLatch(3)
         previewReader.setOnImageAvailableListener(
             { reader -> reader.acquireLatestImage()?.close(); previewFrames.countDown() },
             Handler(consumerThread.looper)
         )
         assertTrue("preview should keep running after the encoder was detached", previewFrames.await(10, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun theEncoderGetsFramesWithNoPreviewSurfaceAtAll() {
+        // Screen off or app in the background: there is nothing to draw on,
+        // and streaming must not depend on it.
+        val encoderSurface = encoder.initialize().getOrThrow()
+        val frames = CountDownLatch(5)
+        encoder.setFrameCallback { frame -> if (!frame.isConfigFrame) frames.countDown() }
+
+        val started = runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("encoder surface should attach", manager.addEncoderSurface(encoderSurface))
+            manager.startPreview(null, CaptureConfig(resolution = size))
+        }
+        assertTrue("capture should start without a preview surface\n" + recentCameraLog(), started)
+        assertTrue("encoder should start", encoder.start())
+        assertTrue("encoder should receive frames with no preview surface", frames.await(20, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun streamingSurvivesThePreviewSurfaceGoingAwayAndComingBack() {
+        val encoderSurface = encoder.initialize().getOrThrow()
+        val frameCount = AtomicInteger(0)
+        encoder.setFrameCallback { frame -> if (!frame.isConfigFrame) frameCount.incrementAndGet() }
+
+        runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("encoder surface should attach", manager.addEncoderSurface(encoderSurface))
+            assertTrue("preview should start", manager.startPreview(previewReader.surface, CaptureConfig(resolution = size)))
+        }
+        assertTrue("encoder should start", encoder.start())
+        assertTrue("frames should flow with the preview", waitForFrames(frameCount, 5))
+
+        // The activity went away: the session drops the preview but keeps encoding
+        val gone = runBlocking { manager.setPreviewSurface(null) }
+        assertTrue("session should rebuild without the preview\n" + recentCameraLog(), gone)
+        assertTrue("frames should keep flowing without the preview", waitForFrames(frameCount, 5))
+
+        // ...and came back
+        val back = runBlocking { manager.setPreviewSurface(previewReader.surface) }
+        assertTrue("session should rebuild with the preview again\n" + recentCameraLog(), back)
+        assertTrue("frames should keep flowing with the preview back", waitForFrames(frameCount, 5))
+    }
+
+    @Test
+    fun losingTheCameraWhileRunningIsReportedNotFatal() {
+        // Opening the same camera again in this app disconnects the first
+        // open, just as another app taking the camera mid-stream would. The
+        // disconnect used to resume the finished open a second time and crash
+        // the process on the camera thread.
+        val lost = CountDownLatch(1)
+        manager.onCameraLost = { lost.countDown() }
+        runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("preview should start", manager.startPreview(previewReader.surface, CaptureConfig(resolution = size)))
+        }
+
+        val other = LensDaemonCameraManager(context)
+        try {
+            assertTrue("a second client should take the camera", runBlocking { other.openCamera(LensType.MAIN) })
+            assertTrue("the first client should be told it lost the camera", lost.await(10, TimeUnit.SECONDS))
+            assertEquals(CameraState.CLOSED, manager.cameraState.value)
+        } finally {
+            other.release()
+        }
+
+        // ...and it can take the camera back
+        assertTrue("the camera should reopen", runBlocking { manager.openCamera(LensType.MAIN) })
+    }
+
+    /** Wait up to 20 s for [count] more frames than [counter] holds now. */
+    private fun waitForFrames(counter: AtomicInteger, count: Int): Boolean {
+        val target = counter.get() + count
+        val deadline = System.currentTimeMillis() + 20_000
+        while (counter.get() < target && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        return counter.get() >= target
     }
 
     /** Recent camera-related logcat lines, for failure diagnostics. */

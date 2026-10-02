@@ -11,6 +11,9 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
+import timber.log.Timber
+import java.net.InetAddress
+import java.net.UnknownHostException
 
 /**
  * API handler for stream, RTSP, recording, and storage endpoints.
@@ -19,11 +22,19 @@ import org.json.JSONObject
  * - /api/stream     - Encoding start/stop/status
  * - /api/rtsp       - RTSP server control
  * - /api/mpegts     - MPEG-TS/UDP publisher control
+ * - /api/audio      - Phone microphone on/off and status
  * - /api/recording  - Local recording control
  * - /api/recordings - Recording file management
  * - /api/storage    - Storage status and cleanup
  */
 class StreamApiHandler {
+
+    private companion object {
+        const val DEFAULT_WIDTH = 1920
+        const val DEFAULT_HEIGHT = 1080
+        const val DEFAULT_BITRATE = 4_000_000
+        const val DEFAULT_FRAME_RATE = 30
+    }
 
     var cameraService: CameraService? = null
 
@@ -46,6 +57,10 @@ class StreamApiHandler {
             uri == "/api/mpegts/start" && method == NanoHTTPD.Method.POST -> startMpegTs(body)
             uri == "/api/mpegts/stop" && method == NanoHTTPD.Method.POST -> stopMpegTs()
             uri == "/api/mpegts/status" && method == NanoHTTPD.Method.GET -> getMpegTsStatus()
+
+            // Audio
+            uri == "/api/audio" && method == NanoHTTPD.Method.GET -> getAudio()
+            uri == "/api/audio" && method == NanoHTTPD.Method.POST -> setAudio(body)
 
             // Recording control
             uri == "/api/recording/start" && method == NanoHTTPD.Method.POST -> startRecording(body)
@@ -71,35 +86,18 @@ class StreamApiHandler {
     private fun startStream(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
-        val codecStr = body?.optString("codec", "H264") ?: "H264"
-        val codec = try { VideoCodec.valueOf(codecStr) } catch (e: Exception) { VideoCodec.H264 }
-
-        val config = EncoderConfig(
-            codec = codec,
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        camera.startStreaming(config)
+        val success = camera.startStreaming(encoderConfigFrom(body))
 
         val json = JSONObject().apply {
-            put("success", true)
-            put("message", "Streaming started")
-            put("config", JSONObject().apply {
-                put("width", width)
-                put("height", height)
-                put("bitrate", bitrate)
-                put("frameRate", frameRate)
-                put("codec", codec.name)
-            })
+            put("success", success)
+            put("message", if (success) "Streaming started" else "Failed to start the encoder")
+            camera.getEncoderConfig()?.let { put("config", encoderConfigJson(it)) }
         }
 
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        return NanoHTTPD.newFixedLengthResponse(
+            if (success) Status.OK else Status.INTERNAL_ERROR,
+            WebServer.MIME_JSON, json.toString()
+        )
     }
 
     private fun stopStream(): NanoHTTPD.Response {
@@ -130,13 +128,7 @@ class StreamApiHandler {
                 put("duration", stats.durationSec)
             }
             if (config != null) {
-                put("config", JSONObject().apply {
-                    put("width", config.width)
-                    put("height", config.height)
-                    put("bitrate", config.bitrateBps)
-                    put("frameRate", config.frameRate)
-                    put("codec", config.codec.name)
-                })
+                put("config", encoderConfigJson(config))
             }
         }
 
@@ -149,24 +141,16 @@ class StreamApiHandler {
         val camera = cameraService ?: return cameraUnavailable()
 
         val port = body?.optInt("port", 8554) ?: 8554
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
 
-        val config = EncoderConfig(
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        val success = camera.startRtspStreaming(config, port)
+        val success = camera.startRtspStreaming(encoderConfigFrom(body), port)
 
         val json = JSONObject().apply {
             put("success", success)
             if (success) {
                 put("url", camera.getRtspUrl())
                 put("message", "RTSP streaming started")
+                // A running encoder is shared, so report what is actually being sent
+                camera.getEncoderConfig()?.let { put("config", encoderConfigJson(it)) }
             } else {
                 put("message", "Failed to start RTSP streaming")
             }
@@ -219,28 +203,34 @@ class StreamApiHandler {
         val targetHost = body?.optString("targetHost", "") ?: ""
         val targetPort = body?.optInt("targetPort", 9000) ?: 9000
         val latencyMs = body?.optInt("latencyMs", 120) ?: 120
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
 
         val mode = if (modeStr.equals("caller", ignoreCase = true)) MpegTsMode.CALLER else MpegTsMode.LISTENER
+        if (mode == MpegTsMode.CALLER && targetHost.isBlank()) {
+            return ApiHandlerUtils.errorJson(
+                Status.BAD_REQUEST,
+                "Caller mode needs targetHost: the address of the machine receiving the stream (e.g. the PC running OBS)"
+            )
+        }
+        // Resolve here, on the request thread, rather than inside the camera
+        // service's start (which holds a lock other threads wait on)
+        val resolvedHost = if (mode == MpegTsMode.CALLER) {
+            resolveHost(targetHost) ?: return ApiHandlerUtils.errorJson(
+                Status.BAD_REQUEST,
+                "Cannot resolve targetHost"
+            )
+        } else {
+            targetHost
+        }
 
         val mpegtsConfig = MpegTsUdpConfig(
             port = port,
             mode = mode,
-            targetHost = targetHost,
+            targetHost = resolvedHost,
             targetPort = targetPort,
             latencyMs = latencyMs
         )
 
-        val encoderConfig = EncoderConfig(
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        val success = camera.startMpegTsStreaming(encoderConfig, mpegtsConfig)
+        val success = camera.startMpegTsStreaming(encoderConfigFrom(body), mpegtsConfig)
 
         val json = JSONObject().apply {
             put("success", success)
@@ -248,6 +238,8 @@ class StreamApiHandler {
                 put("message", "MPEG-TS/UDP streaming started")
                 put("port", port)
                 put("mode", mode.name)
+                if (mode == MpegTsMode.CALLER) put("target", "$targetHost:$targetPort")
+                camera.getEncoderConfig()?.let { put("config", encoderConfigJson(it)) }
             } else {
                 put("message", "Failed to start MPEG-TS/UDP streaming")
             }
@@ -291,15 +283,40 @@ class StreamApiHandler {
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    // ==================== Audio ====================
+
+    private fun getAudio(): NanoHTTPD.Response {
+        val camera = cameraService ?: return cameraUnavailable()
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, audioStatusJson(camera).toString())
+    }
+
+    /** Body: {"enabled": true|false}. Applies to running streams at once. */
+    private fun setAudio(body: JSONObject?): NanoHTTPD.Response {
+        val camera = cameraService ?: return cameraUnavailable()
+        if (body == null || !body.has("enabled")) return ApiHandlerUtils.bodyRequired()
+        camera.setAudioEnabled(body.optBoolean("enabled", true))
+        val json = audioStatusJson(camera).put("success", true)
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+    }
+
+    /** Microphone state: switched on, permitted, and actually being captured (with its settings). */
+    fun audioStatusJson(camera: CameraService): JSONObject = JSONObject().apply {
+        put("enabled", camera.audioEnabled)
+        put("permission", camera.hasMicrophonePermission())
+        put("active", camera.isAudioActive())
+        camera.getAudioConfig()?.let { audio ->
+            put("sampleRate", audio.sampleRate)
+            put("channels", audio.channelCount)
+            put("bitrate", audio.bitrateBps)
+            put("framesEncoded", camera.getAudioFramesEncoded())
+        }
+    }
+
     // ==================== Recording Control ====================
 
     private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val width = body?.optInt("width", 1920) ?: 1920
-        val height = body?.optInt("height", 1080) ?: 1080
-        val bitrate = body?.optInt("bitrate", 4_000_000) ?: 4_000_000
-        val frameRate = body?.optInt("frameRate", 30) ?: 30
         val segmentMinutes = body?.optInt("segmentMinutes", 5) ?: 5
 
         val segmentDuration = when (segmentMinutes) {
@@ -312,13 +329,7 @@ class StreamApiHandler {
             else -> SegmentDuration.FIVE_MINUTES
         }
 
-        val config = EncoderConfig(
-            resolution = android.util.Size(width, height),
-            bitrateBps = bitrate,
-            frameRate = frameRate
-        )
-
-        val success = camera.startRecording(config, segmentDuration)
+        val success = camera.startRecording(encoderConfigFrom(body), segmentDuration)
 
         val json = JSONObject().apply {
             put("success", success)
@@ -502,6 +513,39 @@ class StreamApiHandler {
     }
 
     // ==================== Helpers ====================
+
+    /**
+     * Encoder settings from a start request: width, height, bitrate (bps),
+     * frameRate and codec (H264 or H265), each defaulting to 1080p30 H.264 at 4 Mbps.
+     */
+    private fun encoderConfigFrom(body: JSONObject?): EncoderConfig {
+        val codecStr = body?.optString("codec", "H264") ?: "H264"
+        val codec = VideoCodec.entries.find { it.name.equals(codecStr, ignoreCase = true) } ?: VideoCodec.H264
+        return EncoderConfig(
+            codec = codec,
+            resolution = android.util.Size(
+                body?.optInt("width", DEFAULT_WIDTH) ?: DEFAULT_WIDTH,
+                body?.optInt("height", DEFAULT_HEIGHT) ?: DEFAULT_HEIGHT
+            ),
+            bitrateBps = body?.optInt("bitrate", DEFAULT_BITRATE) ?: DEFAULT_BITRATE,
+            frameRate = body?.optInt("frameRate", DEFAULT_FRAME_RATE) ?: DEFAULT_FRAME_RATE
+        )
+    }
+
+    private fun resolveHost(host: String): String? = try {
+        InetAddress.getByName(host).hostAddress
+    } catch (e: UnknownHostException) {
+        Timber.w(e, "Cannot resolve MPEG-TS target $host")
+        null
+    }
+
+    private fun encoderConfigJson(config: EncoderConfig): JSONObject = JSONObject().apply {
+        put("width", config.width)
+        put("height", config.height)
+        put("bitrate", config.bitrateBps)
+        put("frameRate", config.frameRate)
+        put("codec", config.codec.name)
+    }
 
     private fun cameraUnavailable(): NanoHTTPD.Response {
         return ApiHandlerUtils.serviceUnavailable("Camera service")

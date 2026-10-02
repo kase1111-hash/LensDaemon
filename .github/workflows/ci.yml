@@ -27,6 +27,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also asks for the legacy 'tools' package, which current
+          # command-line tools no longer offer, failing the step. Gradle installs
+          # the platform and build-tools it needs itself.
+          packages: 'platform-tools'
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
@@ -106,6 +111,11 @@ jobs:
 
       - name: Setup Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The default also asks for the legacy 'tools' package, which current
+          # command-line tools no longer offer, failing the step. Gradle installs
+          # the platform and build-tools it needs itself.
+          packages: 'platform-tools'
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
@@ -134,7 +144,11 @@ jobs:
           arch: x86_64
           profile: Nexus 6
           emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim
-          script: ./gradlew connectedFullDebugAndroidTest --no-daemon
+          # On failure, keep the device log with the report and print each
+          # failed test's part of it here, where it can be read without the artifact
+          script: |
+            adb logcat -c
+            ./gradlew connectedFullDebugAndroidTest --no-daemon || { mkdir -p app/build/reports/androidTests; adb logcat -d -v threadtime > app/build/reports/androidTests/logcat.txt; sh .github/scripts/failed-test-logcat.sh app/build/reports/androidTests/logcat.txt; exit 1; }
 
       - name: Upload instrumentation test results
         if: always()

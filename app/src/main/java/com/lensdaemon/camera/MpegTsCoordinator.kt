@@ -1,5 +1,7 @@
 package com.lensdaemon.camera
 
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.MpegTsMode
@@ -28,6 +30,22 @@ class MpegTsCoordinator {
         publisher?.sendFrame(frame)
     }
 
+    /** Forwards encoded AAC frames to the publisher */
+    val audioListener: (EncodedAudioFrame) -> Unit = { frame ->
+        publisher?.sendAudio(frame)
+    }
+
+    /** The audio carried with new and running publishers, or null for video only. */
+    private var audioConfig: AudioConfig? = null
+
+    /** Asks the encoder for a keyframe when a receiver starts. */
+    var onKeyframeRequest: (() -> Unit)? = null
+
+    /**
+     * Start publishing with [config]. A publisher already running with the
+     * same config is kept; one running with a different config (another
+     * target, port or mode) is replaced.
+     */
     fun start(
         config: MpegTsUdpConfig = MpegTsUdpConfig(),
         codec: VideoCodec = VideoCodec.H264,
@@ -35,13 +53,20 @@ class MpegTsCoordinator {
         pps: ByteArray? = null,
         vps: ByteArray? = null
     ): Boolean {
-        if (publisher?.isRunning() == true) {
-            Timber.w("MPEG-TS/UDP publisher already running")
-            return true
+        val running = publisher
+        if (running?.isRunning() == true) {
+            if (running.config == config) {
+                Timber.w("MPEG-TS/UDP publisher already running")
+                return true
+            }
+            Timber.i("MPEG-TS/UDP settings changed; restarting the publisher")
+            stop()
         }
 
         publisher = MpegTsUdpPublisher(config).also {
             it.setCodecConfig(codec, sps, pps, vps)
+            it.setAudioConfig(audioConfig)
+            it.onKeyframeRequest = { onKeyframeRequest?.invoke() }
         }
 
         val success = publisher?.start() ?: false
@@ -60,6 +85,17 @@ class MpegTsCoordinator {
         publisher = null
         _running.value = false
         Timber.i("MPEG-TS/UDP publisher stopped")
+    }
+
+    /** Carry [config]'s AAC stream (none when null), now and in publishers started later. */
+    fun setAudioConfig(config: AudioConfig?) {
+        audioConfig = config
+        publisher?.setAudioConfig(config)
+    }
+
+    /** Switch the running publisher to [codec]; its parameter sets follow from the stream. */
+    fun updateCodec(codec: VideoCodec) {
+        publisher?.setCodecConfig(codec, null, null, null)
     }
 
     fun isRunning(): Boolean = publisher?.isRunning() ?: false

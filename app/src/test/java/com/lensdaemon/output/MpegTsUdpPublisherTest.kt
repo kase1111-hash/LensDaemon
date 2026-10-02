@@ -1,5 +1,8 @@
 package com.lensdaemon.output
 
+import com.lensdaemon.encoder.Aac
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.VideoCodec
 import org.junit.Assert.assertEquals
@@ -46,6 +49,7 @@ class MpegTsUdpPublisherTest {
         private const val FLAG_CODEC_CONFIG = 2
 
         private val START_CODE = byteArrayOf(0x00, 0x00, 0x00, 0x01)
+        private val AUD = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x09, 0xF0.toByte())
         private val SPS = byteArrayOf(0x67, 0x42, 0x00, 0x1f, 0xe5.toByte(), 0x40, 0x5a)
         private val PPS = byteArrayOf(0x68, 0xce.toByte(), 0x38, 0x80.toByte())
     }
@@ -60,7 +64,7 @@ class MpegTsUdpPublisherTest {
         .apply { isAccessible = true }
 
     private val createPesMethod = MpegTsUdpPublisher::class.java
-        .getDeclaredMethod("createPesPacket", EncodedFrame::class.java, Long::class.java)
+        .getDeclaredMethod("createPesPacket", ByteArray::class.java, Long::class.java)
         .apply { isAccessible = true }
 
     private val mediaPtsMethod = MpegTsUdpPublisher::class.java
@@ -72,7 +76,7 @@ class MpegTsUdpPublisherTest {
         packetizeToTsMethod.invoke(publisher, VIDEO_PID, payload, isKeyFrame, pcr) as List<ByteArray>
 
     private fun createPes(frame: EncodedFrame, pts90kHz: Long): ByteArray =
-        createPesMethod.invoke(publisher, frame, pts90kHz) as ByteArray
+        createPesMethod.invoke(publisher, frame.data, pts90kHz) as ByteArray
 
     private fun mediaPts90kHz(presentationTimeUs: Long): Long =
         mediaPtsMethod.invoke(publisher, presentationTimeUs) as Long
@@ -233,8 +237,8 @@ class MpegTsUdpPublisherTest {
         )
 
         assertEquals("codec-config buffer must not become a PES of its own", 2, es.size)
-        assertArrayEqualsMsg("keyframe should be prefixed with SPS and PPS", START_CODE + SPS + START_CODE + PPS + idr, es[0])
-        assertArrayEqualsMsg("non-keyframe should be sent as-is", p, es[1])
+        assertArrayEqualsMsg("keyframe should be prefixed with AUD, SPS and PPS", AUD + START_CODE + SPS + START_CODE + PPS + idr, es[0])
+        assertArrayEqualsMsg("non-keyframe should be sent as-is behind its AUD", AUD + p, es[1])
     }
 
     @Test
@@ -246,7 +250,7 @@ class MpegTsUdpPublisherTest {
         )
 
         assertEquals(1, es.size)
-        assertArrayEqualsMsg("in-band parameter sets should be left alone", inBand, es[0])
+        assertArrayEqualsMsg("in-band parameter sets should be left alone", AUD + inBand, es[0])
     }
 
     @Test
@@ -265,23 +269,101 @@ class MpegTsUdpPublisherTest {
         )
 
         assertEquals(2, es.size)
-        assertArrayEqualsMsg("second keyframe should carry the refreshed sets", START_CODE + newSps + START_CODE + newPps + idr, es[1])
+        assertArrayEqualsMsg(
+            "second keyframe should carry the refreshed sets",
+            AUD + START_CODE + newSps + START_CODE + newPps + idr,
+            es[1]
+        )
     }
 
     @Test
     fun `listener-mode publisher keeps codec config that arrives before any viewer`() {
+        val idr = nal(0x65, 300)
+        val keyframeRequests = java.util.concurrent.atomic.AtomicInteger()
         val listener = MpegTsUdpPublisher(MpegTsUdpConfig(mode = MpegTsMode.LISTENER, port = 0))
+        listener.onKeyframeRequest = { keyframeRequests.incrementAndGet() }
         assertTrue(listener.start())
         try {
+            // The codec-config buffer arrives while nobody is watching...
             listener.sendFrame(EncodedFrame(START_CODE + SPS + START_CODE + PPS, 0L, FLAG_CODEC_CONFIG))
+
+            // ...then a viewer announces itself and the next keyframe must still describe itself.
+            DatagramSocket(0, InetAddress.getLoopbackAddress()).use { viewer ->
+                viewer.soTimeout = 300
+                val listenPort = (MpegTsUdpPublisher::class.java.getDeclaredField("socket")
+                    .apply { isAccessible = true }.get(listener) as DatagramSocket).localPort
+                viewer.send(DatagramPacket(ByteArray(1), 1, InetAddress.getLoopbackAddress(), listenPort))
+                val deadline = System.currentTimeMillis() + 3000
+                while (!listener.isConnected() && System.currentTimeMillis() < deadline) Thread.sleep(10)
+                assertTrue("listener should have learned the viewer's address", listener.isConnected())
+
+                listener.sendFrame(EncodedFrame(nal(0x41, 100), 16_000L, 0))
+                listener.sendFrame(EncodedFrame(idr, 33_333L, FLAG_KEY_FRAME))
+
+                val es = elementaryStreams(receiveVideoPackets(viewer))
+                assertEquals("the picture before the viewer's first keyframe must be held back", 1, es.size)
+                assertArrayEqualsMsg("keyframe should carry the early SPS and PPS", AUD + START_CODE + SPS + START_CODE + PPS + idr, es[0])
+            }
         } finally {
             listener.stop()
         }
+        assertEquals("a new viewer should trigger one keyframe request", 1, keyframeRequests.get())
+    }
 
-        val spsField = MpegTsUdpPublisher::class.java.getDeclaredField("sps").apply { isAccessible = true }
-        val ppsField = MpegTsUdpPublisher::class.java.getDeclaredField("pps").apply { isAccessible = true }
-        assertArrayEqualsMsg("SPS should be cached without a viewer", SPS, spsField.get(listener) as ByteArray)
-        assertArrayEqualsMsg("PPS should be cached without a viewer", PPS, ppsField.get(listener) as ByteArray)
+    @Test
+    fun `pictures before the first keyframe are held back`() {
+        val idr = nal(0x65, 300)
+        val p1 = nal(0x41, 120)
+        val p2 = nal(0x41, 130)
+        val es = elementaryStreamsOnTheWire(
+            configure = true,
+            frames = listOf(
+                EncodedFrame(p1, 0L, 0),
+                EncodedFrame(idr, 33_333L, FLAG_KEY_FRAME),
+                EncodedFrame(p2, 66_666L, 0)
+            )
+        )
+
+        assertEquals(2, es.size)
+        assertArrayEqualsMsg("stream should open on the keyframe", AUD + START_CODE + SPS + START_CODE + PPS + idr, es[0])
+        assertArrayEqualsMsg("pictures after it flow normally", AUD + p2, es[1])
+    }
+
+    @Test
+    fun `an access unit delimiter written by the encoder is not duplicated`() {
+        val withAud = AUD + nal(0x65, 200)
+        val es = elementaryStreamsOnTheWire(
+            configure = false,
+            frames = listOf(EncodedFrame(withAud, 0L, FLAG_KEY_FRAME))
+        )
+
+        assertEquals(1, es.size)
+        assertArrayEqualsMsg("encoder's own AUD should be kept as the only one", withAud, es[0])
+    }
+
+    @Test
+    fun `H265 access units get an HEVC access unit delimiter`() {
+        val hevcAud = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50)
+        val idrWRadl = START_CODE + byteArrayOf(0x26, 0x01) + ByteArray(200) { 0x22 }
+        val pes = createHevcPublisherPes(idrWRadl)
+
+        assertArrayEqualsMsg("HEVC AUD (type 35) should lead the access unit", hevcAud + idrWRadl, pes.copyOfRange(14, pes.size))
+    }
+
+    @Test
+    fun `a caller-mode publisher asks for a keyframe when it starts`() {
+        var requests = 0
+        val caller = MpegTsUdpPublisher(MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = 9))
+        caller.onKeyframeRequest = { requests++ }
+        assertTrue(caller.start())
+        caller.stop()
+        assertEquals(1, requests)
+    }
+
+    private fun createHevcPublisherPes(accessUnit: ByteArray): ByteArray {
+        val hevc = MpegTsUdpPublisher(MpegTsUdpConfig())
+        hevc.setCodecConfig(VideoCodec.H265, null, null, null)
+        return createPesMethod.invoke(hevc, accessUnit, 0L) as ByteArray
     }
 
     @Test
@@ -305,6 +387,116 @@ class MpegTsUdpPublisherTest {
         }
     }
 
+    @Test
+    fun `audio rides its own PID as ADTS once the video has started`() {
+        val audio = AudioConfig(sampleRate = 48_000, channelCount = 2)
+        val aac = ByteArray(300) { (it % 200).toByte() }
+        val packets = allPacketsOnTheWire(audio) { caller ->
+            caller.sendAudio(EncodedAudioFrame(aac, 0L))                       // before any picture: dropped
+            caller.sendFrame(EncodedFrame(nal(0x65, 600), 10_000L, FLAG_KEY_FRAME))
+            caller.sendAudio(EncodedAudioFrame(aac, 20_000L))
+        }
+
+        val pmt = packets.first { pid(it) == 4096 }
+        val entries = pmtStreams(pmt)
+        assertEquals("PMT should list video and audio", listOf(0x1B to 256, 0x0F to 257), entries)
+
+        val audioPackets = packets.filter { pid(it) == 257 }
+        assertEquals("one audio frame should have gone out", 1, audioPackets.count { (it[1].toInt() and 0x40) != 0 })
+        val pes = elementaryStreams(audioPackets).single()
+        val pesWithHeader = firstPes(audioPackets)
+        assertEquals("audio stream id", 0xC0, pesWithHeader[3].toInt() and 0xFF)
+        assertArrayEqualsMsg("ADTS header then the raw frame", Aac.adtsHeader(aac.size, 48_000, 2) + aac, pes)
+
+        val videoPts = readPts(firstPes(packets.filter { pid(it) == 256 }))!!
+        val audioPts = readPts(pesWithHeader)!!
+        assertEquals("audio 10 ms after the picture, on the same clock", 900L, (audioPts - videoPts) and PTS_MASK)
+    }
+
+    @Test
+    fun `without audio the PMT lists only video`() {
+        val packets = allPacketsOnTheWire(null) { caller ->
+            caller.sendFrame(EncodedFrame(nal(0x65, 200), 0L, FLAG_KEY_FRAME))
+            caller.sendAudio(EncodedAudioFrame(ByteArray(100), 10_000L))
+        }
+        assertEquals(listOf(0x1B to 256), pmtStreams(packets.first { pid(it) == 4096 }))
+        assertTrue("no audio PID without an audio config", packets.none { pid(it) == 257 })
+    }
+
+    private fun pid(pkt: ByteArray): Int = ((pkt[1].toInt() and 0x1F) shl 8) or (pkt[2].toInt() and 0xFF)
+
+    /** The (stream_type, PID) entries of a PMT packet, after checking its CRC. */
+    private fun pmtStreams(pmt: ByteArray): List<Pair<Int, Int>> {
+        val t = 5
+        val sectionLength = ((pmt[t + 1].toInt() and 0x0F) shl 8) or (pmt[t + 2].toInt() and 0xFF)
+        val sectionEnd = t + 3 + sectionLength
+        assertEquals("PMT CRC should cover the section", 0, crc32Mpeg(pmt, t, sectionEnd - t))
+        val entries = mutableListOf<Pair<Int, Int>>()
+        var w = t + 12
+        while (w < sectionEnd - 4) {
+            val type = pmt[w].toInt() and 0xFF
+            val pid = ((pmt[w + 1].toInt() and 0x1F) shl 8) or (pmt[w + 2].toInt() and 0xFF)
+            entries.add(type to pid)
+            w += 5
+        }
+        return entries
+    }
+
+    /** CRC-32/MPEG-2 over [length] bytes; 0 when the bytes end with their own valid CRC. */
+    private fun crc32Mpeg(data: ByteArray, offset: Int, length: Int): Int {
+        var crc = -1
+        for (i in offset until offset + length) {
+            crc = crc xor ((data[i].toInt() and 0xFF) shl 24)
+            repeat(8) { crc = if (crc and Int.MIN_VALUE != 0) (crc shl 1) xor 0x04C11DB7 else crc shl 1 }
+        }
+        return crc
+    }
+
+    /** Publishes in caller mode with [audio] and returns every TS packet received, in order. */
+    private fun allPacketsOnTheWire(audio: AudioConfig?, send: (MpegTsUdpPublisher) -> Unit): List<ByteArray> {
+        DatagramSocket(0, InetAddress.getLoopbackAddress()).use { receiver ->
+            receiver.soTimeout = 300
+            val caller = MpegTsUdpPublisher(
+                MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = receiver.localPort)
+            )
+            caller.setCodecConfig(VideoCodec.H264, SPS, PPS)
+            caller.setAudioConfig(audio)
+            assertTrue("publisher should start", caller.start())
+            try {
+                send(caller)
+            } finally {
+                caller.stop()
+            }
+            val packets = mutableListOf<ByteArray>()
+            val buf = ByteArray(65535)
+            while (true) {
+                val datagram = DatagramPacket(buf, buf.size)
+                try {
+                    receiver.receive(datagram)
+                } catch (expected: SocketTimeoutException) {
+                    break
+                }
+                for (off in 0 until datagram.length step TS_PACKET_SIZE) {
+                    packets.add(buf.copyOfRange(off, off + TS_PACKET_SIZE))
+                }
+            }
+            return packets
+        }
+    }
+
+    /** The first PES carried by [packets], header included. */
+    private fun firstPes(packets: List<ByteArray>): ByteArray {
+        fun unitStart(pkt: ByteArray) = (pkt[1].toInt() and 0x40) != 0
+        val first = packets.indexOfFirst { unitStart(it) }
+        if (first < 0) return ByteArray(0)
+        val pesPackets = listOf(packets[first]) + packets.drop(first + 1).takeWhile { !unitStart(it) }
+        val out = ByteArrayOutputStream()
+        for (pkt in pesPackets) {
+            payloadOffset(pkt)?.let { off -> out.write(pkt, off, TS_PACKET_SIZE - off) }
+        }
+        return out.toByteArray()
+    }
+
     /** A NAL unit of [type] with a start code and [payloadSize] bytes of body. */
     private fun nal(type: Int, payloadSize: Int): ByteArray =
         START_CODE + byteArrayOf(type.toByte()) + ByteArray(payloadSize) { (0x10 + it % 0xE0).toByte() }
@@ -323,30 +515,38 @@ class MpegTsUdpPublisherTest {
             } finally {
                 caller.stop()
             }
-
-            val packets = mutableListOf<ByteArray>()
-            val buf = ByteArray(65535)
-            while (true) {
-                val datagram = DatagramPacket(buf, buf.size)
-                try {
-                    receiver.receive(datagram)
-                } catch (expected: SocketTimeoutException) {
-                    break
-                }
-                assertEquals("datagram should hold whole TS packets", 0, datagram.length % TS_PACKET_SIZE)
-                for (off in 0 until datagram.length step TS_PACKET_SIZE) {
-                    packets.add(buf.copyOfRange(off, off + TS_PACKET_SIZE))
-                }
-            }
-            return packets.filter { ((it[1].toInt() and 0x1F) shl 8) or (it[2].toInt() and 0xFF) == VIDEO_PID }
+            return receiveVideoPackets(receiver)
         }
     }
 
+    /** Everything [receiver] gets until it goes quiet, as the video PID's TS packets in order. */
+    private fun receiveVideoPackets(receiver: DatagramSocket): List<ByteArray> {
+        val packets = mutableListOf<ByteArray>()
+        val buf = ByteArray(65535)
+        while (true) {
+            val datagram = DatagramPacket(buf, buf.size)
+            try {
+                receiver.receive(datagram)
+            } catch (expected: SocketTimeoutException) {
+                break
+            }
+            assertEquals("datagram should hold whole TS packets", 0, datagram.length % TS_PACKET_SIZE)
+            for (off in 0 until datagram.length step TS_PACKET_SIZE) {
+                packets.add(buf.copyOfRange(off, off + TS_PACKET_SIZE))
+            }
+        }
+        return packets.filter { ((it[1].toInt() and 0x1F) shl 8) or (it[2].toInt() and 0xFF) == VIDEO_PID }
+    }
+
     /** The elementary stream of every PES on the video PID, in order, as a demuxer would reassemble it. */
-    private fun elementaryStreamsOnTheWire(configure: Boolean, frames: List<EncodedFrame>): List<ByteArray> {
+    private fun elementaryStreamsOnTheWire(configure: Boolean, frames: List<EncodedFrame>): List<ByteArray> =
+        elementaryStreams(videoPacketsOnTheWire(configure, frames))
+
+    /** Reassemble the PES packets in [videoPackets] and return each one's elementary stream. */
+    private fun elementaryStreams(videoPackets: List<ByteArray>): List<ByteArray> {
         val pesList = mutableListOf<ByteArray>()
         var current: ByteArrayOutputStream? = null
-        for (pkt in videoPacketsOnTheWire(configure, frames)) {
+        for (pkt in videoPackets) {
             if ((pkt[1].toInt() and 0x40) != 0) {
                 current?.let { pesList.add(it.toByteArray()) }
                 current = ByteArrayOutputStream()

@@ -8,6 +8,7 @@ const API_BASE = '';
 // State
 let isStreaming = false;
 let isRtspRunning = false;
+let isMpegTsRunning = false;
 let isPreviewActive = false;
 let statusInterval = null;
 
@@ -31,6 +32,12 @@ const elements = {
     streamStatus: document.getElementById('stream-status'),
     rtspUrl: document.getElementById('rtsp-url'),
     rtspClients: document.getElementById('rtsp-clients'),
+    mpegtsHost: document.getElementById('mpegts-host'),
+    mpegtsPort: document.getElementById('mpegts-port'),
+    mpegtsStatus: document.getElementById('mpegts-status'),
+    mpegtsObsInput: document.getElementById('mpegts-obs-input'),
+    btnMpegtsStart: document.getElementById('btn-mpegts-start'),
+    btnMpegtsStop: document.getElementById('btn-mpegts-stop'),
     lensButtons: document.querySelectorAll('.btn-lens'),
     zoomSlider: document.getElementById('zoom-slider'),
     zoomValue: document.getElementById('zoom-value'),
@@ -40,6 +47,8 @@ const elements = {
     bitrate: document.getElementById('bitrate'),
     framerate: document.getElementById('framerate'),
     codec: document.getElementById('codec'),
+    audioEnabled: document.getElementById('audio-enabled'),
+    audioState: document.getElementById('audio-state'),
     statFrames: document.getElementById('stat-frames'),
     statFps: document.getElementById('stat-fps'),
     statBitrate: document.getElementById('stat-bitrate'),
@@ -99,6 +108,16 @@ function setupEventListeners() {
     // RTSP control
     elements.btnRtspStart.addEventListener('click', startRtsp);
     elements.btnRtspStop.addEventListener('click', stopRtsp);
+
+    // Phone microphone
+    elements.audioEnabled.addEventListener('change', setAudioEnabled);
+
+    // MPEG-TS/UDP control
+    elements.btnMpegtsStart.addEventListener('click', startMpegTs);
+    elements.btnMpegtsStop.addEventListener('click', stopMpegTs);
+    elements.mpegtsPort.addEventListener('input', () => {
+        elements.mpegtsObsInput.textContent = `udp://@:${elements.mpegtsPort.value || 9000}`;
+    });
 
     // Lens selection
     elements.lensButtons.forEach(btn => {
@@ -195,6 +214,10 @@ async function fetchDeviceInfo() {
     const info = await apiCall('/api/device');
     if (info) {
         elements.deviceInfo.textContent = `${info.manufacturer} ${info.model} | Android ${info.androidVersion}`;
+        // Default the MPEG-TS target to the computer this dashboard is open on
+        if (info.clientAddress && !elements.mpegtsHost.value) {
+            elements.mpegtsHost.value = info.clientAddress;
+        }
     }
 }
 
@@ -220,11 +243,20 @@ async function fetchStatus() {
             elements.statFrames.textContent = formatNumber(status.encoder.framesEncoded || 0);
             elements.statFps.textContent = (status.encoder.currentFps || 0).toFixed(1);
             elements.statBitrate.textContent = formatBitrate(status.encoder.currentBitrate || 0);
-            elements.statEncoder.textContent = status.encoder.state || 'IDLE';
+            const enc = status.encoder;
+            elements.statEncoder.textContent = enc.width
+                ? `${enc.state} ${enc.width}x${enc.height}@${enc.frameRate} ${enc.codec}`
+                : (enc.state || 'IDLE');
         }
 
         // RTSP status
         updateRtspStatus(status.rtsp);
+
+        // MPEG-TS status
+        updateMpegTsStatus(status.mpegts);
+
+        // Microphone
+        updateAudioStatus(status.audio);
 
         // Zoom
         if (status.camera?.zoom) {
@@ -270,7 +302,7 @@ function updateRtspStatus(rtsp) {
     isRtspRunning = rtsp.running;
     elements.btnRtspStart.disabled = rtsp.running;
     elements.btnRtspStop.disabled = !rtsp.running;
-    elements.rtspClients.textContent = rtsp.clients || 0;
+    elements.rtspClients.textContent = rtsp.playing || 0;
 
     if (rtsp.running && rtsp.url) {
         elements.rtspUrl.textContent = rtsp.url;
@@ -279,6 +311,68 @@ function updateRtspStatus(rtsp) {
         elements.rtspUrl.textContent = 'Not running';
         elements.rtspUrl.href = '#';
     }
+}
+
+// Update MPEG-TS status UI
+function updateMpegTsStatus(mpegts) {
+    if (!mpegts) return;
+
+    isMpegTsRunning = mpegts.running;
+    elements.btnMpegtsStart.disabled = mpegts.running;
+    elements.btnMpegtsStop.disabled = !mpegts.running;
+
+    if (!mpegts.running) {
+        elements.mpegtsStatus.textContent = 'Stopped';
+        elements.mpegtsStatus.className = 'status-text stopped';
+    } else if (mpegts.mode === 'CALLER') {
+        elements.mpegtsStatus.textContent = `Sending to ${mpegts.remoteAddress}`;
+        elements.mpegtsStatus.className = 'status-text running';
+    } else {
+        elements.mpegtsStatus.textContent = mpegts.connected
+            ? `Sending to ${mpegts.remoteAddress}`
+            : `Waiting for a receiver on port ${mpegts.port}`;
+        elements.mpegtsStatus.className = 'status-text running';
+    }
+}
+
+// Update microphone status UI
+function updateAudioStatus(audio) {
+    if (!audio) return;
+
+    elements.audioEnabled.checked = audio.enabled;
+    if (!audio.permission) {
+        elements.audioState.textContent = 'No permission: allow the microphone on the phone';
+    } else if (!audio.enabled) {
+        elements.audioState.textContent = 'Off';
+    } else if (audio.active) {
+        const channels = audio.channels === 2 ? 'stereo' : 'mono';
+        elements.audioState.textContent = `On · AAC ${audio.sampleRate / 1000} kHz ${channels}`;
+    } else {
+        elements.audioState.textContent = 'On (starts with the stream)';
+    }
+}
+
+async function setAudioEnabled() {
+    const result = await apiCall('/api/audio', 'POST', { enabled: elements.audioEnabled.checked });
+    if (result) {
+        updateAudioStatus(result);
+    }
+}
+
+// Encoder settings from the settings panel
+function encoderSettings() {
+    const resolution = elements.resolution.value.split('x');
+    return {
+        width: parseInt(resolution[0]),
+        height: parseInt(resolution[1]),
+        bitrate: parseFloat(elements.bitrate.value) * 1000000,
+        frameRate: parseInt(elements.framerate.value),
+        codec: elements.codec.value
+    };
+}
+
+function errorText(result) {
+    return result?.message || result?.error || 'Unknown error';
 }
 
 // Preview control
@@ -312,22 +406,16 @@ function stopPreview() {
 }
 
 // Stream control
+// Starting the encoder applies the settings panel; outputs started later
+// share the running encoder. Stop Streaming stops every output.
 async function startStream() {
-    const resolution = elements.resolution.value.split('x');
-    const config = {
-        width: parseInt(resolution[0]),
-        height: parseInt(resolution[1]),
-        bitrate: parseFloat(elements.bitrate.value) * 1000000,
-        frameRate: parseInt(elements.framerate.value),
-        codec: elements.codec.value
-    };
-
-    const result = await apiCall('/api/stream/start', 'POST', config);
+    const result = await apiCall('/api/stream/start', 'POST', encoderSettings());
     if (result?.success) {
         updateStreamStatus(true);
     } else {
-        alert('Failed to start streaming: ' + (result?.message || 'Unknown error'));
+        alert('Failed to start streaming: ' + errorText(result));
     }
+    fetchStatus();
 }
 
 async function stopStream() {
@@ -335,32 +423,54 @@ async function stopStream() {
     if (result?.success) {
         updateStreamStatus(false);
     }
+    fetchStatus();
 }
 
 // RTSP control
 async function startRtsp() {
-    const resolution = elements.resolution.value.split('x');
-    const config = {
-        width: parseInt(resolution[0]),
-        height: parseInt(resolution[1]),
-        bitrate: parseFloat(elements.bitrate.value) * 1000000,
-        frameRate: parseInt(elements.framerate.value),
-        port: 8554
-    };
+    const config = { ...encoderSettings(), port: 8554 };
 
     const result = await apiCall('/api/rtsp/start', 'POST', config);
     if (result?.success) {
-        updateRtspStatus({ running: true, url: result.url, clients: 0 });
+        updateRtspStatus({ running: true, url: result.url, playing: 0 });
     } else {
-        alert('Failed to start RTSP: ' + (result?.message || 'Unknown error'));
+        alert('Failed to start RTSP: ' + errorText(result));
     }
+    fetchStatus();
 }
 
 async function stopRtsp() {
     const result = await apiCall('/api/rtsp/stop', 'POST');
     if (result?.success) {
-        updateRtspStatus({ running: false, url: '', clients: 0 });
+        updateRtspStatus({ running: false, url: '', playing: 0 });
     }
+    fetchStatus();
+}
+
+// MPEG-TS/UDP control: push to the machine running OBS
+async function startMpegTs() {
+    const targetHost = elements.mpegtsHost.value.trim();
+    if (!targetHost) {
+        alert('Enter the address of the machine running OBS');
+        return;
+    }
+    const config = {
+        ...encoderSettings(),
+        mode: 'caller',
+        targetHost,
+        targetPort: parseInt(elements.mpegtsPort.value) || 9000
+    };
+
+    const result = await apiCall('/api/mpegts/start', 'POST', config);
+    if (!result?.success) {
+        alert('Failed to start MPEG-TS: ' + errorText(result));
+    }
+    fetchStatus();
+}
+
+async function stopMpegTs() {
+    await apiCall('/api/mpegts/stop', 'POST');
+    fetchStatus();
 }
 
 // Lens control

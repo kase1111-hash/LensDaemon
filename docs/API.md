@@ -24,57 +24,127 @@ If no `apiToken` is configured, all endpoints are accessible without credentials
 
 ### GET /api/status
 
-Returns device info, temperatures, and streaming state.
+Returns the camera, encoder and output state. The dashboard polls it every
+two seconds.
 
 **Response:**
 ```json
 {
-  "device": "Pixel 7 Pro",
-  "android": "13",
-  "uptime": 86400,
-  "streaming": true,
-  "rtsp": true,
-  "recording": false,
-  "temperatures": {
-    "cpu": 42.5,
-    "battery": 38.0,
-    "gpu": 40.0
+  "status": "ok",
+  "timestamp": 1699887600000,
+  "camera": {
+    "previewActive": true,
+    "streamingActive": true,
+    "currentLens": "MAIN",
+    "zoom": 1.0
   },
   "encoder": {
-    "codec": "H265",
-    "resolution": "1920x1080",
-    "bitrate": 6000000,
-    "fps": 30
+    "state": "ENCODING",
+    "framesEncoded": 5400,
+    "currentBitrate": 3950000,
+    "currentFps": 30.0,
+    "width": 1920,
+    "height": 1080,
+    "frameRate": 30,
+    "bitrate": 4000000,
+    "codec": "H264"
   },
-  "lens": "main",
-  "zoom": 1.0,
-  "clients": {
-    "rtsp": 2,
-    "mjpeg": 1
+  "rtsp": {
+    "running": true,
+    "url": "rtsp://192.168.1.50:8554/stream",
+    "clients": 1,
+    "playing": 1
+  },
+  "mpegts": {
+    "running": true,
+    "mode": "CALLER",
+    "connected": true,
+    "remoteAddress": "192.168.1.20:9000",
+    "port": 9000
+  },
+  "recording": {
+    "active": false,
+    "paused": false
+  },
+  "audio": {
+    "enabled": true,
+    "permission": true,
+    "active": true,
+    "sampleRate": 48000,
+    "channels": 2,
+    "bitrate": 128000,
+    "framesEncoded": 28125
   }
 }
 ```
 
+### Encoder settings in start requests
+
+`/api/stream/start`, `/api/rtsp/start`, `/api/mpegts/start` and
+`/api/recording/start` all accept the same optional encoder fields:
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `width`, `height` | `1920`, `1080` | Must be a size the hardware encoder supports |
+| `bitrate` | `4000000` | Bits per second |
+| `frameRate` | `30` | The camera is locked to this rate (see below) |
+| `codec` | `H264` | `H264` or `H265` |
+
+There is one encoder, shared by every output. An output started while the
+encoder is already running joins it as it is, and the response's `config`
+reports the settings actually being sent. To change settings while streaming,
+call `/api/stream/start` with the new ones.
+
+The camera's auto-exposure is held at the stream's frame rate, so the stream
+does not drop frames in dim light; if the camera cannot reach the requested
+rate it runs at its fastest fixed rate instead.
+
 ### POST /api/stream/start
 
-Start the video encoder.
+Start the encoder with the given settings (see above) and keep it running until
+`/api/stream/stop`, whether or not any output is attached. If the encoder is
+already running with different settings it is restarted: RTSP and MPEG-TS
+viewers stay connected and continue from the new stream's first keyframe, and
+an active recording continues in a new segment.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "Streaming started"
+  "success": true,
+  "message": "Streaming started",
+  "config": { "width": 1920, "height": 1080, "bitrate": 4000000, "frameRate": 30, "codec": "H264" }
 }
 ```
 
+Returns `500` with `"success": false` if the encoder could not be started.
+
+### GET /api/audio, POST /api/audio
+
+The phone's microphone, captured whenever the encoder runs and sent with the
+video as AAC-LC (48 kHz, stereo or mono depending on the phone, 128 kbps) on
+every output. Audio is stamped on the camera's clock, so it stays in sync with
+the picture. It needs the RECORD_AUDIO permission, granted on the phone; without
+it, or with audio switched off, streams carry video only.
+
+**Request (POST):** `{"enabled": false}` switches the microphone off (`true` on).
+It applies at once while streaming: RTSP clients that connect afterwards are
+offered (or not offered) an audio track, MPEG-TS receivers see the PMT change,
+and a recording changes from its next segment. The setting is kept across
+restarts.
+
+**Response (both):** the `audio` object shown under `/api/status`; `active` is
+false until the encoder runs, and the settings fields are present only while
+audio is being captured.
+
 ### POST /api/stream/stop
 
-Stop the video encoder.
+Stop streaming: the RTSP server, the MPEG-TS publisher, any recording, and the
+encoder.
 
 **Response:**
 ```json
 {
-  "status": "ok",
+  "success": true,
   "message": "Streaming stopped"
 }
 ```
@@ -155,30 +225,126 @@ Update encoder configuration. Accepts partial updates -- only include the fields
 
 ## RTSP
 
-The RTSP server runs on port 8554 and supports up to 10 concurrent clients.
+The RTSP server runs on port 8554 and supports up to 10 concurrent clients,
+over UDP or TCP (interleaved). Any path is accepted;
+`rtsp://<device-ip>:8554/stream` is the advertised one.
+
+With audio on, the SDP offers a second track, `trackID=1`: AAC as
+`MPEG4-GENERIC` (RFC 3640, AAC-hbr). Each track sends RTCP sender reports
+(on the RTCP port, or the odd interleaved channel over TCP), which is what
+players use to keep audio and video in sync.
+
+A viewer that connects to a running stream (OBS reconnecting, a second player)
+is sent nothing until a keyframe, which is requested from the encoder the moment
+it sends PLAY, and that keyframe carries the SPS/PPS it needs to decode. A
+viewer that falls more than about two seconds behind skips to the next keyframe
+rather than decoding a damaged picture.
 
 ### POST /api/rtsp/start
 
-Start the RTSP server.
+Start the RTSP server, starting the encoder too if it is not running.
+
+**Request (all optional):** the encoder fields above, plus `port` (default `8554`).
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "RTSP server started",
-  "url": "rtsp://192.168.1.100:8554/stream"
+  "success": true,
+  "message": "RTSP streaming started",
+  "url": "rtsp://192.168.1.50:8554/stream",
+  "config": { "width": 1920, "height": 1080, "bitrate": 4000000, "frameRate": 30, "codec": "H264" }
 }
 ```
 
 ### POST /api/rtsp/stop
 
-Stop the RTSP server and disconnect all clients.
+Stop the RTSP server and disconnect its clients. The encoder keeps running if
+another output (or `/api/stream/start`) still uses it.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "RTSP server stopped"
+  "success": true,
+  "message": "RTSP streaming stopped"
+}
+```
+
+### GET /api/rtsp/status
+
+```json
+{
+  "running": true,
+  "url": "rtsp://192.168.1.50:8554/stream",
+  "clients": 1,
+  "playing": 1,
+  "totalConnections": 3,
+  "totalPackets": 120000,
+  "totalBytes": 150000000,
+  "uptime": 600000
+}
+```
+
+---
+
+## MPEG-TS over UDP
+
+Plain MPEG transport stream in UDP datagrams (7 TS packets each). There is no
+encryption and no retransmission, so use it on a wired or solid WiFi LAN. It
+has lower latency than RTSP in OBS. Each receiver starts on a keyframe with its
+parameter sets, and every picture carries an access unit delimiter. With audio
+on, AAC travels as ADTS on PID 257 (stream type 0x0F) next to the video on PID
+256, on the same clock.
+
+### POST /api/mpegts/start
+
+Start publishing, starting the encoder too if it is not running.
+
+**Request:**
+| Field | Default | Notes |
+|-------|---------|-------|
+| `mode` | `listener` | `caller` pushes to `targetHost:targetPort`; `listener` waits on `port` and sends to whoever sends it a datagram first |
+| `targetHost` | | Required for `caller`: the machine running OBS/VLC/ffplay |
+| `targetPort` | `9000` | |
+| `port` | `9000` | Listener mode's local port |
+| `latencyMs` | `120` | Decoder buffer delay (PCR to PTS) |
+
+plus the encoder fields above. A publisher already running with other settings
+is replaced.
+
+Receive a `caller` stream in OBS with a Media Source (untick "Local File") whose
+Input is `udp://@:9000`, or with `ffplay udp://@:9000`.
+
+**Response:**
+```json
+{
+  "success": true,
+  "message": "MPEG-TS/UDP streaming started",
+  "port": 9000,
+  "mode": "CALLER",
+  "target": "192.168.1.20:9000",
+  "config": { "width": 1920, "height": 1080, "bitrate": 4000000, "frameRate": 30, "codec": "H264" }
+}
+```
+
+Returns `400` if `caller` mode has no `targetHost`.
+
+### POST /api/mpegts/stop
+
+Stop the publisher. The encoder keeps running if another output still uses it.
+
+### GET /api/mpegts/status
+
+```json
+{
+  "running": true,
+  "connected": true,
+  "mode": "CALLER",
+  "port": 9000,
+  "remoteAddress": "192.168.1.20:9000",
+  "bytesSent": 75000000,
+  "packetsSent": 400000,
+  "framesSent": 18000,
+  "uptime": 600000
 }
 ```
 
@@ -255,7 +421,11 @@ Set exposure compensation in EV steps.
 
 ### POST /api/recording/start
 
-Start local recording to MP4.
+Start local recording to MP4, alongside any stream (it shares the running
+encoder) or on its own.
+
+**Request (all optional):** the encoder fields above, plus `segmentMinutes`
+(`0` for one continuous file, or `1`, `5`, `15`, `30`, `60`; default `5`).
 
 **Response:**
 ```json

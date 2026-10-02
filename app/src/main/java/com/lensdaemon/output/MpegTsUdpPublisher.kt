@@ -1,6 +1,11 @@
 package com.lensdaemon.output
 
+import com.lensdaemon.encoder.Aac
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.H264NalType
+import com.lensdaemon.encoder.H265NalType
 import com.lensdaemon.encoder.NalUnitParser
 import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
@@ -42,11 +47,13 @@ data class MpegTsUdpStats(
  * Features:
  * - Caller mode (push to remote) and Listener mode (accept incoming pulls)
  * - MPEG-TS packetization with periodic PAT/PMT tables
- * - H.264 and H.265 stream type support
+ * - H.264 and H.265 stream type support, one access unit delimiter per picture
+ * - Optional AAC audio (ADTS) on its own PID, on the video's clock
+ * - Each receiver starts on a keyframe carrying its parameter sets
  * - Coroutine-based async architecture with SupervisorJob
  * - Real-time statistics via StateFlow
  */
-class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()) {
+class MpegTsUdpPublisher(val config: MpegTsUdpConfig = MpegTsUdpConfig()) {
 
     companion object {
         private const val TAG = "MpegTsUdpPublisher"
@@ -55,8 +62,19 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         private const val PAT_PID = 0
         private const val PMT_PID = 4096
         private const val VIDEO_PID = 256
+        private const val AUDIO_PID = 257
         private const val H264_STREAM_TYPE = 0x1B
         private const val H265_STREAM_TYPE = 0x24
+
+        /** ISO/IEC 13818-7 AAC with ADTS framing. */
+        private const val AAC_ADTS_STREAM_TYPE = 0x0F
+        private const val VIDEO_STREAM_ID = 0xE0
+        private const val AUDIO_STREAM_ID = 0xC0
+
+        /** PMT bytes after section_length, before the stream entries: program, version, sections, PCR PID, info length. */
+        private const val PMT_FIXED_SECTION_BYTES = 9
+        private const val PMT_ES_ENTRY_BYTES = 5
+        private const val CRC_BYTES = 4
         private const val PAT_PMT_INTERVAL_MS = 500L
         private const val TS_PACKETS_PER_DATAGRAM = 7
 
@@ -72,6 +90,15 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
 
         /** Payload bytes available once a PCR adaptation field is present. */
         private const val TS_PAYLOAD_WITH_PCR = TS_PACKET_SIZE - 5 - AF_PCR_DATA_LEN
+
+        /**
+         * Access unit delimiters. H.222.0 requires one at the start of every
+         * H.264/H.265 access unit carried in a transport stream; decoders that
+         * split the stream into pictures (hardware ones especially) rely on it.
+         * primary_pic_type / pic_type "any", followed by the RBSP stop bit.
+         */
+        private val H264_AUD = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x09, 0xF0.toByte())
+        private val H265_AUD = byteArrayOf(0x00, 0x00, 0x00, 0x01, 0x46, 0x01, 0x50)
     }
 
     private val isRunning = AtomicBoolean(false)
@@ -85,16 +112,34 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
     @Volatile
     private var remoteAddress: InetSocketAddress? = null
 
+    @Volatile
     private var codec: VideoCodec = VideoCodec.H264
-    private var sps: ByteArray? = null
-    private var pps: ByteArray? = null
-    private var vps: ByteArray? = null
 
-    /** Extracts parameter sets from codec-config buffers and in-band keyframes. */
-    private var nalParser = NalUnitParser(isHevc = false)
+    /**
+     * Starts the receiver on a keyframe and keeps every keyframe
+     * self-describing. Guarded by this publisher: frames arrive on the
+     * encoder's thread, a new listener-mode peer on the listener coroutine.
+     */
+    private var aligner = KeyframeAligner(isHevc = false)
+
+    /**
+     * Asks the encoder for a keyframe, so a receiver that starts (or a new
+     * listener-mode peer) gets a picture right away instead of waiting out
+     * the GOP.
+     */
+    @Volatile
+    var onKeyframeRequest: (() -> Unit)? = null
 
     private var continuityCounters = IntArray(8192)
     private var lastPatPmtTime = 0L
+
+    /** PMT version_number; bumped when the streams change so receivers re-read them. */
+    @Volatile
+    private var pmtVersion = 0
+
+    /** The AAC stream carried alongside the video, or null for video only. */
+    @Volatile
+    private var audioConfig: AudioConfig? = null
     private var startTimeMs = 0L
 
     /**
@@ -109,12 +154,55 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
     private var framesSent = 0L
 
     fun setCodecConfig(codec: VideoCodec, sps: ByteArray?, pps: ByteArray?, vps: ByteArray? = null) {
-        this.codec = codec
-        this.sps = sps
-        this.pps = pps
-        this.vps = vps
-        nalParser = NalUnitParser(isHevc = codec == VideoCodec.H265)
+        synchronized(this) {
+            // A new codec needs a new parser; otherwise keep what the aligner
+            // already learned from the stream and only add what is given.
+            if (codec != this.codec) {
+                this.codec = codec
+                aligner = KeyframeAligner(isHevc = codec == VideoCodec.H265)
+                pmtVersion = (pmtVersion + 1) and 0x1F
+                lastPatPmtTime = 0L // announce the new PMT with the next frame
+            }
+            aligner.setParameterSets(vps, sps, pps)
+        }
         Timber.d("$TAG: Codec config set - codec=$codec, sps=${sps?.size}, pps=${pps?.size}, vps=${vps?.size}")
+    }
+
+    /**
+     * Carry [config]'s AAC stream on the audio PID, or no audio when null.
+     * The PMT is re-announced with a new version so receivers pick it up.
+     */
+    fun setAudioConfig(config: AudioConfig?) {
+        synchronized(this) {
+            if (config == audioConfig) return
+            audioConfig = config
+            pmtVersion = (pmtVersion + 1) and 0x1F
+            lastPatPmtTime = 0L
+        }
+        Timber.d("$TAG: Audio ${config?.let { "${it.sampleRate} Hz x ${it.channelCount}" } ?: "off"}")
+    }
+
+    /**
+     * Send one AAC frame as an ADTS PES on the audio PID. Audio starts once
+     * the receiver's video has (its first keyframe): until then there is no
+     * clock to place it on, and a player would start on sound alone.
+     */
+    fun sendAudio(frame: EncodedAudioFrame) {
+        if (!isRunning.get() || frame.isConfig) return
+        val audio = audioConfig ?: return
+        val target = remoteAddress ?: return
+        try {
+            synchronized(this) {
+                if (!aligner.started || ptsBaseUs < 0) return
+                // Earlier than the buffer delay before the stream's first picture: no PTS for it
+                if (frame.presentationTimeUs < ptsBaseUs - config.latencyMs * 1000L) return
+                val adts = Aac.adtsHeader(frame.size, audio.sampleRate, audio.channelCount) + frame.data
+                val pes = pesPacket(AUDIO_STREAM_ID, adts, mediaPts90kHz(frame.presentationTimeUs))
+                sendTsPackets(packetizeToTs(AUDIO_PID, pes, false, null), target)
+            }
+        } catch (e: java.io.IOException) {
+            Timber.e(e, "$TAG: Error sending audio")
+        }
     }
 
     fun start(): Boolean {
@@ -156,6 +244,7 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
             framesSent = 0L
             updateStats()
             Timber.i("$TAG: MPEG-TS/UDP publisher started (mode=${config.mode}, port=${config.port})")
+            if (config.mode == MpegTsMode.CALLER) onKeyframeRequest?.invoke()
             true
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Failed to start MPEG-TS/UDP publisher")
@@ -178,35 +267,42 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
             // MediaCodec hands over SPS/PPS (and VPS) in a codec-config buffer
             // only once the first frame has been encoded, which is after this
             // publisher was configured from whatever the encoder had cached at
-            // the time: nothing, on a freshly initialized encoder. Keep them so
-            // every keyframe is self-describing. This runs before the peer check
-            // so a listener-mode publisher still learns them while it is waiting
-            // for its first viewer.
-            cacheParameterSets(frame.data)
+            // the time: nothing, on a freshly initialized encoder. The aligner
+            // keeps them so every keyframe is self-describing. This runs before
+            // the peer check so a listener-mode publisher still learns them
+            // while it is waiting for its first viewer.
+            synchronized(this) { aligner.process(frame) }
             return
         }
         val target = remoteAddress ?: return
+        // Nothing reaches a receiver before its first keyframe: those pictures
+        // reference frames it never saw and would only decode as garbage.
+        val accessUnit = synchronized(this) { aligner.process(frame) } ?: return
 
         try {
-            val now = System.currentTimeMillis()
-            if (now - lastPatPmtTime >= PAT_PMT_INTERVAL_MS) {
-                sendPatPmt(target)
-                lastPatPmtTime = now
+            // One lock for video and audio: they share the socket, the
+            // continuity counters and the statistics
+            synchronized(this) {
+                val now = System.currentTimeMillis()
+                if (now - lastPatPmtTime >= PAT_PMT_INTERVAL_MS) {
+                    sendPatPmt(target)
+                    lastPatPmtTime = now
+                }
+
+                if (ptsBaseUs < 0) ptsBaseUs = frame.presentationTimeUs
+                val pts90kHz = mediaPts90kHz(frame.presentationTimeUs)
+                // PCR shares the media clock with PTS, trailing it by the configured
+                // decoder buffer delay. A PCR rides the first packet of every frame so
+                // the interval stays well inside the 100 ms ISO 13818-1 ceiling.
+                val pcr90kHz = (pts90kHz - config.latencyMs * PTS_CLOCK_HZ / 1000L) and PTS_MASK
+
+                val pesPacket = createPesPacket(accessUnit, pts90kHz)
+                val tsPackets = packetizeToTs(VIDEO_PID, pesPacket, frame.isKeyFrame, pcr90kHz)
+                sendTsPackets(tsPackets, target)
+
+                framesSent++
+                updateStats()
             }
-
-            if (ptsBaseUs < 0) ptsBaseUs = frame.presentationTimeUs
-            val pts90kHz = mediaPts90kHz(frame.presentationTimeUs)
-            // PCR shares the media clock with PTS, trailing it by the configured
-            // decoder buffer delay. A PCR rides the first packet of every frame so
-            // the interval stays well inside the 100 ms ISO 13818-1 ceiling.
-            val pcr90kHz = (pts90kHz - config.latencyMs * PTS_CLOCK_HZ / 1000L) and PTS_MASK
-
-            val pesPacket = createPesPacket(frame, pts90kHz)
-            val tsPackets = packetizeToTs(VIDEO_PID, pesPacket, frame.isKeyFrame, pcr90kHz)
-            sendTsPackets(tsPackets, target)
-
-            framesSent++
-            updateStats()
         } catch (e: Exception) {
             Timber.e(e, "$TAG: Error sending frame")
         }
@@ -233,9 +329,15 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
                 }
                 val peer = InetSocketAddress(packet.address, packet.port)
                 if (remoteAddress == null || remoteAddress != peer) {
-                    remoteAddress = peer
+                    // A new receiver starts from scratch: hold pictures back
+                    // until a keyframe, and ask for one now.
+                    synchronized(this@MpegTsUdpPublisher) {
+                        aligner.reset()
+                        remoteAddress = peer
+                    }
                     Timber.i("$TAG: Peer connected from ${peer.address.hostAddress}:${peer.port}")
                     updateStats()
+                    onKeyframeRequest?.invoke()
                 }
             } catch (_: SocketTimeoutException) {
                 // Normal timeout, continue
@@ -289,7 +391,12 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
     private fun buildPmtPacket(): ByteArray {
         val pkt = ByteArray(TS_PACKET_SIZE).apply { fill(0xFF.toByte()) }
         val cc = nextContinuityCounter(PMT_PID)
-        val streamType = if (codec == VideoCodec.H264) H264_STREAM_TYPE else H265_STREAM_TYPE
+        val videoType = if (codec == VideoCodec.H264) H264_STREAM_TYPE else H265_STREAM_TYPE
+        val streams = listOfNotNull(
+            videoType to VIDEO_PID,
+            audioConfig?.let { AAC_ADTS_STREAM_TYPE to AUDIO_PID }
+        )
+        val sectionLength = PMT_FIXED_SECTION_BYTES + PMT_ES_ENTRY_BYTES * streams.size + CRC_BYTES
 
         pkt[0] = TS_SYNC_BYTE
         pkt[1] = (0x40 or ((PMT_PID shr 8) and 0x1F)).toByte()
@@ -299,23 +406,28 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
 
         val t = 5
         pkt[t] = 0x02                                                    // table_id (PMT)
-        pkt[t + 1] = 0xB0.toByte(); pkt[t + 2] = 0x12                   // section_syntax + length=18
+        pkt[t + 1] = (0xB0 or (sectionLength shr 8)).toByte()            // section_syntax + length
+        pkt[t + 2] = (sectionLength and 0xFF).toByte()
         pkt[t + 3] = 0x00; pkt[t + 4] = 0x01                            // program_number=1
-        pkt[t + 5] = 0xC1.toByte()                                      // version=0, current_next=1
+        pkt[t + 5] = (0xC1 or (pmtVersion shl 1)).toByte()              // version, current_next=1
         pkt[t + 6] = 0x00; pkt[t + 7] = 0x00                            // section/last section
         pkt[t + 8] = (0xE0 or ((VIDEO_PID shr 8) and 0x1F)).toByte()    // PCR PID high
         pkt[t + 9] = (VIDEO_PID and 0xFF).toByte()                      // PCR PID low
         pkt[t + 10] = 0xF0.toByte(); pkt[t + 11] = 0x00                 // program info length=0
-        pkt[t + 12] = streamType.toByte()                                // stream type
-        pkt[t + 13] = (0xE0 or ((VIDEO_PID shr 8) and 0x1F)).toByte()   // elementary PID high
-        pkt[t + 14] = (VIDEO_PID and 0xFF).toByte()                     // elementary PID low
-        pkt[t + 15] = 0xF0.toByte(); pkt[t + 16] = 0x00                 // ES info length=0
 
-        val crc = calculateCrc32(pkt, t, 17)
-        pkt[t + 17] = ((crc shr 24) and 0xFF).toByte()
-        pkt[t + 18] = ((crc shr 16) and 0xFF).toByte()
-        pkt[t + 19] = ((crc shr 8) and 0xFF).toByte()
-        pkt[t + 20] = (crc and 0xFF).toByte()
+        var w = t + 12
+        for ((streamType, pid) in streams) {
+            pkt[w++] = streamType.toByte()                               // stream type
+            pkt[w++] = (0xE0 or ((pid shr 8) and 0x1F)).toByte()         // elementary PID high
+            pkt[w++] = (pid and 0xFF).toByte()                           // elementary PID low
+            pkt[w++] = 0xF0.toByte(); pkt[w++] = 0x00                    // ES info length=0
+        }
+
+        val crc = calculateCrc32(pkt, t, w - t)
+        pkt[w++] = ((crc shr 24) and 0xFF).toByte()
+        pkt[w++] = ((crc shr 16) and 0xFF).toByte()
+        pkt[w++] = ((crc shr 8) and 0xFF).toByte()
+        pkt[w] = (crc and 0xFF).toByte()
         return pkt
     }
 
@@ -333,55 +445,43 @@ class MpegTsUdpPublisher(private val config: MpegTsUdpConfig = MpegTsUdpConfig()
         return ((mediaUs * PTS_CLOCK_HZ / 1_000_000L) + offsetTicks) and PTS_MASK
     }
 
-    private fun createPesPacket(frame: EncodedFrame, pts90kHz: Long): ByteArray {
-        val accessUnit = if (frame.isKeyFrame) buildKeyframeAU(frame.data) else frame.data
-        val pesPayloadLen = 3 + 5 + accessUnit.size  // flags(2) + hdrLen(1) + PTS(5) + data
+    /**
+     * Wrap one access unit in a PES packet, led by an access unit delimiter
+     * unless the encoder already wrote one.
+     */
+    private fun createPesPacket(accessUnit: ByteArray, pts90kHz: Long): ByteArray {
+        val aud = if (startsWithAud(accessUnit)) ByteArray(0) else if (codec == VideoCodec.H265) H265_AUD else H264_AUD
+        return pesPacket(VIDEO_STREAM_ID, aud + accessUnit, pts90kHz)
+    }
+
+    /** A PES packet with a PTS. Video PES larger than the length field can say declare length 0. */
+    private fun pesPacket(streamId: Int, payload: ByteArray, pts90kHz: Long): ByteArray {
+        val pesPayloadLen = 3 + 5 + payload.size  // flags(2) + hdrLen(1) + PTS(5) + data
         val lengthField = if (pesPayloadLen > 0xFFFF) 0 else pesPayloadLen
 
-        val buf = ByteBuffer.allocate(14 + accessUnit.size)
+        val buf = ByteBuffer.allocate(14 + payload.size)
         buf.put(0x00); buf.put(0x00); buf.put(0x01) // start code
-        buf.put(0xE0.toByte())                       // stream_id = video 0
+        buf.put(streamId.toByte())
         buf.put(((lengthField shr 8) and 0xFF).toByte())
         buf.put((lengthField and 0xFF).toByte())
         buf.put(0x80.toByte())                       // marker bits
         buf.put(0x80.toByte())                       // PTS only
         buf.put(0x05)                                // PTS header data length
         writePts(buf, pts90kHz)
-        buf.put(accessUnit)
+        buf.put(payload)
         return buf.array()
     }
 
-    /**
-     * Prefix a keyframe with the parameter sets a decoder needs to start from
-     * it. Encoders that already inline SPS/PPS into their IDR buffers are left
-     * alone; their in-band copies refresh the cache instead, so a later change
-     * of resolution or profile is carried forward.
-     */
-    private fun buildKeyframeAU(frameData: ByteArray): ByteArray {
-        if (cacheParameterSets(frameData)) return frameData
-
-        val startCode = byteArrayOf(0x00, 0x00, 0x00, 0x01)
-        val parts = mutableListOf<ByteArray>()
-        if (codec == VideoCodec.H265) vps?.let { parts.add(startCode); parts.add(it) }
-        sps?.let { parts.add(startCode); parts.add(it) }
-        pps?.let { parts.add(startCode); parts.add(it) }
-        parts.add(frameData)
-
-        val result = ByteArray(parts.sumOf { it.size })
-        var off = 0
-        for (part in parts) { System.arraycopy(part, 0, result, off, part.size); off += part.size }
-        return result
-    }
-
-    /**
-     * Cache any SPS/PPS/VPS carried in [data]. Returns true if it carried any.
-     */
-    private fun cacheParameterSets(data: ByteArray): Boolean {
-        val units = nalParser.parse(data)
-        nalParser.sps?.let { sps = it }
-        nalParser.pps?.let { pps = it }
-        nalParser.vps?.let { vps = it }
-        return units.any { it.isConfigData }
+    /** True if [accessUnit] opens with an access unit delimiter NAL unit. */
+    private fun startsWithAud(accessUnit: ByteArray): Boolean {
+        val startCode = NalUnitParser.findStartCode(accessUnit, 0)
+        if (startCode == 0 || accessUnit.size <= startCode) return false
+        val header = accessUnit[startCode].toInt()
+        return if (codec == VideoCodec.H265) {
+            ((header and 0x7E) shr 1) == H265NalType.AUD
+        } else {
+            (header and 0x1F) == H264NalType.AUD
+        }
     }
 
     private fun writePts(buf: ByteBuffer, pts: Long) {

@@ -30,9 +30,15 @@ import com.lensdaemon.camera.FocusState
 import com.lensdaemon.camera.LensType
 import com.lensdaemon.databinding.ActivityMainBinding
 import com.lensdaemon.web.WebServerService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import timber.log.Timber
+import java.util.Locale
 
 /**
  * Main activity for LensDaemon.
@@ -40,7 +46,15 @@ import timber.log.Timber
  */
 class MainActivity : AppCompatActivity() {
 
+    companion object {
+        private const val STREAM_STATUS_REFRESH_MS = 1000L
+    }
+
     private lateinit var binding: ActivityMainBinding
+
+    /** Refreshes the stream overlay while the activity is visible. */
+    private var streamStatusJob: Job? = null
+    private var shownStreaming: Boolean? = null
 
     // Camera service connection
     private var cameraService: CameraService? = null
@@ -55,13 +69,14 @@ class MainActivity : AppCompatActivity() {
     private val hideFocusIndicatorRunnable = Runnable { hideFocusIndicator() }
 
     /**
-     * Only permissions the app actually uses and the platform knows about.
-     * Requesting an undeclared permission (audio is not captured) or the
-     * notification permission on Android 12 and below is refused outright and
-     * used to stop the launch flow before the camera ever started.
+     * Only permissions the app actually uses and the platform knows about:
+     * requesting the notification permission on Android 12 and below is
+     * refused outright. Only the camera is essential; without the microphone
+     * the streams carry video only.
      */
     private val requiredPermissions: Array<String> = buildList {
         add(Manifest.permission.CAMERA)
+        add(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
         }
@@ -117,9 +132,20 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onStart() {
+        super.onStart()
+        startStreamStatusUpdates()
+    }
+
     override fun onResume() {
         super.onResume()
         hideSystemUI()
+    }
+
+    override fun onStop() {
+        streamStatusJob?.cancel()
+        streamStatusJob = null
+        super.onStop()
     }
 
     override fun onDestroy() {
@@ -332,7 +358,8 @@ class MainActivity : AppCompatActivity() {
             // Attach the preview surface
             service.attachPreviewSurface(binding.surfacePreview)
 
-            // Start preview with main lens
+            // Start the camera with the main lens. If it is already running
+            // (a stream carried on while the activity was away) it is kept.
             service.startPreview(LensType.MAIN)
 
             // Update UI based on available lenses
@@ -340,10 +367,11 @@ class MainActivity : AppCompatActivity() {
 
             // Observe camera state
             observeCameraState(service)
-        }
 
-        updateStatus(StreamingState.IDLE)
-        binding.tvStatus.text = "Camera ready"
+            shownStreaming = null
+            renderStreamState(service)
+            if (!service.isStreaming()) binding.tvStatus.text = "Camera ready"
+        }
     }
 
     private fun updateLensButtons(service: CameraService) {
@@ -374,7 +402,8 @@ class MainActivity : AppCompatActivity() {
                 Timber.d("Camera state: $state")
                 when (state) {
                     CameraState.PREVIEWING -> {
-                        binding.tvStatus.text = "Preview active"
+                        binding.tvStatus.text =
+                            if (service.isStreaming()) getString(R.string.status_streaming) else "Preview active"
                     }
                     CameraState.STREAMING -> {
                         binding.tvStatus.text = getString(R.string.status_streaming)
@@ -444,30 +473,77 @@ class MainActivity : AppCompatActivity() {
         binding.tvStatus.text = "Permissions required"
     }
 
+    /**
+     * Start streaming the way the README describes it: the encoder plus the
+     * RTSP server, so the URL shown on screen can be opened in OBS or VLC.
+     */
     private fun onStartStreamClicked() {
         Timber.i("Start stream clicked")
-        cameraService?.startStreaming()
-        updateStatus(StreamingState.STREAMING)
-        binding.apply {
-            btnStartStream.visibility = View.GONE
-            btnStopStream.visibility = View.VISIBLE
-            overlayStreamInfo.visibility = View.VISIBLE
-
-            // Show stream info
-            tvRtspUrl.text = "RTSP: rtsp://${getLocalIpAddress()}:8554/live"
-            tvResolution.text = "1920x1080 @ 30fps"
-            tvBitrate.text = "6.0 Mbps"
+        val service = cameraService ?: return
+        binding.btnStartStream.isEnabled = false
+        lifecycleScope.launch {
+            // Configuring the encoder blocks briefly; keep it off the UI thread
+            val started = withContext(Dispatchers.IO) { service.startRtspStreaming() }
+            binding.btnStartStream.isEnabled = true
+            if (!started) {
+                Toast.makeText(this@MainActivity, "Could not start streaming", Toast.LENGTH_LONG).show()
+                updateStatus(StreamingState.ERROR)
+            }
+            renderStreamState(service)
         }
     }
 
     private fun onStopStreamClicked() {
         Timber.i("Stop stream clicked")
-        cameraService?.stopStreaming()
-        updateStatus(StreamingState.IDLE)
+        val service = cameraService ?: return
+        lifecycleScope.launch {
+            withContext(Dispatchers.IO) { service.stopStreaming() }
+            renderStreamState(service)
+        }
+    }
+
+    /**
+     * Keep the stream overlay in step with the service once a second, whether
+     * the stream was started here, from the web dashboard or by auto-start.
+     */
+    private fun startStreamStatusUpdates() {
+        streamStatusJob?.cancel()
+        streamStatusJob = lifecycleScope.launch {
+            while (isActive) {
+                cameraService?.let { renderStreamState(it) }
+                delay(STREAM_STATUS_REFRESH_MS)
+            }
+        }
+    }
+
+    private fun renderStreamState(service: CameraService) {
+        val streaming = service.isStreaming()
+        if (streaming != shownStreaming) {
+            shownStreaming = streaming
+            updateStatus(if (streaming) StreamingState.STREAMING else StreamingState.IDLE)
+        }
+
         binding.apply {
-            btnStartStream.visibility = View.VISIBLE
-            btnStopStream.visibility = View.GONE
-            overlayStreamInfo.visibility = View.GONE
+            btnStartStream.visibility = if (streaming) View.GONE else View.VISIBLE
+            btnStopStream.visibility = if (streaming) View.VISIBLE else View.GONE
+            overlayStreamInfo.visibility = if (streaming) View.VISIBLE else View.GONE
+            if (!streaming) return
+
+            val url = service.getRtspUrl()
+            tvRtspUrl.text = if (url != null) {
+                "RTSP: $url · ${service.getRtspPlayingCount()} watching"
+            } else {
+                "RTSP server off"
+            }
+            val audio = service.getAudioConfig()
+                ?.let { " · AAC ${it.sampleRate / 1000} kHz ${if (it.channelCount == 2) "stereo" else "mono"}" }
+                ?: " · no audio"
+            tvResolution.text = service.getEncoderConfig()
+                ?.let { "${it.width}x${it.height} @ ${it.frameRate}fps ${it.codec.name}$audio" }
+                .orEmpty()
+            tvBitrate.text = service.getEncoderStats()
+                ?.let { String.format(Locale.US, "%.1f Mbps · %.0f fps", it.currentBitrateBps / 1_000_000.0, it.currentFps) }
+                .orEmpty()
         }
     }
 
@@ -509,24 +585,6 @@ class MainActivity : AppCompatActivity() {
                 }
             )
         )
-    }
-
-    private fun getLocalIpAddress(): String {
-        try {
-            val wifiManager = applicationContext.getSystemService(Context.WIFI_SERVICE)
-                as android.net.wifi.WifiManager
-            val ipAddress = wifiManager.connectionInfo.ipAddress
-            return String.format(
-                "%d.%d.%d.%d",
-                ipAddress and 0xff,
-                ipAddress shr 8 and 0xff,
-                ipAddress shr 16 and 0xff,
-                ipAddress shr 24 and 0xff
-            )
-        } catch (e: Exception) {
-            Timber.w(e, "Failed to get local IP address")
-            return "?.?.?.?"
-        }
     }
 
     enum class StreamingState {

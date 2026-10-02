@@ -14,6 +14,7 @@ import android.os.HandlerThread
 import android.util.Range
 import android.util.Size
 import android.view.Surface
+import com.lensdaemon.encoder.MediaClock
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -24,6 +25,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
@@ -76,12 +78,32 @@ class LensDaemonCameraManager(private val context: Context) {
     private var previewSurface: Surface? = null
     private var encoderSurface: Surface? = null
 
+    /** The open camera's CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES. */
+    private var availableFpsRanges: List<IntRange> = emptyList()
+
+    /**
+     * The clock this camera's frame timestamps (and so video presentation
+     * times) are on. Audio is stamped on the same clock to stay in sync.
+     * Known from the camera list before any camera opens.
+     */
+    @Volatile
+    var mediaClock: MediaClock = MediaClock.MONOTONIC
+        private set
+
     /** Serializes session (re)configuration so surface changes never interleave. */
     private val sessionMutex = Mutex()
 
     /** The session being closed by a reconfigure, so its onClosed can be awaited. */
     @Volatile
     private var closingSession: Pair<CameraCaptureSession, CompletableDeferred<Unit>>? = null
+
+    /**
+     * Called on the camera thread when an open camera is lost: disconnected
+     * or failed after it opened. The encoder surface stays attached, so
+     * reopening the camera resumes the stream.
+     */
+    @Volatile
+    var onCameraLost: (() -> Unit)? = null
 
     /**
      * Receives each captured YUV image, still open, on the camera thread.
@@ -92,6 +114,16 @@ class LensDaemonCameraManager(private val context: Context) {
 
     init {
         enumerateCameras()
+        _availableLenses.firstOrNull()?.let { mediaClock = queryMediaClock(it.cameraId) }
+    }
+
+    private fun queryMediaClock(cameraId: String): MediaClock = try {
+        val source = cameraManager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE)
+        if (source == CameraMetadata.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME) MediaClock.BOOTTIME else MediaClock.MONOTONIC
+    } catch (e: CameraAccessException) {
+        Timber.w(e, "Could not read the timestamp source of camera $cameraId")
+        mediaClock
     }
 
     /**
@@ -380,44 +412,7 @@ class LensDaemonCameraManager(private val context: Context) {
             try {
                 cameraManager.openCamera(
                     lens.cameraId,
-                    object : CameraDevice.StateCallback() {
-                        override fun onOpened(camera: CameraDevice) {
-                            Timber.i("Camera opened: ${lens.cameraId}")
-                            cameraDevice = camera
-                            _currentLens.value = lens
-                            _cameraState.value = CameraState.OPENED
-                            continuation.resume(true)
-                        }
-
-                        override fun onDisconnected(camera: CameraDevice) {
-                            Timber.w("Camera disconnected: ${lens.cameraId}")
-                            camera.close()
-                            cameraDevice = null
-                            _currentLens.value = null
-                            _cameraState.value = CameraState.CLOSED
-                            if (continuation.context.isActive) {
-                                continuation.resume(false)
-                            }
-                        }
-
-                        override fun onError(camera: CameraDevice, error: Int) {
-                            val errorType = when (error) {
-                                ERROR_CAMERA_IN_USE -> CameraError.CAMERA_IN_USE
-                                ERROR_MAX_CAMERAS_IN_USE -> CameraError.MAX_CAMERAS_IN_USE
-                                ERROR_CAMERA_DISABLED -> CameraError.CAMERA_DISABLED
-                                ERROR_CAMERA_DEVICE -> CameraError.CAMERA_DEVICE_ERROR
-                                ERROR_CAMERA_SERVICE -> CameraError.CAMERA_SERVICE_ERROR
-                                else -> CameraError.UNKNOWN
-                            }
-                            Timber.e("Camera error: ${errorType.message}")
-                            camera.close()
-                            cameraDevice = null
-                            _cameraState.value = CameraState.ERROR
-                            continuation.resumeWithException(
-                                CameraException(errorType)
-                            )
-                        }
-                    },
+                    deviceCallback(lens, continuation),
                     cameraHandler
                 )
             } catch (e: CameraAccessException) {
@@ -434,12 +429,96 @@ class LensDaemonCameraManager(private val context: Context) {
         }
     }
 
+    private fun queryFpsRanges(cameraId: String): List<IntRange> = try {
+        cameraManager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.map { it.lower..it.upper }
+            .orEmpty()
+    } catch (e: CameraAccessException) {
+        Timber.w(e, "Could not read frame-rate ranges for camera $cameraId")
+        emptyList()
+    }
+
     /**
-     * Configure the capture session with the preview surface, the frame-access
-     * ImageReader and, when one is attached, the encoder's input surface.
+     * Device callbacks for one [openCamera] call. The open settles exactly
+     * once, on the first of onOpened / onDisconnected / onError. Those two can
+     * also arrive later, while the camera is running (another app takes the
+     * camera, the camera service restarts, a HAL error): resuming the open a
+     * second time would throw on the camera thread and crash the app, so a
+     * later one is reported through [onCameraLost] instead.
+     */
+    private fun deviceCallback(
+        lens: CameraLens,
+        continuation: kotlin.coroutines.Continuation<Boolean>
+    ): CameraDevice.StateCallback = object : CameraDevice.StateCallback() {
+        private val settled = AtomicBoolean(false)
+
+        override fun onOpened(camera: CameraDevice) {
+            Timber.i("Camera opened: ${lens.cameraId}")
+            cameraDevice = camera
+            availableFpsRanges = queryFpsRanges(lens.cameraId)
+            mediaClock = queryMediaClock(lens.cameraId)
+            _currentLens.value = lens
+            _cameraState.value = CameraState.OPENED
+            if (settled.compareAndSet(false, true)) continuation.resume(true)
+        }
+
+        override fun onDisconnected(camera: CameraDevice) {
+            Timber.w("Camera disconnected: ${lens.cameraId}")
+            val wasRunning = dropDevice(camera, CameraState.CLOSED)
+            if (settled.compareAndSet(false, true)) {
+                continuation.resume(false)
+            } else if (wasRunning) {
+                onCameraLost?.invoke()
+            }
+        }
+
+        override fun onError(camera: CameraDevice, error: Int) {
+            val errorType = when (error) {
+                ERROR_CAMERA_IN_USE -> CameraError.CAMERA_IN_USE
+                ERROR_MAX_CAMERAS_IN_USE -> CameraError.MAX_CAMERAS_IN_USE
+                ERROR_CAMERA_DISABLED -> CameraError.CAMERA_DISABLED
+                ERROR_CAMERA_DEVICE -> CameraError.CAMERA_DEVICE_ERROR
+                ERROR_CAMERA_SERVICE -> CameraError.CAMERA_SERVICE_ERROR
+                else -> CameraError.UNKNOWN
+            }
+            Timber.e("Camera error on ${lens.cameraId}: ${errorType.message} ($error)")
+            val wasRunning = dropDevice(camera, CameraState.ERROR)
+            if (settled.compareAndSet(false, true)) {
+                continuation.resumeWithException(CameraException(errorType))
+            } else if (wasRunning) {
+                onCameraLost?.invoke()
+            }
+        }
+    }
+
+    /**
+     * Close [camera] and, unless another device has replaced it, forget it and
+     * its session and move to [state]. Returns true if it was the running
+     * device (not one that failed while opening, nor one already replaced).
+     */
+    private fun dropDevice(camera: CameraDevice, state: CameraState): Boolean {
+        camera.close()
+        val current = cameraDevice
+        if (current != null && current !== camera) return false
+        cameraDevice = null
+        captureSession = null
+        _currentLens.value = null
+        _cameraState.value = state
+        return current === camera
+    }
+
+    /**
+     * Configure the capture session with the preview surface (if there is one),
+     * the frame-access ImageReader and, when one is attached, the encoder's
+     * input surface.
+     *
+     * The on-screen preview is optional: with the screen off or the app in the
+     * background there is no surface to draw on, but the encoder (and the web
+     * dashboard's MJPEG preview) must keep getting frames.
      */
     suspend fun startPreview(
-        previewSurface: Surface,
+        previewSurface: Surface?,
         config: CaptureConfig = CaptureConfig()
     ): Boolean = sessionMutex.withLock {
         val device = cameraDevice ?: run {
@@ -488,9 +567,26 @@ class LensDaemonCameraManager(private val context: Context) {
         return createSession(device, activeSurfaces())
     }
 
-    /** All surfaces the session must target right now. */
+    /**
+     * All surfaces the session must target right now. A surface can die before
+     * the change that removes it is applied (the activity's view is destroyed
+     * mid-rebuild, an encoder is replaced twice in quick succession); a session
+     * built with a dead surface fails outright, so those are left out.
+     */
     private fun activeSurfaces(): List<Surface> =
-        listOfNotNull(previewSurface, imageReader?.surface, encoderSurface)
+        listOfNotNull(previewSurface, imageReader?.surface, encoderSurface).filter { it.isValid }
+
+    /**
+     * Show the camera on [surface], or stop drawing to the screen when it is
+     * null (the activity went away), without interrupting the encoder. A
+     * running session is rebuilt with the new surface set; before the session
+     * exists the surface is simply used by the next [startPreview].
+     */
+    suspend fun setPreviewSurface(surface: Surface?): Boolean = sessionMutex.withLock {
+        if (previewSurface === surface) return@withLock true
+        previewSurface = surface
+        reconfigureSessionIfActive(if (surface != null) "preview surface attached" else "preview surface gone")
+    }
 
     /** Create a capture session for [surfaces] and start the repeating request on it. */
     private suspend fun createSession(device: CameraDevice, surfaces: List<Surface>): Boolean =
@@ -515,6 +611,16 @@ class LensDaemonCameraManager(private val context: Context) {
                 }
             } catch (e: CameraAccessException) {
                 Timber.e(e, "Failed to create capture session")
+                _cameraState.value = CameraState.ERROR
+                continuation.resumeWithException(e)
+            } catch (e: IllegalArgumentException) {
+                // A target surface was released or abandoned
+                Timber.e(e, "Capture session rejected its surfaces")
+                _cameraState.value = CameraState.ERROR
+                continuation.resumeWithException(e)
+            } catch (e: IllegalStateException) {
+                // The camera device was closed underneath us
+                Timber.e(e, "Camera closed while creating the capture session")
                 _cameraState.value = CameraState.ERROR
                 continuation.resumeWithException(e)
             }
@@ -568,15 +674,20 @@ class LensDaemonCameraManager(private val context: Context) {
     private fun startRepeatingRequest() {
         val device = cameraDevice ?: return
         val session = captureSession ?: return
-        val preview = previewSurface ?: return
+        val targets = activeSurfaces()
+        if (targets.isEmpty()) return
 
         // TEMPLATE_RECORD tunes the pipeline for a steady frame rate once an
         // encoder is attached; TEMPLATE_PREVIEW favours responsiveness otherwise.
         val template = if (encoderSurface != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val requestBuilder = device.createCaptureRequest(template).apply {
-            addTarget(preview)
-            imageReader?.surface?.let { addTarget(it) }
-            encoderSurface?.let { addTarget(it) }
+            targets.forEach { addTarget(it) }
+
+            // Hold the frame rate steady at the stream's rate instead of letting
+            // auto-exposure slow it down in dim light
+            FrameRatePolicy.chooseAeTargetFpsRange(availableFpsRanges, currentConfig.frameRate)?.let {
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.last))
+            }
 
             // Apply configuration
             set(CaptureRequest.CONTROL_AF_MODE, currentConfig.focusMode.camera2Mode)
@@ -621,12 +732,20 @@ class LensDaemonCameraManager(private val context: Context) {
      */
     fun updateConfig(config: CaptureConfig) {
         currentConfig = config
+        applyRepeatingRequest()
+    }
+
+    private fun applyRepeatingRequest() {
         if (_cameraState.value == CameraState.PREVIEWING ||
             _cameraState.value == CameraState.STREAMING) {
             try {
                 startRepeatingRequest()
             } catch (e: CameraAccessException) {
                 Timber.e(e, "Failed to update capture config")
+            } catch (e: IllegalStateException) {
+                // The session closed under us (lens switch, reconfigure); the
+                // next session picks the config up
+                Timber.w(e, "Capture session gone while updating config")
             }
         }
     }
@@ -636,9 +755,20 @@ class LensDaemonCameraManager(private val context: Context) {
      * already running it is rebuilt with the new surface; otherwise the surface
      * is picked up by the next [startPreview]. The surface survives lens
      * switches (which close and reopen the camera) until [removeEncoderSurface].
+     *
+     * @param config capture settings to apply with it, e.g. the encoder's frame rate
      */
-    suspend fun addEncoderSurface(surface: Surface): Boolean = sessionMutex.withLock {
-        if (encoderSurface === surface) return@withLock true
+    suspend fun addEncoderSurface(surface: Surface, config: CaptureConfig? = null): Boolean = sessionMutex.withLock {
+        if (!surface.isValid) {
+            // Its encoder was replaced before this attach got to run
+            Timber.w("Not attaching an encoder surface that has already been released")
+            return@withLock false
+        }
+        config?.let { currentConfig = it }
+        if (encoderSurface === surface) {
+            if (config != null) applyRepeatingRequest()
+            return@withLock true
+        }
         encoderSurface = surface
         reconfigureSessionIfActive("encoder surface attached")
     }
@@ -646,41 +776,34 @@ class LensDaemonCameraManager(private val context: Context) {
     /**
      * Detach the encoder surface. Call this before releasing the encoder so
      * the camera never renders into a dead surface.
+     *
+     * @param expected detach only if this is still the attached surface, so a
+     *   late detach for an old encoder never removes its replacement's surface
      */
-    suspend fun removeEncoderSurface(): Boolean = sessionMutex.withLock {
+    suspend fun removeEncoderSurface(expected: Surface? = null): Boolean = sessionMutex.withLock {
         if (encoderSurface == null) return@withLock true
+        if (expected != null && encoderSurface !== expected) return@withLock true
         encoderSurface = null
         reconfigureSessionIfActive("encoder surface detached")
     }
 
     /**
      * Rebuild the capture session with the current surface set.
-     * Returns true when no session was active or the rebuild succeeded.
+     *
+     * Also builds one when capture was started but the last build failed (no
+     * session left): otherwise every later surface change would be skipped and
+     * the camera would stay dark for good. Returns true when the camera is not
+     * open, capture has not been started yet (the next [startPreview] builds
+     * the session), or the rebuild succeeded.
      */
     private suspend fun reconfigureSessionIfActive(reason: String): Boolean {
         val device = cameraDevice ?: return true
-        val session = captureSession ?: return true
-        if (previewSurface == null) return true
+        val session = captureSession
+        if (session == null && imageReader == null) return true
 
         Timber.i("Reconfiguring capture session: $reason")
         _cameraState.value = CameraState.CONFIGURING
-        val closed = CompletableDeferred<Unit>()
-        closingSession = session to closed
-        try {
-            session.stopRepeating()
-            session.close()
-        } catch (e: Exception) {
-            Timber.w(e, "Error closing capture session before reconfigure")
-        }
-        captureSession = null
-
-        // Some camera HALs (the emulator's among them) refuse a new stream
-        // configuration while the previous session still holds its buffers,
-        // so wait for it to report closed before configuring the next one.
-        if (withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { closed.await() } == null) {
-            Timber.w("Previous capture session did not report closed within $SESSION_CLOSE_TIMEOUT_MS ms")
-        }
-        closingSession = null
+        if (session != null) closeSessionAndWait(session)
 
         repeat(SESSION_CREATE_ATTEMPTS) { attempt ->
             try {
@@ -693,6 +816,28 @@ class LensDaemonCameraManager(private val context: Context) {
         Timber.e("Failed to reconfigure capture session")
         _cameraState.value = CameraState.ERROR
         return false
+    }
+
+    private suspend fun closeSessionAndWait(session: CameraCaptureSession) {
+        val closed = CompletableDeferred<Unit>()
+        closingSession = session to closed
+        try {
+            session.stopRepeating()
+            session.close()
+        } catch (e: CameraAccessException) {
+            Timber.w(e, "Error closing capture session before reconfigure")
+        } catch (e: IllegalStateException) {
+            Timber.w(e, "Capture session already closed before reconfigure")
+        }
+        captureSession = null
+
+        // Some camera HALs (the emulator's among them) refuse a new stream
+        // configuration while the previous session still holds its buffers,
+        // so wait for it to report closed before configuring the next one.
+        if (withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { closed.await() } == null) {
+            Timber.w("Previous capture session did not report closed within $SESSION_CLOSE_TIMEOUT_MS ms")
+        }
+        closingSession = null
     }
 
     /**

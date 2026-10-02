@@ -1,5 +1,7 @@
 package com.lensdaemon.camera
 
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
@@ -26,6 +28,11 @@ class RtspCoordinator {
     /** Frame listener that forwards encoded frames to RTSP clients */
     val frameListener: (EncodedFrame) -> Unit = { frame ->
         rtspServer?.sendFrame(frame)
+    }
+
+    /** Forwards encoded AAC frames to RTSP clients that set up audio */
+    val audioListener: (EncodedAudioFrame) -> Unit = { frame ->
+        rtspServer?.sendAudio(frame)
     }
 
     /** Callback invoked when an RTSP client requests a keyframe */
@@ -63,6 +70,29 @@ class RtspCoordinator {
 
     fun updateCodecConfig(codec: VideoCodec, sps: ByteArray?, pps: ByteArray?, vps: ByteArray?) {
         rtspServer?.setCodecConfig(codec, sps, pps, vps)
+    }
+
+    /**
+     * Disconnect every viewer. Their SDP no longer matches the stream after a
+     * codec change; players such as OBS reconnect and DESCRIBE it afresh.
+     */
+    fun disconnectViewers() {
+        rtspServer?.disconnectAllSessions()
+    }
+
+    /** Offer an audio track with [config] (none when null) to clients that DESCRIBE from now on. */
+    fun setAudioConfig(config: AudioConfig?) {
+        rtspServer?.setAudioConfig(config)
+    }
+
+    /** The clock frame presentation times are on, for RTCP sender reports. */
+    fun setMediaClock(nowUs: () -> Long) {
+        rtspServer?.mediaClockUs = nowUs
+    }
+
+    /** Advertise [config]'s frame rate and bitrate to clients that DESCRIBE from now on. */
+    fun setStreamConfig(config: EncoderConfig) {
+        rtspServer?.setStreamConfig(config)
     }
 
     fun getRtspUrl(): String? = rtspServer?.getRtspUrl()

@@ -2,6 +2,7 @@ package com.lensdaemon.camera
 
 import android.content.Context
 import android.media.MediaFormat
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.output.RecordingEvent
@@ -31,6 +32,13 @@ class RecordingCoordinator(
 ) {
     private var storageManager: StorageManager? = null
 
+    /** The encoder settings the file writer was built for (codec, size). */
+    private var encoderConfig: EncoderConfig? = null
+
+    /** The segment length in use, kept across a re-initialization. */
+    var segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
+        private set
+
     private val _recordingState = MutableStateFlow(RecordingState.IDLE)
     val recordingState: StateFlow<RecordingState> = _recordingState.asStateFlow()
 
@@ -38,6 +46,14 @@ class RecordingCoordinator(
     val frameListener: (EncodedFrame) -> Unit = { frame ->
         storageManager?.writeFrame(frame)
     }
+
+    /** Forwards encoded AAC frames to the file writer */
+    val audioListener: (EncodedAudioFrame) -> Unit = { frame ->
+        storageManager?.audioFrameWriter?.invoke(frame)
+    }
+
+    /** The audio track format for new segments, kept across re-initialization. */
+    private var audioFormat: MediaFormat? = null
 
     /** Callback for notification updates when recording state changes */
     var onStateChanged: (() -> Unit)? = null
@@ -58,6 +74,8 @@ class RecordingCoordinator(
             return true
         }
 
+        this.encoderConfig = encoderConfig
+        this.segmentDuration = segmentDuration
         storageManager = StorageManagerBuilder(context)
             .encoderConfig(encoderConfig)
             .segmentDuration(segmentDuration)
@@ -95,6 +113,7 @@ class RecordingCoordinator(
         })
 
         storageManager?.onKeyFrameRequest = onKeyFrameRequest
+        storageManager?.audioFormat = audioFormat
         Timber.i("Storage manager initialized")
         return true
     }
@@ -105,6 +124,12 @@ class RecordingCoordinator(
      */
     fun setVideoFormat(format: MediaFormat, sps: ByteArray? = null, pps: ByteArray? = null, vps: ByteArray? = null) {
         storageManager?.setVideoFormat(format, sps, pps, vps)
+    }
+
+    /** Record audio described by [format] from the next segment, or video only when null. */
+    fun setAudioFormat(format: MediaFormat?) {
+        audioFormat = format
+        storageManager?.audioFormat = format
     }
 
     fun startRecording(): Boolean {
@@ -153,6 +178,7 @@ class RecordingCoordinator(
         storageManager?.getRecordingsDirectory()?.absolutePath ?: ""
 
     fun setSegmentDuration(duration: SegmentDuration) {
+        segmentDuration = duration
         storageManager?.updateSegmentDuration(duration)
     }
 
@@ -164,11 +190,13 @@ class RecordingCoordinator(
 
     fun isInitialized(): Boolean = storageManager != null
 
-    fun getEncoderConfig(): EncoderConfig? = null // Config comes from encoder, not storage
+    /** The encoder settings the recorder was initialized for, or null before [initialize]. */
+    fun getEncoderConfig(): EncoderConfig? = encoderConfig
 
     fun release() {
         storageManager?.release()
         storageManager = null
+        encoderConfig = null
         _recordingState.value = RecordingState.IDLE
     }
 }
