@@ -136,7 +136,8 @@ class CameraPipelineSmokeTest {
         assertTrue("encoder should receive frames after the session was rebuilt", frames.await(20, TimeUnit.SECONDS))
 
         // Detaching must rebuild the session again without the encoder and leave the preview alive.
-        runBlocking { assertTrue("encoder surface should detach", manager.removeEncoderSurface()) }
+        val detached = runBlocking { manager.removeEncoderSurface() }
+        assertTrue("encoder surface should detach\n" + recentCameraLog(), detached)
         val previewFrames = CountDownLatch(3)
         previewReader.setOnImageAvailableListener(
             { reader -> reader.acquireLatestImage()?.close(); previewFrames.countDown() },

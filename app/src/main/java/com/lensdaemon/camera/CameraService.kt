@@ -555,15 +555,15 @@ class CameraService : Service() {
         if (!isPreviewActive) return
         serviceScope.launch {
             if (cameraRecoveryJob?.isActive == true) return@launch
-            cameraRecoveryJob = launch {
+            cameraRecoveryJob = launch recovery@{
                 for (waitMs in CAMERA_RECOVERY_DELAYS_MS) {
                     delay(waitMs)
-                    if (!isPreviewActive) return@launch
+                    if (!isPreviewActive) return@recovery
                     Timber.w("Camera lost; reopening the $lastLensType lens")
                     openCameraAndStartPreview(lastLensType)
                     if (lensDaemonCameraManager.cameraState.value == CameraState.PREVIEWING) {
                         Timber.i("Camera recovered")
-                        return@launch
+                        return@recovery
                     }
                 }
                 Timber.e("Camera could not be reopened; the next start will try again")
