@@ -44,6 +44,14 @@ class StreamingOutputsSmokeTest {
     @get:Rule
     val serviceRule = ServiceTestRule()
 
+    private companion object {
+        /**
+         * The publisher sends to 127.0.0.1, so the receiver must listen there.
+         * InetAddress.getLoopbackAddress() is ::1 on Android.
+         */
+        val IPV4_LOOPBACK: InetAddress = InetAddress.getByName("127.0.0.1")
+    }
+
     private lateinit var service: CameraService
 
     private val config = EncoderConfig(
@@ -76,7 +84,7 @@ class StreamingOutputsSmokeTest {
         assertTrue("RTSP streaming should start", retryFor(10_000) { service.startRtspStreaming(config, rtspPort) })
         assertTrue("encoder should produce frames", waitUntil(20_000) { (service.getEncoderStats()?.framesEncoded ?: 0) > 5 })
 
-        DatagramSocket(0, InetAddress.getLoopbackAddress()).use { receiver ->
+        DatagramSocket(0, IPV4_LOOPBACK).use { receiver ->
             val mpegts = MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = receiver.localPort)
             val otherSettings = config.copy(resolution = Size(1280, 720))
             assertTrue("MPEG-TS should start", service.startMpegTsStreaming(otherSettings, mpegts))
@@ -105,7 +113,7 @@ class StreamingOutputsSmokeTest {
         val rtspPort = ServerSocket(0).use { it.localPort }
         assertTrue("RTSP streaming should start", retryFor(10_000) { service.startRtspStreaming(config, rtspPort) })
 
-        DatagramSocket(0, InetAddress.getLoopbackAddress()).use { receiver ->
+        DatagramSocket(0, IPV4_LOOPBACK).use { receiver ->
             val mpegts = MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = receiver.localPort)
             assertTrue(service.startMpegTsStreaming(config, mpegts))
             assertTrue("starting again with the same settings should be accepted", service.startMpegTsStreaming(config, mpegts))
