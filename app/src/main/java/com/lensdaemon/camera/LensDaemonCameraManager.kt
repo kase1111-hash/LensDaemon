@@ -24,6 +24,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import timber.log.Timber
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
@@ -85,6 +86,14 @@ class LensDaemonCameraManager(private val context: Context) {
     /** The session being closed by a reconfigure, so its onClosed can be awaited. */
     @Volatile
     private var closingSession: Pair<CameraCaptureSession, CompletableDeferred<Unit>>? = null
+
+    /**
+     * Called on the camera thread when an open camera is lost: disconnected
+     * or failed after it opened. The encoder surface stays attached, so
+     * reopening the camera resumes the stream.
+     */
+    @Volatile
+    var onCameraLost: (() -> Unit)? = null
 
     /**
      * Receives each captured YUV image, still open, on the camera thread.
@@ -383,45 +392,7 @@ class LensDaemonCameraManager(private val context: Context) {
             try {
                 cameraManager.openCamera(
                     lens.cameraId,
-                    object : CameraDevice.StateCallback() {
-                        override fun onOpened(camera: CameraDevice) {
-                            Timber.i("Camera opened: ${lens.cameraId}")
-                            cameraDevice = camera
-                            availableFpsRanges = queryFpsRanges(lens.cameraId)
-                            _currentLens.value = lens
-                            _cameraState.value = CameraState.OPENED
-                            continuation.resume(true)
-                        }
-
-                        override fun onDisconnected(camera: CameraDevice) {
-                            Timber.w("Camera disconnected: ${lens.cameraId}")
-                            camera.close()
-                            cameraDevice = null
-                            _currentLens.value = null
-                            _cameraState.value = CameraState.CLOSED
-                            if (continuation.context.isActive) {
-                                continuation.resume(false)
-                            }
-                        }
-
-                        override fun onError(camera: CameraDevice, error: Int) {
-                            val errorType = when (error) {
-                                ERROR_CAMERA_IN_USE -> CameraError.CAMERA_IN_USE
-                                ERROR_MAX_CAMERAS_IN_USE -> CameraError.MAX_CAMERAS_IN_USE
-                                ERROR_CAMERA_DISABLED -> CameraError.CAMERA_DISABLED
-                                ERROR_CAMERA_DEVICE -> CameraError.CAMERA_DEVICE_ERROR
-                                ERROR_CAMERA_SERVICE -> CameraError.CAMERA_SERVICE_ERROR
-                                else -> CameraError.UNKNOWN
-                            }
-                            Timber.e("Camera error: ${errorType.message}")
-                            camera.close()
-                            cameraDevice = null
-                            _cameraState.value = CameraState.ERROR
-                            continuation.resumeWithException(
-                                CameraException(errorType)
-                            )
-                        }
-                    },
+                    deviceCallback(lens, continuation),
                     cameraHandler
                 )
             } catch (e: CameraAccessException) {
@@ -446,6 +417,74 @@ class LensDaemonCameraManager(private val context: Context) {
     } catch (e: CameraAccessException) {
         Timber.w(e, "Could not read frame-rate ranges for camera $cameraId")
         emptyList()
+    }
+
+    /**
+     * Device callbacks for one [openCamera] call. The open settles exactly
+     * once, on the first of onOpened / onDisconnected / onError. Those two can
+     * also arrive later, while the camera is running (another app takes the
+     * camera, the camera service restarts, a HAL error): resuming the open a
+     * second time would throw on the camera thread and crash the app, so a
+     * later one is reported through [onCameraLost] instead.
+     */
+    private fun deviceCallback(
+        lens: CameraLens,
+        continuation: kotlin.coroutines.Continuation<Boolean>
+    ): CameraDevice.StateCallback = object : CameraDevice.StateCallback() {
+        private val settled = AtomicBoolean(false)
+
+        override fun onOpened(camera: CameraDevice) {
+            Timber.i("Camera opened: ${lens.cameraId}")
+            cameraDevice = camera
+            availableFpsRanges = queryFpsRanges(lens.cameraId)
+            _currentLens.value = lens
+            _cameraState.value = CameraState.OPENED
+            if (settled.compareAndSet(false, true)) continuation.resume(true)
+        }
+
+        override fun onDisconnected(camera: CameraDevice) {
+            Timber.w("Camera disconnected: ${lens.cameraId}")
+            val wasRunning = dropDevice(camera, CameraState.CLOSED)
+            if (settled.compareAndSet(false, true)) {
+                continuation.resume(false)
+            } else if (wasRunning) {
+                onCameraLost?.invoke()
+            }
+        }
+
+        override fun onError(camera: CameraDevice, error: Int) {
+            val errorType = when (error) {
+                ERROR_CAMERA_IN_USE -> CameraError.CAMERA_IN_USE
+                ERROR_MAX_CAMERAS_IN_USE -> CameraError.MAX_CAMERAS_IN_USE
+                ERROR_CAMERA_DISABLED -> CameraError.CAMERA_DISABLED
+                ERROR_CAMERA_DEVICE -> CameraError.CAMERA_DEVICE_ERROR
+                ERROR_CAMERA_SERVICE -> CameraError.CAMERA_SERVICE_ERROR
+                else -> CameraError.UNKNOWN
+            }
+            Timber.e("Camera error on ${lens.cameraId}: ${errorType.message} ($error)")
+            val wasRunning = dropDevice(camera, CameraState.ERROR)
+            if (settled.compareAndSet(false, true)) {
+                continuation.resumeWithException(CameraException(errorType))
+            } else if (wasRunning) {
+                onCameraLost?.invoke()
+            }
+        }
+    }
+
+    /**
+     * Close [camera] and, unless another device has replaced it, forget it and
+     * its session and move to [state]. Returns true if it was the running
+     * device (not one that failed while opening, nor one already replaced).
+     */
+    private fun dropDevice(camera: CameraDevice, state: CameraState): Boolean {
+        camera.close()
+        val current = cameraDevice
+        if (current != null && current !== camera) return false
+        cameraDevice = null
+        captureSession = null
+        _currentLens.value = null
+        _cameraState.value = state
+        return current === camera
     }
 
     /**

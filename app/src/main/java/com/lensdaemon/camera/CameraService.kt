@@ -80,6 +80,9 @@ class CameraService : Service() {
         }
 
         private const val SNAPSHOT_TIMEOUT_MS = 3000L
+
+        /** Waits between attempts to reopen a camera that was lost while running. */
+        private val CAMERA_RECOVERY_DELAYS_MS = listOf(1_000L, 2_000L, 5_000L, 10_000L, 30_000L, 30_000L)
     }
 
     private val binder = LocalBinder()
@@ -102,6 +105,12 @@ class CameraService : Service() {
 
     /** A camera open has been launched and has not finished yet. */
     private val cameraOpenPending = AtomicBoolean(false)
+
+    /** The lens last opened, to reopen after the camera is lost. */
+    @Volatile private var lastLensType = LensType.MAIN
+
+    /** Reopens the camera after it was lost while running. */
+    private var cameraRecoveryJob: Job? = null
 
     /**
      * Encoding was asked for in its own right (Start Streaming), so it keeps
@@ -194,6 +203,7 @@ class CameraService : Service() {
         val systemCameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         lensDaemonCameraManager = LensDaemonCameraManager(applicationContext)
         lensDaemonCameraManager.onImageAvailable = previewFrameGrabber::onImage
+        lensDaemonCameraManager.onCameraLost = { scheduleCameraRecovery() }
 
         // Initialize lens controller with available lenses
         lensController = LensController(systemCameraManager, lensDaemonCameraManager.availableLenses)
@@ -419,6 +429,7 @@ class CameraService : Service() {
             if (opened) {
                 val lens = lensDaemonCameraManager.currentLens.value
                 lens?.let {
+                    lastLensType = it.lensType
                     lensController.setCurrentLens(it)
                     initializeControllersForCamera(it.cameraId)
                 }
@@ -438,6 +449,7 @@ class CameraService : Service() {
             Timber.i("Opening camera with lens: ${lens.lensType.displayName}")
             val opened = lensDaemonCameraManager.openCamera(lens)
             if (opened) {
+                lastLensType = lens.lensType
                 lensController.setCurrentLens(lens)
                 initializeControllersForCamera(lens.cameraId)
                 isPreviewActive = true
@@ -470,10 +482,38 @@ class CameraService : Service() {
     }
 
     /**
+     * The camera was taken away while running: another app opened it, the
+     * camera service restarted, or the device reported an error. Reopen it,
+     * backing off between attempts, so a stream recovers without anyone
+     * pressing Start again; the encoder surface is still attached and the new
+     * capture session feeds it.
+     */
+    private fun scheduleCameraRecovery() {
+        if (!isPreviewActive) return
+        serviceScope.launch {
+            if (cameraRecoveryJob?.isActive == true) return@launch
+            cameraRecoveryJob = launch {
+                for (waitMs in CAMERA_RECOVERY_DELAYS_MS) {
+                    delay(waitMs)
+                    if (!isPreviewActive) return@launch
+                    Timber.w("Camera lost; reopening the $lastLensType lens")
+                    openCameraAndStartPreview(lastLensType)
+                    if (lensDaemonCameraManager.cameraState.value == CameraState.PREVIEWING) {
+                        Timber.i("Camera recovered")
+                        return@launch
+                    }
+                }
+                Timber.e("Camera could not be reopened; the next start will try again")
+            }
+        }
+    }
+
+    /**
      * Stop camera preview.
      */
     fun stopPreview() {
         Timber.i("Stopping preview")
+        cameraRecoveryJob?.cancel()
         isPreviewActive = false
         lensDaemonCameraManager.closeCamera()
         focusController.reset()
@@ -844,7 +884,7 @@ class CameraService : Service() {
     private fun ensureEncoding(config: EncoderConfig): Boolean {
         // Opens the camera only if it is not running: never opened, or closed
         // or failed since. A running stream whose camera went away recovers.
-        startPreview(lensDaemonCameraManager.currentLens.value?.lensType ?: LensType.MAIN)
+        startPreview(lastLensType)
 
         if (isStreamingActive) {
             val running = getEncoderConfig()

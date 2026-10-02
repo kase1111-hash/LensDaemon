@@ -14,6 +14,7 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.rule.GrantPermissionRule
+import com.lensdaemon.camera.CameraState
 import com.lensdaemon.camera.CaptureConfig
 import com.lensdaemon.camera.LensDaemonCameraManager
 import com.lensdaemon.camera.LensType
@@ -185,6 +186,32 @@ class CameraPipelineSmokeTest {
         val back = runBlocking { manager.setPreviewSurface(previewReader.surface) }
         assertTrue("session should rebuild with the preview again\n" + recentCameraLog(), back)
         assertTrue("frames should keep flowing with the preview back", waitForFrames(frameCount, 5))
+    }
+
+    @Test
+    fun losingTheCameraWhileRunningIsReportedNotFatal() {
+        // Opening the same camera again in this app disconnects the first
+        // open, just as another app taking the camera mid-stream would. The
+        // disconnect used to resume the finished open a second time and crash
+        // the process on the camera thread.
+        val lost = CountDownLatch(1)
+        manager.onCameraLost = { lost.countDown() }
+        runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("preview should start", manager.startPreview(previewReader.surface, CaptureConfig(resolution = size)))
+        }
+
+        val other = LensDaemonCameraManager(context)
+        try {
+            assertTrue("a second client should take the camera", runBlocking { other.openCamera(LensType.MAIN) })
+            assertTrue("the first client should be told it lost the camera", lost.await(10, TimeUnit.SECONDS))
+            assertEquals(CameraState.CLOSED, manager.cameraState.value)
+        } finally {
+            other.release()
+        }
+
+        // ...and it can take the camera back
+        assertTrue("the camera should reopen", runBlocking { manager.openCamera(LensType.MAIN) })
     }
 
     /** Wait up to 20 s for [count] more frames than [counter] holds now. */
