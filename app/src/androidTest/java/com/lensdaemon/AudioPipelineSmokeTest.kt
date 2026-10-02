@@ -199,9 +199,11 @@ class AudioPipelineSmokeTest {
                 extractor.release()
             }
         } finally {
-            writer.release()
-            encoder.release()
+            // Camera first, so it never draws into a released encoder surface,
+            // then the encoder, so no frame reaches a released writer
             manager.release()
+            encoder.release()
+            writer.release()
             previewReader.close()
             consumerThread.quitSafely()
         }

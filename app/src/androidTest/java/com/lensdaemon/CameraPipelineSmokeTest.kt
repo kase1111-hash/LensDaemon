@@ -89,8 +89,9 @@ class CameraPipelineSmokeTest {
 
     @After
     fun tearDown() {
-        if (this::encoder.isInitialized) encoder.release()
+        // Camera first, so it never draws into a released encoder surface
         if (this::manager.isInitialized) manager.release()
+        if (this::encoder.isInitialized) encoder.release()
         if (this::previewReader.isInitialized) previewReader.close()
         if (this::consumerThread.isInitialized) consumerThread.quitSafely()
     }
