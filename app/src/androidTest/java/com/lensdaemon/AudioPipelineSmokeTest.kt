@@ -3,6 +3,7 @@ package com.lensdaemon
 import android.Manifest
 import android.content.Context
 import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import android.media.ImageReader
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -144,7 +145,10 @@ class AudioPipelineSmokeTest {
         val encoderConfig = EncoderConfig(codec = VideoCodec.H264, resolution = size, bitrateBps = 1_000_000, frameRate = 30)
         val encoder = VideoEncoder(encoderConfig)
         val consumerThread = HandlerThread("preview-consumer").apply { start() }
-        val previewReader = ImageReader.newInstance(size.width, size.height, ImageFormat.PRIVATE, 3)
+        // GPU sampling like a real preview; see CameraPipelineSmokeTest.setUp
+        val previewReader = ImageReader.newInstance(
+            size.width, size.height, ImageFormat.PRIVATE, 3, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+        )
         previewReader.setOnImageAvailableListener({ it.acquireLatestImage()?.close() }, Handler(consumerThread.looper))
 
         val outputDir = File(context.cacheDir, "audio-recording-test").apply { deleteRecursively(); mkdirs() }

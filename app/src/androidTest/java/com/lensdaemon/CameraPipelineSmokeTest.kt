@@ -3,6 +3,7 @@ package com.lensdaemon
 import android.Manifest
 import android.content.Context
 import android.graphics.ImageFormat
+import android.hardware.HardwareBuffer
 import android.media.ImageReader
 import android.media.MediaExtractor
 import android.media.MediaFormat
@@ -80,7 +81,13 @@ class CameraPipelineSmokeTest {
         consumerThread = HandlerThread("preview-consumer").apply { start() }
         // A PRIVATE ImageReader stands in for the on-screen preview and always
         // drains its buffers so the camera never stalls on the preview stream.
-        previewReader = ImageReader.newInstance(size.width, size.height, ImageFormat.PRIVATE, 3)
+        // It asks for GPU sampling like a real preview (SurfaceView/TextureView):
+        // without it the emulator's camera HAL renders the stream as RGB_888,
+        // overruns those buffers (crashing the camera provider now and then)
+        // and rejects the stream when a session rebuild reuses it.
+        previewReader = ImageReader.newInstance(
+            size.width, size.height, ImageFormat.PRIVATE, 3, HardwareBuffer.USAGE_GPU_SAMPLED_IMAGE
+        )
         previewReader.setOnImageAvailableListener(
             { reader -> reader.acquireLatestImage()?.close() },
             Handler(consumerThread.looper)
