@@ -3,8 +3,6 @@ package com.lensdaemon.output
 import android.util.Base64
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
-import timber.log.Timber
-import java.net.InetAddress
 
 /**
  * SDP (Session Description Protocol) generator for RTSP streaming
@@ -13,8 +11,6 @@ import java.net.InetAddress
 class SdpGenerator {
 
     companion object {
-        private const val TAG = "SdpGenerator"
-
         // SDP version
         private const val SDP_VERSION = "0"
 
@@ -306,25 +302,7 @@ class SdpGenerator {
     }
 
     /**
-     * Get local IP address
+     * Get the LAN-reachable IPv4 address of this device.
      */
-    fun getLocalIpAddress(): String {
-        return try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val netInterface = interfaces.nextElement()
-                val addresses = netInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr = addresses.nextElement()
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress ?: "0.0.0.0"
-                    }
-                }
-            }
-            "0.0.0.0"
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Failed to get local IP")
-            "0.0.0.0"
-        }
-    }
+    fun getLocalIpAddress(): String = LocalNetwork.lanIpv4Address() ?: "0.0.0.0"
 }

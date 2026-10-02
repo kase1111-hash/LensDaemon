@@ -1,6 +1,7 @@
 package com.lensdaemon.web
 
 import android.content.Context
+import com.lensdaemon.output.LocalNetwork
 import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -241,26 +242,9 @@ class WebServer(
     }
 
     /**
-     * Get local IP address
+     * Get the LAN-reachable IPv4 address of this device.
      */
-    private fun getLocalIpAddress(): String {
-        return try {
-            val interfaces = java.net.NetworkInterface.getNetworkInterfaces()
-            while (interfaces.hasMoreElements()) {
-                val netInterface = interfaces.nextElement()
-                val addresses = netInterface.inetAddresses
-                while (addresses.hasMoreElements()) {
-                    val addr = addresses.nextElement()
-                    if (!addr.isLoopbackAddress && addr is java.net.Inet4Address) {
-                        return addr.hostAddress ?: "0.0.0.0"
-                    }
-                }
-            }
-            "0.0.0.0"
-        } catch (e: Exception) {
-            "0.0.0.0"
-        }
-    }
+    private fun getLocalIpAddress(): String = LocalNetwork.lanIpv4Address() ?: "0.0.0.0"
 }
 
 /**

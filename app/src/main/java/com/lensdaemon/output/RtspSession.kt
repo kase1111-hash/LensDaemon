@@ -1,6 +1,7 @@
 package com.lensdaemon.output
 
 import com.lensdaemon.encoder.EncodedFrame
+import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
 import kotlinx.coroutines.*
 import timber.log.Timber
@@ -12,6 +13,7 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.DatagramPacket
 import java.net.DatagramSocket
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
@@ -39,16 +41,19 @@ enum class SessionState {
 class RtspSession(
     private val socket: Socket,
     private val serverAddress: String,
-    private val onSessionClosed: (RtspSession) -> Unit
+    private val onSessionClosed: (RtspSession) -> Unit,
+    /** Called when the client starts (or resumes) playing, so the server can ask for a keyframe. */
+    private val onStartedPlaying: (RtspSession) -> Unit = {}
 ) {
     companion object {
         private const val TAG = "RtspSession"
         private const val READ_TIMEOUT_MS = 60_000
 
         /**
-         * Frames buffered per client before the slowest picture is discarded.
-         * Roughly two seconds at 30 fps: enough to ride out a WiFi hiccup,
-         * short enough that a recovering viewer catches up to live quickly.
+         * Frames buffered per client before the backlog is dropped and the
+         * client resumes at the next keyframe. Roughly two seconds at 30 fps:
+         * enough to ride out a WiFi hiccup, short enough that a recovering
+         * viewer catches up to live quickly.
          */
         private const val OUTBOUND_QUEUE_CAPACITY = 60
 
@@ -91,6 +96,17 @@ class RtspSession(
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
     private var vps: ByteArray? = null
+
+    /** Encoder settings this session advertises in its SDP (frame rate, bandwidth, profile fallback). */
+    @Volatile
+    var streamConfig: EncoderConfig = EncoderConfig()
+
+    /**
+     * Starts this client on a self-describing keyframe. Guarded by itself:
+     * frames arrive on the encoder thread, PLAY on the request thread and
+     * parameter-set updates on the server's.
+     */
+    private var aligner = KeyframeAligner(isHevc = false)
 
     // I/O streams
     private var inputStream: InputStream? = null
@@ -172,6 +188,10 @@ class RtspSession(
                 VideoCodec.H264 -> RtpPacketizerFactory.createH264Packetizer()
                 VideoCodec.H265 -> RtpPacketizerFactory.createH265Packetizer()
             }
+        }
+        synchronized(this) {
+            if (codecChanged) aligner = KeyframeAligner(isHevc = codec == VideoCodec.H265)
+            aligner.setParameterSets(vps, sps, pps)
         }
     }
 
@@ -330,11 +350,15 @@ class RtspSession(
     private fun handleDescribe(request: RtspRequest): RtspResponse {
         val sdpGenerator = SdpGenerator()
 
+        // Describe the stream at the address this client actually reached us
+        // on; the server-wide guess can be another interface (mobile data).
+        val localAddress = (socket.localAddress as? Inet4Address)?.hostAddress ?: serverAddress
+
         val sdp = sdpGenerator.generateSdp(
-            serverAddress = serverAddress,
+            serverAddress = localAddress,
             serverPort = serverRtpPort.takeIf { it > 0 } ?: RtspConstants.DEFAULT_RTP_PORT,
             sessionName = "LensDaemon Stream",
-            config = com.lensdaemon.encoder.EncoderConfig(codec = codec),
+            config = streamConfig.copy(codec = codec),
             vps = vps,
             sps = sps,
             pps = pps,
@@ -442,10 +466,16 @@ class RtspSession(
             return RtspResponse(RtspStatusCode.METHOD_NOT_VALID, request.cseq)
         }
 
+        // Start the client on a keyframe that carries its parameter sets, and
+        // ask the encoder for one now rather than leaving the player waiting
+        // up to a full GOP for the next scheduled keyframe.
+        synchronized(this) { aligner.reset() }
+        outboundQueue.clear()
         state = SessionState.PLAYING
         isPlaying.set(true)
         startTimeMs = System.currentTimeMillis()
         startWriterLoop()
+        onStartedPlaying(this)
 
         // RTP-Info header
         val seq = rtpPacketizer?.getSequenceNumber() ?: 0
@@ -522,19 +552,33 @@ class RtspSession(
      * Queue an encoded frame for delivery to this client.
      *
      * Never blocks: a client that cannot keep up loses frames rather than
-     * holding up the encoder and every other output.
+     * holding up the encoder and every other output. Pictures before the
+     * client's first keyframe are held back, and codec-config buffers are
+     * folded into the keyframes instead of being sent on their own.
      */
     fun sendFrame(frame: EncodedFrame) {
         if (!isPlaying.get()) return
         if (rtpPacketizer == null) return
 
-        if (outboundQueue.offer(frame)) return
+        val accessUnit = synchronized(this) { aligner.process(frame) } ?: return
+        val outbound = if (accessUnit === frame.data) frame else frame.copy(data = accessUnit, size = accessUnit.size)
 
-        // Backlog is full. Discard the oldest picture so the client is always
-        // working toward live rather than falling further behind.
-        outboundQueue.poll()
-        framesDropped.incrementAndGet()
-        outboundQueue.offer(frame)
+        if (outboundQueue.offer(outbound)) return
+
+        // Backlog is full. Pictures depend on the ones before them, so dropping
+        // some of the backlog would leave the viewer decoding garbage until the
+        // next keyframe. Drop all of it and resume cleanly at a keyframe (this
+        // one, if it is one): the client sees a brief freeze and then picks up
+        // at live.
+        val discarded = outboundQueue.size
+        outboundQueue.clear()
+        if (frame.isKeyFrame) {
+            outboundQueue.offer(outbound)
+            framesDropped.addAndGet(discarded.toLong())
+        } else {
+            framesDropped.addAndGet(discarded + 1L)
+            synchronized(this) { aligner.reset() }
+        }
 
         // Frames are piling up and nothing is draining: the peer has stopped
         // reading. Close the socket, which also unblocks the stuck write.
