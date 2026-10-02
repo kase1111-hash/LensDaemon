@@ -1090,7 +1090,35 @@ app/src/main/java/com/lensdaemon/output/
                                  # - H.264/H.265 stream type support
                                  # - Per-PID continuity counters
                                  # - UDP datagram batching (7 TS packets)
+                                 # - Access unit delimiter on every picture
 ```
+
+## Streaming Pipeline (shared encoder)
+
+One encoder feeds every output. `CameraService` starts it for the first
+output (RTSP, MPEG-TS or recording) and shares it with the rest; stopping an
+output stops the encoder only when nothing else uses it. `startStreaming(config)`
+holds the encoder on its own and restarts it if the settings change;
+`stopStreaming()` stops every output and the encoder. The phone's Start Stream
+button and kiosk boot auto-start both start RTSP.
+
+```
+app/src/main/java/com/lensdaemon/output/
+├── KeyframeAligner.kt           # Per-receiver stream start: holds pictures until a
+│                                # keyframe, folds codec-config buffers into an
+│                                # SPS/PPS/VPS cache, prefixes bare keyframes with it
+│                                # (used by RtspSession and MpegTsUdpPublisher)
+└── LocalNetwork.kt              # LAN IPv4 for stream URLs (WiFi/hotspot/USB over cellular)
+
+app/src/main/java/com/lensdaemon/camera/
+└── FrameRatePolicy.kt           # CONTROL_AE_TARGET_FPS_RANGE choice: fixed range at
+                                 # the encoder frame rate so low light never drops fps
+```
+
+- RTSP PLAY and new MPEG-TS receivers request a keyframe from the encoder.
+- The capture session runs with or without the on-screen preview surface
+  (`LensDaemonCameraManager.setPreviewSurface`), so streaming survives the
+  screen turning off or the app going to the background.
 
 ### MPEG-TS/UDP API Endpoints
 

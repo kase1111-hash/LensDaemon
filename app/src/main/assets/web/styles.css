@@ -247,6 +247,24 @@ main {
 .rtsp-link {
     color: var(--primary-color);
     text-decoration: none;
+    word-break: break-all;
+}
+
+.stream-hint {
+    margin-bottom: 10px;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.stream-hint code {
+    color: var(--text-color);
+}
+
+.stream-target {
+    display: grid;
+    grid-template-columns: 2fr 1fr;
+    gap: 10px;
+    margin-bottom: 10px;
 }
 
 .rtsp-link:hover {

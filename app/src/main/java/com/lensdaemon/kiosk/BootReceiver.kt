@@ -78,21 +78,11 @@ class BootReceiver : BroadcastReceiver() {
             // 2. Start web server service (needed for API access)
             startWebServerService(context)
 
-            // 3. Start camera/streaming services if configured
-            if (config.autoStart.startStreaming) {
-                startCameraService(context)
-            }
-
-            // 4. Start RTSP server if configured
-            if (config.autoStart.startRtsp) {
-                // RTSP is started via CameraService
-                Timber.tag(TAG).d("RTSP auto-start configured")
-            }
-
-            // 5. Start recording if configured
-            if (config.autoStart.startRecording) {
-                // Recording is started via CameraService
-                Timber.tag(TAG).d("Recording auto-start configured")
+            // 3. Start streaming (camera, encoder and RTSP server) and, if
+            //    configured, recording alongside it
+            val autoStart = config.autoStart
+            if (autoStart.startStreaming || autoStart.startRtsp || autoStart.startRecording) {
+                startCameraService(context, record = autoStart.startRecording)
             }
 
             Timber.tag(TAG).i("Startup sequence completed")
@@ -121,17 +111,17 @@ class BootReceiver : BroadcastReceiver() {
     }
 
     /**
-     * Start the camera foreground service
+     * Start the camera foreground service serving RTSP, recording too if [record].
      */
-    private fun startCameraService(context: Context) {
+    private fun startCameraService(context: Context, record: Boolean) {
         try {
-            val serviceIntent = Intent(context, CameraService::class.java)
+            val serviceIntent = CameraService.startRtspStreamingIntent(context, record)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(serviceIntent)
             } else {
                 context.startService(serviceIntent)
             }
-            Timber.tag(TAG).d("Camera service started")
+            Timber.tag(TAG).i("Camera service started: RTSP${if (record) " + recording" else ""}")
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Failed to start camera service")
         }

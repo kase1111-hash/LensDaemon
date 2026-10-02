@@ -106,13 +106,26 @@ Open LensDaemon on the device. Note the IP address displayed.
 
 From any browser: `http://{device-ip}:8080`
 
-### 4. Connect Your Software
+### 4. Start the Stream
+Tap **Start Stream** on the phone, or **Start RTSP** in the web dashboard. The
+phone's overlay shows the RTSP URL, the resolution and frame rate, and how many
+viewers are watching.
+
 ```
-RTSP: rtsp://{device-ip}:8554/live
-MPEG-TS/UDP: caller mode pushes to udp://{your-pc}:9000 (open udp://@:9000 in VLC or ffplay)
+RTSP:        rtsp://{device-ip}:8554/stream
+MPEG-TS/UDP: pushed to udp://{your-pc}:9000 (dashboard: "MPEG-TS over UDP")
 ```
 
 Works with OBS, VLC, vMix, Blue Iris, Frigate, or any NVR that speaks RTSP.
+
+### 5. Add It to OBS
+1. **Sources → + → Media Source**, untick **Local File**.
+2. **Input:** the RTSP URL, or `udp://@:9000` if you started MPEG-TS from the dashboard (it pushes to the computer the dashboard is open on).
+3. Untick **Restart playback when source becomes active**, and set **Network Buffering** to 0–1 MB for low latency.
+4. On WiFi with packet loss, use RTSP and enter `rtsp_transport=tcp` under **FFmpeg Options**: MPEG-TS over UDP has the lowest latency but no loss recovery.
+
+Video only: the phone's microphone is not captured, so use your usual mic in OBS.
+The stream keeps running with the phone's screen off or the app in the background.
 
 ---
 

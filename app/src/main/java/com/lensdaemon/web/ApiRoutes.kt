@@ -204,7 +204,7 @@ class ApiRoutes(
         return when {
             // Status endpoints
             uri == "/api/status" && method == NanoHTTPD.Method.GET -> getStatus()
-            uri == "/api/device" && method == NanoHTTPD.Method.GET -> getDeviceInfo()
+            uri == "/api/device" && method == NanoHTTPD.Method.GET -> getDeviceInfo(session.remoteIpAddress)
 
             // Lens control
             uri.startsWith("/api/lens/") && method == NanoHTTPD.Method.POST -> switchLens(uri)
@@ -276,6 +276,13 @@ class ApiRoutes(
                     put("currentBitrate", stats.currentBitrateBps)
                     put("currentFps", stats.currentFps)
                 }
+                camera?.getEncoderConfig()?.let { config ->
+                    put("width", config.width)
+                    put("height", config.height)
+                    put("frameRate", config.frameRate)
+                    put("bitrate", config.bitrateBps)
+                    put("codec", config.codec.name)
+                }
             })
 
             // RTSP status
@@ -284,6 +291,24 @@ class ApiRoutes(
                 put("url", camera?.getRtspUrl() ?: "")
                 put("clients", camera?.getRtspClientCount() ?: 0)
                 put("playing", camera?.getRtspPlayingCount() ?: 0)
+            })
+
+            // MPEG-TS/UDP status
+            put("mpegts", JSONObject().apply {
+                put("running", camera?.isMpegTsRunning() ?: false)
+                val stats = camera?.getMpegTsStats()
+                if (stats != null) {
+                    put("mode", stats.mode.name)
+                    put("connected", stats.isConnected)
+                    put("remoteAddress", stats.remoteAddress)
+                    put("port", stats.port)
+                }
+            })
+
+            // Recording status
+            put("recording", JSONObject().apply {
+                put("active", camera?.isRecording() ?: false)
+                put("paused", camera?.isRecordingPaused() ?: false)
             })
 
             // Director status
@@ -314,8 +339,13 @@ class ApiRoutes(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    private fun getDeviceInfo(): NanoHTTPD.Response {
+    /**
+     * Device details, plus the address this request came from: the dashboard
+     * offers it as the default target for pushing MPEG-TS to "this computer".
+     */
+    private fun getDeviceInfo(clientAddress: String?): NanoHTTPD.Response {
         val json = JSONObject().apply {
+            put("clientAddress", clientAddress ?: "")
             put("manufacturer", Build.MANUFACTURER)
             put("model", Build.MODEL)
             put("device", Build.DEVICE)

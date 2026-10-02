@@ -51,11 +51,36 @@
                         <a id="rtsp-url" href="#" class="rtsp-link">Not running</a>
                     </div>
                     <div class="rtsp-stats">
-                        <span>Clients: <span id="rtsp-clients">0</span></span>
+                        <span>Watching: <span id="rtsp-clients">0</span></span>
                     </div>
+                    <p class="stream-hint">OBS: add a Media Source, untick "Local File" and paste the URL as the Input.</p>
                     <div class="button-group">
                         <button id="btn-rtsp-start" class="btn btn-success">Start RTSP</button>
                         <button id="btn-rtsp-stop" class="btn btn-danger" disabled>Stop RTSP</button>
+                    </div>
+                </div>
+
+                <!-- MPEG-TS/UDP Controls -->
+                <div class="control-group">
+                    <h3>MPEG-TS over UDP</h3>
+                    <div class="stream-target">
+                        <div class="form-group">
+                            <label for="mpegts-host">Send to (machine running OBS)</label>
+                            <input type="text" id="mpegts-host" placeholder="192.168.1.20" autocomplete="off">
+                        </div>
+                        <div class="form-group">
+                            <label for="mpegts-port">UDP port</label>
+                            <input type="number" id="mpegts-port" value="9000" min="1" max="65535">
+                        </div>
+                    </div>
+                    <div class="rtsp-info">
+                        <span>Status: </span>
+                        <span id="mpegts-status" class="status-text stopped">Stopped</span>
+                    </div>
+                    <p class="stream-hint">OBS: add a Media Source, untick "Local File", Input <code id="mpegts-obs-input">udp://@:9000</code>. Lower latency than RTSP; no packet-loss recovery.</p>
+                    <div class="button-group">
+                        <button id="btn-mpegts-start" class="btn btn-success">Start MPEG-TS</button>
+                        <button id="btn-mpegts-stop" class="btn btn-danger" disabled>Stop MPEG-TS</button>
                     </div>
                 </div>
 
