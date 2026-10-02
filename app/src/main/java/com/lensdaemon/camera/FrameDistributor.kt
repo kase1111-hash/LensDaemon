@@ -24,8 +24,13 @@ class FrameDistributor {
 
     private val listeners = CopyOnWriteArrayList<(EncodedFrame) -> Unit>()
 
+    /**
+     * Register [listener]. Registering the same listener again is a no-op:
+     * an output started twice (a repeated API call, the dashboard and the
+     * phone both pressing Start) must not receive, and send, every frame twice.
+     */
     fun addListener(listener: (EncodedFrame) -> Unit) {
-        listeners.add(listener)
+        listeners.addIfAbsent(listener)
     }
 
     fun removeListener(listener: (EncodedFrame) -> Unit) {

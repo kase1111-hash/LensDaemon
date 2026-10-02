@@ -76,6 +76,9 @@ class LensDaemonCameraManager(private val context: Context) {
     private var previewSurface: Surface? = null
     private var encoderSurface: Surface? = null
 
+    /** The open camera's CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES. */
+    private var availableFpsRanges: List<IntRange> = emptyList()
+
     /** Serializes session (re)configuration so surface changes never interleave. */
     private val sessionMutex = Mutex()
 
@@ -384,6 +387,7 @@ class LensDaemonCameraManager(private val context: Context) {
                         override fun onOpened(camera: CameraDevice) {
                             Timber.i("Camera opened: ${lens.cameraId}")
                             cameraDevice = camera
+                            availableFpsRanges = queryFpsRanges(lens.cameraId)
                             _currentLens.value = lens
                             _cameraState.value = CameraState.OPENED
                             continuation.resume(true)
@@ -434,12 +438,27 @@ class LensDaemonCameraManager(private val context: Context) {
         }
     }
 
+    private fun queryFpsRanges(cameraId: String): List<IntRange> = try {
+        cameraManager.getCameraCharacteristics(cameraId)
+            .get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?.map { it.lower..it.upper }
+            .orEmpty()
+    } catch (e: CameraAccessException) {
+        Timber.w(e, "Could not read frame-rate ranges for camera $cameraId")
+        emptyList()
+    }
+
     /**
-     * Configure the capture session with the preview surface, the frame-access
-     * ImageReader and, when one is attached, the encoder's input surface.
+     * Configure the capture session with the preview surface (if there is one),
+     * the frame-access ImageReader and, when one is attached, the encoder's
+     * input surface.
+     *
+     * The on-screen preview is optional: with the screen off or the app in the
+     * background there is no surface to draw on, but the encoder (and the web
+     * dashboard's MJPEG preview) must keep getting frames.
      */
     suspend fun startPreview(
-        previewSurface: Surface,
+        previewSurface: Surface?,
         config: CaptureConfig = CaptureConfig()
     ): Boolean = sessionMutex.withLock {
         val device = cameraDevice ?: run {
@@ -491,6 +510,18 @@ class LensDaemonCameraManager(private val context: Context) {
     /** All surfaces the session must target right now. */
     private fun activeSurfaces(): List<Surface> =
         listOfNotNull(previewSurface, imageReader?.surface, encoderSurface)
+
+    /**
+     * Show the camera on [surface], or stop drawing to the screen when it is
+     * null (the activity went away), without interrupting the encoder. A
+     * running session is rebuilt with the new surface set; before the session
+     * exists the surface is simply used by the next [startPreview].
+     */
+    suspend fun setPreviewSurface(surface: Surface?): Boolean = sessionMutex.withLock {
+        if (previewSurface === surface) return@withLock true
+        previewSurface = surface
+        reconfigureSessionIfActive(if (surface != null) "preview surface attached" else "preview surface gone")
+    }
 
     /** Create a capture session for [surfaces] and start the repeating request on it. */
     private suspend fun createSession(device: CameraDevice, surfaces: List<Surface>): Boolean =
@@ -568,15 +599,20 @@ class LensDaemonCameraManager(private val context: Context) {
     private fun startRepeatingRequest() {
         val device = cameraDevice ?: return
         val session = captureSession ?: return
-        val preview = previewSurface ?: return
+        val targets = activeSurfaces()
+        if (targets.isEmpty()) return
 
         // TEMPLATE_RECORD tunes the pipeline for a steady frame rate once an
         // encoder is attached; TEMPLATE_PREVIEW favours responsiveness otherwise.
         val template = if (encoderSurface != null) CameraDevice.TEMPLATE_RECORD else CameraDevice.TEMPLATE_PREVIEW
         val requestBuilder = device.createCaptureRequest(template).apply {
-            addTarget(preview)
-            imageReader?.surface?.let { addTarget(it) }
-            encoderSurface?.let { addTarget(it) }
+            targets.forEach { addTarget(it) }
+
+            // Hold the frame rate steady at the stream's rate instead of letting
+            // auto-exposure slow it down in dim light
+            FrameRatePolicy.chooseAeTargetFpsRange(availableFpsRanges, currentConfig.frameRate)?.let {
+                set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, Range(it.first, it.last))
+            }
 
             // Apply configuration
             set(CaptureRequest.CONTROL_AF_MODE, currentConfig.focusMode.camera2Mode)
@@ -621,12 +657,20 @@ class LensDaemonCameraManager(private val context: Context) {
      */
     fun updateConfig(config: CaptureConfig) {
         currentConfig = config
+        applyRepeatingRequest()
+    }
+
+    private fun applyRepeatingRequest() {
         if (_cameraState.value == CameraState.PREVIEWING ||
             _cameraState.value == CameraState.STREAMING) {
             try {
                 startRepeatingRequest()
             } catch (e: CameraAccessException) {
                 Timber.e(e, "Failed to update capture config")
+            } catch (e: IllegalStateException) {
+                // The session closed under us (lens switch, reconfigure); the
+                // next session picks the config up
+                Timber.w(e, "Capture session gone while updating config")
             }
         }
     }
@@ -636,9 +680,15 @@ class LensDaemonCameraManager(private val context: Context) {
      * already running it is rebuilt with the new surface; otherwise the surface
      * is picked up by the next [startPreview]. The surface survives lens
      * switches (which close and reopen the camera) until [removeEncoderSurface].
+     *
+     * @param config capture settings to apply with it, e.g. the encoder's frame rate
      */
-    suspend fun addEncoderSurface(surface: Surface): Boolean = sessionMutex.withLock {
-        if (encoderSurface === surface) return@withLock true
+    suspend fun addEncoderSurface(surface: Surface, config: CaptureConfig? = null): Boolean = sessionMutex.withLock {
+        config?.let { currentConfig = it }
+        if (encoderSurface === surface) {
+            if (config != null) applyRepeatingRequest()
+            return@withLock true
+        }
         encoderSurface = surface
         reconfigureSessionIfActive("encoder surface attached")
     }
@@ -660,7 +710,6 @@ class LensDaemonCameraManager(private val context: Context) {
     private suspend fun reconfigureSessionIfActive(reason: String): Boolean {
         val device = cameraDevice ?: return true
         val session = captureSession ?: return true
-        if (previewSurface == null) return true
 
         Timber.i("Reconfiguring capture session: $reason")
         _cameraState.value = CameraState.CONFIGURING

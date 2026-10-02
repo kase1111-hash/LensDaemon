@@ -37,6 +37,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.collectLatest
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Foreground service for camera capture operations.
@@ -49,7 +50,9 @@ class CameraService : Service() {
         private const val ACTION_STOP_PREVIEW = "com.lensdaemon.action.STOP_PREVIEW"
         private const val ACTION_START_STREAMING = "com.lensdaemon.action.START_STREAMING"
         private const val ACTION_STOP_STREAMING = "com.lensdaemon.action.STOP_STREAMING"
+        private const val ACTION_START_RTSP_STREAMING = "com.lensdaemon.action.START_RTSP_STREAMING"
         private const val EXTRA_LENS_TYPE = "lens_type"
+        private const val EXTRA_RECORD = "record"
         private const val DEFAULT_CPU_TEMP_FALLBACK = 40
 
         fun startPreviewIntent(context: Context, lensType: LensType = LensType.MAIN): Intent {
@@ -62,6 +65,17 @@ class CameraService : Service() {
         fun stopPreviewIntent(context: Context): Intent {
             return Intent(context, CameraService::class.java).apply {
                 action = ACTION_STOP_PREVIEW
+            }
+        }
+
+        /**
+         * Open the camera and serve RTSP with the default encoder settings,
+         * optionally recording too. Used to bring the appliance up unattended.
+         */
+        fun startRtspStreamingIntent(context: Context, record: Boolean = false): Intent {
+            return Intent(context, CameraService::class.java).apply {
+                action = ACTION_START_RTSP_STREAMING
+                putExtra(EXTRA_RECORD, record)
             }
         }
 
@@ -85,6 +99,19 @@ class CameraService : Service() {
     private var currentConfig = CaptureConfig()
     @Volatile private var isPreviewActive = false
     @Volatile private var isStreamingActive = false
+
+    /** A camera open has been launched and has not finished yet. */
+    private val cameraOpenPending = AtomicBoolean(false)
+
+    /**
+     * Encoding was asked for in its own right (Start Streaming), so it keeps
+     * running when the last output stops. Outputs started on their own (RTSP,
+     * MPEG-TS, recording) release the encoder when the last of them stops.
+     */
+    @Volatile private var encodingRequested = false
+
+    /** Work that needs the encoder service, waiting for it to bind. */
+    private val pendingEncoderWork = mutableListOf<() -> Unit>()
 
     // Focus state observable
     private val _focusState = MutableStateFlow(FocusState.INACTIVE)
@@ -140,6 +167,10 @@ class CameraService : Service() {
                     _encoderState.value = state
                 }
             }
+
+            val pending = pendingEncoderWork.toList()
+            pendingEncoderWork.clear()
+            pending.forEach { it() }
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
@@ -171,6 +202,7 @@ class CameraService : Service() {
         recordingCoordinator = RecordingCoordinator(applicationContext, serviceScope)
         recordingCoordinator.onStateChanged = { updateNotification() }
         rtspCoordinator.onKeyframeRequest = { requestKeyFrame() }
+        mpegTsCoordinator.onKeyframeRequest = { requestKeyFrame() }
 
         // Set up zoom change listener
         zoomController.setOnZoomChangedListener { zoom ->
@@ -178,18 +210,21 @@ class CameraService : Service() {
             applyZoomToCamera(zoom)
         }
 
-        // Monitor surface state
+        // Follow the on-screen preview surface. It comes and goes with the
+        // activity (screen off, app in the background); the capture session
+        // keeps running without it so streaming and recording carry on.
+        // collect, not collectLatest: a surface change must never be cancelled
+        // halfway through rebuilding the session.
         serviceScope.launch {
-            previewSurfaceProvider.surfaceState.collectLatest { state ->
+            previewSurfaceProvider.surfaceState.collect { state ->
                 when (state) {
                     is SurfaceState.Available -> {
                         Timber.d("Preview surface available: ${state.width}x${state.height}")
-                        if (isPreviewActive) {
-                            startCameraPreview(state.surface)
-                        }
+                        if (isPreviewActive) lensDaemonCameraManager.setPreviewSurface(state.surface)
                     }
                     is SurfaceState.Unavailable -> {
-                        Timber.d("Preview surface unavailable")
+                        Timber.d("Preview surface gone; capture continues without it")
+                        if (isPreviewActive) lensDaemonCameraManager.setPreviewSurface(null)
                     }
                 }
             }
@@ -218,6 +253,15 @@ class CameraService : Service() {
         }
     }
 
+    /**
+     * Run [work] now if the encoder service is bound, otherwise as soon as it
+     * binds. A start intent can arrive right after onCreate, before binding
+     * completes.
+     */
+    private fun whenEncoderBound(work: () -> Unit) {
+        if (encoderBound && encoderService != null) work() else pendingEncoderWork.add(work)
+    }
+
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Timber.i("CameraService onStartCommand: ${intent?.action}")
 
@@ -227,19 +271,24 @@ class CameraService : Service() {
         when (intent?.action) {
             ACTION_START_PREVIEW -> {
                 val lensTypeName = intent.getStringExtra(EXTRA_LENS_TYPE) ?: LensType.MAIN.name
-                val lensType = LensType.valueOf(lensTypeName)
-                serviceScope.launch {
-                    openCameraAndStartPreview(lensType)
-                }
+                startPreview(LensType.valueOf(lensTypeName))
             }
             ACTION_STOP_PREVIEW -> {
                 stopPreview()
             }
             ACTION_START_STREAMING -> {
-                startStreaming()
+                whenEncoderBound { startStreaming() }
             }
             ACTION_STOP_STREAMING -> {
                 stopStreaming()
+            }
+            ACTION_START_RTSP_STREAMING -> {
+                val record = intent.getBooleanExtra(EXTRA_RECORD, false)
+                whenEncoderBound {
+                    if (startRtspStreaming() && record && !startRecording()) {
+                        Timber.e("Auto-start: RTSP is up but recording failed to start")
+                    }
+                }
             }
         }
 
@@ -249,11 +298,9 @@ class CameraService : Service() {
     override fun onDestroy() {
         super.onDestroy()
         Timber.i("CameraService destroyed")
-        rtspCoordinator.stop()
-        mpegTsCoordinator.stop()
+        stopStreaming()
         recordingCoordinator.release()
         frameDistributor.removeAll()
-        stopStreaming()
         stopPreview()
         unbindEncoderService()
         lensDaemonCameraManager.release()
@@ -335,11 +382,24 @@ class CameraService : Service() {
     fun getZoomPresets(): List<ZoomPreset> = lensController.getZoomPresets()
 
     /**
-     * Start camera preview with the specified lens.
+     * Open the camera with [lensType] and start capturing, unless it is already
+     * running (or opening). The activity calls this every time it binds and
+     * outputs call it when they start, and neither may reopen the camera under
+     * a running stream; use [switchLens] to change lenses.
      */
     fun startPreview(lensType: LensType = LensType.MAIN) {
+        val state = lensDaemonCameraManager.cameraState.value
+        if (isPreviewActive && state != CameraState.CLOSED && state != CameraState.ERROR) {
+            Timber.d("Camera already running ($state); keeping it")
+            return
+        }
+        if (!cameraOpenPending.compareAndSet(false, true)) return
         serviceScope.launch {
-            openCameraAndStartPreview(lensType)
+            try {
+                openCameraAndStartPreview(lensType)
+            } finally {
+                cameraOpenPending.set(false)
+            }
         }
     }
 
@@ -363,11 +423,7 @@ class CameraService : Service() {
                     initializeControllersForCamera(it.cameraId)
                 }
                 isPreviewActive = true
-                // Wait for surface to be available
-                val surfaceState = previewSurfaceProvider.surfaceState.value
-                if (surfaceState is SurfaceState.Available) {
-                    startCameraPreview(surfaceState.surface)
-                }
+                startCameraPreview(currentPreviewSurface())
                 updateNotification()
             } else {
                 Timber.e("Failed to open camera")
@@ -385,10 +441,7 @@ class CameraService : Service() {
                 lensController.setCurrentLens(lens)
                 initializeControllersForCamera(lens.cameraId)
                 isPreviewActive = true
-                val surfaceState = previewSurfaceProvider.surfaceState.value
-                if (surfaceState is SurfaceState.Available) {
-                    startCameraPreview(surfaceState.surface)
-                }
+                startCameraPreview(currentPreviewSurface())
                 updateNotification()
             } else {
                 Timber.e("Failed to open camera")
@@ -398,9 +451,18 @@ class CameraService : Service() {
         }
     }
 
-    private suspend fun startCameraPreview(surface: Surface) {
+    /** The on-screen preview surface, or null while the activity is not showing. */
+    private fun currentPreviewSurface(): Surface? =
+        (previewSurfaceProvider.surfaceState.value as? SurfaceState.Available)?.surface
+
+    /**
+     * Start the capture session. [surface] is the on-screen preview, if the
+     * activity is showing; without it the camera still feeds the encoder and
+     * the dashboard preview.
+     */
+    private suspend fun startCameraPreview(surface: Surface?) {
         try {
-            Timber.i("Starting camera preview")
+            Timber.i("Starting camera capture (on-screen preview: ${surface != null})")
             lensDaemonCameraManager.startPreview(surface, currentConfig)
         } catch (e: Exception) {
             Timber.e(e, "Error starting camera preview")
@@ -696,6 +758,9 @@ class CameraService : Service() {
 
     // ==================== Encoding & Streaming (Phase 4-5) ====================
 
+    /** The outputs that share the encoder. */
+    private enum class Output { RTSP, MPEGTS, RECORDING }
+
     /**
      * Initialize encoder with configuration.
      * @return true if initialization successful
@@ -717,11 +782,14 @@ class CameraService : Service() {
         encoderService?.removeFrameListener(encoderFrameListener)
         encoderService?.addFrameListener(encoderFrameListener)
 
-        // Hand the encoder's input surface to the camera. The capture session is
-        // rebuilt with it as a target; until that completes the codec simply
+        // Hand the encoder's input surface to the camera, and have the camera
+        // deliver frames at the encoder's rate. The capture session is rebuilt
+        // with the surface as a target; until that completes the codec simply
         // waits for its first frame.
+        currentConfig = currentConfig.copy(frameRate = config.frameRate)
+        val captureConfig = currentConfig
         serviceScope.launch {
-            if (!lensDaemonCameraManager.addEncoderSurface(surface)) {
+            if (!lensDaemonCameraManager.addEncoderSurface(surface, captureConfig)) {
                 Timber.e("Camera could not attach the encoder surface; nothing will be encoded")
             }
         }
@@ -764,51 +832,145 @@ class CameraService : Service() {
     }
 
     /**
-     * Start video streaming (encoding + preview).
+     * Make sure the encoder is running for an output that is starting.
+     *
+     * A running encoder is shared as it is: restarting it for the new output
+     * would cut every other output's viewers off mid-stream. Otherwise the
+     * camera is opened if needed and a fresh encoder is started with [config].
+     *
+     * @return true if the encoder is running
      */
-    fun startStreaming() {
+    @Synchronized
+    private fun ensureEncoding(config: EncoderConfig): Boolean {
+        if (isStreamingActive) {
+            val running = getEncoderConfig()
+            if (running != null && running != config) {
+                Timber.i(
+                    "Encoder already running at ${running.width}x${running.height} " +
+                        "${running.frameRate}fps ${running.codec}; the new output shares it"
+                )
+            }
+            return true
+        }
+
         if (!isPreviewActive) {
-            Timber.w("Preview not active, cannot start streaming")
-            return
+            Timber.i("Camera not running; starting it with the main lens")
+            startPreview(LensType.MAIN)
         }
 
         // A stopped MediaCodec cannot be restarted, so anything but a freshly
-        // initialized encoder is replaced.
-        val freshEncoder = encoderSurface != null && encoderService?.encoderState?.value == EncoderState.READY
-        if (!freshEncoder && !initializeEncoder()) {
-            Timber.e("Failed to initialize encoder for streaming")
-            return
+        // initialized encoder with this configuration is replaced.
+        val fresh = encoderSurface != null &&
+            encoderService?.encoderState?.value == EncoderState.READY &&
+            getEncoderConfig() == config
+        if (!fresh && !initializeEncoder(config)) {
+            Timber.e("Failed to initialize encoder")
+            return false
         }
-
-        if (beginEncoding()) {
-            Timber.i("Streaming started")
-        }
+        return beginEncoding()
     }
 
     /**
-     * Start video streaming with specific encoder configuration.
+     * Start encoding with [config] and keep encoding until [stopStreaming],
+     * whether or not an output is attached.
+     *
+     * If the encoder already runs with other settings it is restarted with
+     * these. Attached RTSP and MPEG-TS viewers stay connected and pick the new
+     * stream up at its first keyframe; a recording is split into a new
+     * segment, since one MP4 track cannot change format.
+     *
+     * @return true if the encoder is running with [config]
      */
-    fun startStreaming(config: EncoderConfig) {
-        if (!isPreviewActive) {
-            Timber.w("Preview not active, cannot start streaming")
-            return
+    @Synchronized
+    fun startStreaming(config: EncoderConfig = EncoderConfig.PRESET_1080P): Boolean {
+        encodingRequested = true
+        val running = getEncoderConfig()
+        if (isStreamingActive && running != null && running != config) {
+            return restartEncoder(config)
         }
-
-        // Initialize encoder with provided config
-        if (!initializeEncoder(config)) {
-            Timber.e("Failed to initialize encoder for streaming")
-            return
+        if (!ensureEncoding(config)) {
+            encodingRequested = false
+            return false
         }
-
-        if (beginEncoding()) {
-            Timber.i("Streaming started with config: ${config.width}x${config.height}")
-        }
+        Timber.i("Streaming started: ${config.width}x${config.height} ${config.frameRate}fps")
+        return true
     }
 
     /**
-     * Stop video streaming.
+     * Replace the running encoder with one using [config], keeping the outputs.
      */
+    private fun restartEncoder(config: EncoderConfig): Boolean {
+        val previous = getEncoderConfig()
+        Timber.i(
+            "Restarting encoder: ${previous?.width}x${previous?.height} ${previous?.frameRate}fps -> " +
+                "${config.width}x${config.height} ${config.frameRate}fps"
+        )
+        val wasRecording = isRecordingActive()
+        if (wasRecording) {
+            frameDistributor.removeListener(recordingCoordinator.frameListener)
+            recordingCoordinator.stopRecording()
+        }
+
+        isStreamingActive = false
+        encoderService?.stopEncoding()
+
+        // Tell the outputs before the new encoder's first (codec-config)
+        // buffer reaches them, so they parse it as the right codec.
+        if (previous?.codec != config.codec) {
+            rtspCoordinator.updateCodecConfig(config.codec, null, null, null)
+            mpegTsCoordinator.updateCodec(config.codec)
+        }
+        rtspCoordinator.setStreamConfig(config)
+
+        if (!initializeEncoder(config) || !beginEncoding()) {
+            Timber.e("Encoder restart failed; stopping outputs")
+            stopStreaming()
+            return false
+        }
+
+        if (wasRecording && !startRecording()) {
+            Timber.e("Recording could not continue after the encoder restart")
+        }
+        return true
+    }
+
+    /**
+     * Stop streaming: every output (RTSP server, MPEG-TS publisher, recording)
+     * and then the encoder, so nothing is left serving viewers a frozen stream.
+     */
+    @Synchronized
     fun stopStreaming() {
+        encodingRequested = false
+        if (isRecordingActive()) {
+            frameDistributor.removeListener(recordingCoordinator.frameListener)
+            recordingCoordinator.stopRecording()
+        }
+        stopRtspServer()
+        stopMpegTsPublisher()
+        stopEncoder()
+    }
+
+    /**
+     * Stop the encoder unless something still needs it: an explicit
+     * [startStreaming], or an output other than [stopping].
+     */
+    @Synchronized
+    private fun stopEncoderIfUnused(stopping: Output) {
+        val stillNeeded = encodingRequested ||
+            (stopping != Output.RTSP && rtspCoordinator.isRunning()) ||
+            (stopping != Output.MPEGTS && mpegTsCoordinator.isRunning()) ||
+            (stopping != Output.RECORDING && isRecordingActive())
+        if (stillNeeded) {
+            Timber.i("Encoder kept running for the remaining outputs")
+            return
+        }
+        stopEncoder()
+    }
+
+    private fun isRecordingActive(): Boolean =
+        recordingCoordinator.isRecording() || recordingCoordinator.isPaused()
+
+    private fun stopEncoder() {
         if (!isStreamingActive) return
 
         isStreamingActive = false
@@ -816,13 +978,17 @@ class CameraService : Service() {
 
         // Detach the encoder surface from the camera first so it never renders
         // into a dead surface, then drop the encoder: a stopped MediaCodec
-        // cannot be restarted, so the next start builds a fresh one.
+        // cannot be restarted, so the next start builds a fresh one. The lock
+        // keeps this from releasing an encoder that a start on another thread
+        // has just built but not yet started.
         serviceScope.launch {
             lensDaemonCameraManager.removeEncoderSurface()
-            if (!isStreamingActive) {
-                encoderService?.stopEncoding()
-                encoderService?.releaseEncoder()
-                encoderSurface = null
+            synchronized(this@CameraService) {
+                if (!isStreamingActive) {
+                    encoderService?.stopEncoding()
+                    encoderService?.releaseEncoder()
+                    encoderSurface = null
+                }
             }
             Timber.i("Streaming stopped")
         }
@@ -975,16 +1141,24 @@ class CameraService : Service() {
 
     // ==================== RTSP Server (Phase 5) ====================
 
+    /**
+     * Start the RTSP server on [port] (or keep the running one) and feed it
+     * the encoder's frames. Starting it twice never delivers a frame twice.
+     */
     fun startRtspServer(port: Int = 8554): Boolean {
-        val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
-        rtspCoordinator.updateCodecConfig(codec, getSps(), getPps(), getVps())
         frameDistributor.addListener(rtspCoordinator.frameListener)
-
         val success = rtspCoordinator.start(port)
         if (!success) {
             frameDistributor.removeListener(rtspCoordinator.frameListener)
+            return false
         }
-        return success
+        // Configure after start: before it there is no server to configure.
+        // Parameter sets the encoder has not produced yet are learned from
+        // its codec-config buffer as it goes out.
+        val config = getEncoderConfig() ?: EncoderConfig.PRESET_1080P
+        rtspCoordinator.updateCodecConfig(config.codec, getSps(), getPps(), getVps())
+        rtspCoordinator.setStreamConfig(config)
+        return true
     }
 
     fun stopRtspServer() {
@@ -1002,39 +1176,23 @@ class CameraService : Service() {
 
     fun isRtspServerRunning(): Boolean = rtspCoordinator.isRunning()
 
-    private fun updateRtspCodecConfig() {
-        val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
-        rtspCoordinator.updateCodecConfig(codec, getSps(), getPps(), getVps())
-    }
-
+    /**
+     * Serve the camera over RTSP. Uses the running encoder if there is one
+     * (another output started it), otherwise starts one with [config].
+     */
+    @Synchronized
     fun startRtspStreaming(
         config: EncoderConfig = EncoderConfig.PRESET_1080P,
         rtspPort: Int = 8554
     ): Boolean {
-        if (!isPreviewActive) {
-            Timber.w("Preview not active, starting with main lens")
-            startPreview(LensType.MAIN)
-        }
-
-        if (!initializeEncoder(config)) {
-            Timber.e("Failed to initialize encoder")
+        if (!ensureEncoding(config)) {
             return false
         }
 
-        if (!beginEncoding()) {
-            return false
-        }
-
-        val rtspStarted = startRtspServer(rtspPort)
-        if (!rtspStarted) {
+        if (!startRtspServer(rtspPort)) {
             Timber.e("Failed to start RTSP server")
-            stopStreaming()
+            stopEncoderIfUnused(Output.RTSP)
             return false
-        }
-
-        serviceScope.launch {
-            delay(500)
-            updateRtspCodecConfig()
         }
 
         updateNotification()
@@ -1042,14 +1200,23 @@ class CameraService : Service() {
         return true
     }
 
+    /**
+     * Stop serving RTSP. The encoder keeps running if another output (or an
+     * explicit Start Streaming) still needs it.
+     */
+    @Synchronized
     fun stopRtspStreaming() {
         stopRtspServer()
-        stopStreaming()
+        stopEncoderIfUnused(Output.RTSP)
         Timber.i("RTSP streaming stopped")
     }
 
     // ==================== MPEG-TS/UDP Publisher ====================
 
+    /**
+     * Start the MPEG-TS/UDP publisher (restarting it if [config] differs from
+     * the running one) and feed it the encoder's frames.
+     */
     fun startMpegTsPublisher(config: MpegTsUdpConfig = MpegTsUdpConfig()): Boolean {
         val codec = getEncoderConfig()?.codec ?: VideoCodec.H264
         frameDistributor.addListener(mpegTsCoordinator.frameListener)
@@ -1070,28 +1237,22 @@ class CameraService : Service() {
 
     fun getMpegTsStats(): MpegTsUdpStats? = mpegTsCoordinator.getStats()
 
+    /**
+     * Publish the camera as MPEG-TS over UDP. Uses the running encoder if
+     * there is one, otherwise starts one with [encoderConfig].
+     */
+    @Synchronized
     fun startMpegTsStreaming(
         encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
         mpegtsConfig: MpegTsUdpConfig = MpegTsUdpConfig()
     ): Boolean {
-        if (!isPreviewActive) {
-            Timber.w("Preview not active, starting with main lens")
-            startPreview(LensType.MAIN)
-        }
-
-        if (!initializeEncoder(encoderConfig)) {
-            Timber.e("Failed to initialize encoder for MPEG-TS/UDP")
+        if (!ensureEncoding(encoderConfig)) {
             return false
         }
 
-        if (!beginEncoding()) {
-            return false
-        }
-
-        val started = startMpegTsPublisher(mpegtsConfig)
-        if (!started) {
+        if (!startMpegTsPublisher(mpegtsConfig)) {
             Timber.e("Failed to start MPEG-TS/UDP publisher")
-            stopStreaming()
+            stopEncoderIfUnused(Output.MPEGTS)
             return false
         }
 
@@ -1100,9 +1261,14 @@ class CameraService : Service() {
         return true
     }
 
+    /**
+     * Stop the MPEG-TS/UDP publisher. The encoder keeps running if another
+     * output (or an explicit Start Streaming) still needs it.
+     */
+    @Synchronized
     fun stopMpegTsStreaming() {
         stopMpegTsPublisher()
-        stopStreaming()
+        stopEncoderIfUnused(Output.MPEGTS)
         Timber.i("MPEG-TS/UDP streaming stopped")
     }
 
@@ -1144,29 +1310,38 @@ class CameraService : Service() {
         return success
     }
 
+    /**
+     * Record locally. Uses the running encoder if there is one (recording
+     * alongside a stream), otherwise starts one with [config].
+     */
+    @Synchronized
     fun startRecording(
         config: EncoderConfig,
         segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
     ): Boolean {
-        if (!isStreamingActive) {
-            if (!initializeEncoder(config)) {
-                return false
-            }
-            if (!beginEncoding()) {
-                return false
-            }
+        if (!ensureEncoding(config)) {
+            return false
         }
 
         if (!recordingCoordinator.isInitialized()) {
             recordingCoordinator.initialize(config, segmentDuration)
         }
 
-        return startRecording()
+        val started = startRecording()
+        if (!started) stopEncoderIfUnused(Output.RECORDING)
+        return started
     }
 
+    /**
+     * Stop recording. The encoder keeps running if a stream (or an explicit
+     * Start Streaming) still needs it.
+     */
+    @Synchronized
     fun stopRecording(): List<String> {
         frameDistributor.removeListener(recordingCoordinator.frameListener)
-        return recordingCoordinator.stopRecording()
+        val segments = recordingCoordinator.stopRecording()
+        stopEncoderIfUnused(Output.RECORDING)
+        return segments
     }
 
     fun pauseRecording(): Boolean = recordingCoordinator.pauseRecording()

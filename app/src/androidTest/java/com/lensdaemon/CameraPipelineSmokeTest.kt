@@ -144,6 +144,57 @@ class CameraPipelineSmokeTest {
         assertTrue("preview should keep running after the encoder was detached", previewFrames.await(10, TimeUnit.SECONDS))
     }
 
+    @Test
+    fun theEncoderGetsFramesWithNoPreviewSurfaceAtAll() {
+        // Screen off or app in the background: there is nothing to draw on,
+        // and streaming must not depend on it.
+        val encoderSurface = encoder.initialize().getOrThrow()
+        val frames = CountDownLatch(5)
+        encoder.setFrameCallback { frame -> if (!frame.isConfigFrame) frames.countDown() }
+
+        val started = runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("encoder surface should attach", manager.addEncoderSurface(encoderSurface))
+            manager.startPreview(null, CaptureConfig(resolution = size))
+        }
+        assertTrue("capture should start without a preview surface\n" + recentCameraLog(), started)
+        assertTrue("encoder should start", encoder.start())
+        assertTrue("encoder should receive frames with no preview surface", frames.await(20, TimeUnit.SECONDS))
+    }
+
+    @Test
+    fun streamingSurvivesThePreviewSurfaceGoingAwayAndComingBack() {
+        val encoderSurface = encoder.initialize().getOrThrow()
+        val frameCount = AtomicInteger(0)
+        encoder.setFrameCallback { frame -> if (!frame.isConfigFrame) frameCount.incrementAndGet() }
+
+        runBlocking {
+            assertTrue("camera should open", manager.openCamera(LensType.MAIN))
+            assertTrue("encoder surface should attach", manager.addEncoderSurface(encoderSurface))
+            assertTrue("preview should start", manager.startPreview(previewReader.surface, CaptureConfig(resolution = size)))
+        }
+        assertTrue("encoder should start", encoder.start())
+        assertTrue("frames should flow with the preview", waitForFrames(frameCount, 5))
+
+        // The activity went away: the session drops the preview but keeps encoding
+        val gone = runBlocking { manager.setPreviewSurface(null) }
+        assertTrue("session should rebuild without the preview\n" + recentCameraLog(), gone)
+        assertTrue("frames should keep flowing without the preview", waitForFrames(frameCount, 5))
+
+        // ...and came back
+        val back = runBlocking { manager.setPreviewSurface(previewReader.surface) }
+        assertTrue("session should rebuild with the preview again\n" + recentCameraLog(), back)
+        assertTrue("frames should keep flowing with the preview back", waitForFrames(frameCount, 5))
+    }
+
+    /** Wait up to 20 s for [count] more frames than [counter] holds now. */
+    private fun waitForFrames(counter: AtomicInteger, count: Int): Boolean {
+        val target = counter.get() + count
+        val deadline = System.currentTimeMillis() + 20_000
+        while (counter.get() < target && System.currentTimeMillis() < deadline) Thread.sleep(20)
+        return counter.get() >= target
+    }
+
     /** Recent camera-related logcat lines, for failure diagnostics. */
     private fun recentCameraLog(): String {
         return try {

@@ -65,6 +65,11 @@ class RtspCoordinator {
         rtspServer?.setCodecConfig(codec, sps, pps, vps)
     }
 
+    /** Advertise [config]'s frame rate and bitrate to clients that DESCRIBE from now on. */
+    fun setStreamConfig(config: EncoderConfig) {
+        rtspServer?.setStreamConfig(config)
+    }
+
     fun getRtspUrl(): String? = rtspServer?.getRtspUrl()
 
     fun getStats(): RtspServerStats? = rtspServer?.getStats()
