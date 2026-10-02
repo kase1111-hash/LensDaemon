@@ -1,6 +1,8 @@
 package com.lensdaemon
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
@@ -225,6 +227,92 @@ class RtspServerSmokeTest {
             assertEquals("viewer should get SPS, PPS, IDR, then the next picture", listOf(7, 8, 5, 1), nalTypes)
         }
     }
+
+    @Test
+    fun aViewerSettingUpAudioGetsAacInSyncWithTheVideo() {
+        rtspServer.setCodecConfig(VideoCodec.H264, SPS, PPS)
+        rtspServer.setAudioConfig(AudioConfig(sampleRate = 48_000, channelCount = 2))
+        rtspServer.mediaClockUs = { 10_000_000L } // sender reports describe media time 10 s
+        assertTrue("RTSP server should start", rtspServer.start())
+
+        Socket("localhost", testPort).use { socket ->
+            socket.soTimeout = 3000
+            val input = socket.getInputStream()
+            val out = socket.getOutputStream()
+
+            out.write(request("DESCRIBE", 1).toByteArray())
+            val sdp = readResponse(input)
+            assertTrue("SDP should offer an AAC track: $sdp", sdp.contains("m=audio") && sdp.contains("config=1190"))
+
+            out.write(request("SETUP", 2, "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n", "/trackID=0").toByteArray())
+            val setup = readResponse(input)
+            val session = setup.lines().first { it.startsWith("Session:", ignoreCase = true) }
+                .substringAfter(":").substringBefore(";").trim()
+            out.write(
+                request(
+                    "SETUP", 3, "Transport: RTP/AVP/TCP;unicast;interleaved=2-3\r\nSession: $session\r\n", "/trackID=1"
+                ).toByteArray()
+            )
+            assertTrue("audio SETUP should succeed", readResponse(input).startsWith("RTSP/1.0 200"))
+            out.write(request("PLAY", 4, "Session: $session\r\n").toByteArray())
+            val play = readResponse(input)
+            assertTrue("RTP-Info should list both tracks: $play", play.contains("trackID=0") && play.contains("trackID=1"))
+
+            val early = ByteArray(200) { 1 }
+            val first = ByteArray(300) { 2 }
+            val second = ByteArray(310) { 3 }
+            rtspServer.sendAudio(EncodedAudioFrame(early, 9_990_000L))   // before any picture: held back
+            rtspServer.sendFrame(EncodedFrame(nal(0x65, 2000), 10_000_000L, FLAG_KEY_FRAME))
+            rtspServer.sendAudio(EncodedAudioFrame(first, 10_010_000L))
+            rtspServer.sendAudio(EncodedAudioFrame(second, 10_031_333L))
+
+            val frames = readInterleaved(input) { got -> got.count { it.first == 2 } >= 2 && got.any { it.first == 3 } }
+            val firstVideo = frames.indexOfFirst { it.first == 0 }
+            val firstAudio = frames.indexOfFirst { it.first == 2 }
+            assertTrue("audio should follow the first picture", firstVideo in 0 until firstAudio)
+
+            val audioPackets = frames.filter { it.first == 2 }.map { it.second }
+            assertEquals("the audio sent before the picture should not go out", 2, audioPackets.size)
+            assertEquals("payload type 98", 98, audioPackets[0][1].toInt() and 0x7F)
+            assertEquals("AU size of the first frame", first.size, auSize(audioPackets[0]))
+            assertEquals("AU size of the second frame", second.size, auSize(audioPackets[1]))
+            assertEquals("RTP clock is the sample rate", 480_480L, rtpTimestamp(audioPackets[0]))
+
+            val videoReport = frames.first { it.first == 1 }.second
+            val audioReport = frames.first { it.first == 3 }.second
+            assertEquals("video sender report", 200, videoReport[1].toInt() and 0xFF)
+            assertEquals("audio sender report", 200, audioReport[1].toInt() and 0xFF)
+            assertEquals("video SR maps media time 10 s at 90 kHz", 900_000L, srRtpTimestamp(videoReport))
+            assertEquals("audio SR maps the same instant at 48 kHz", 480_000L, srRtpTimestamp(audioReport))
+        }
+    }
+
+    /** Read interleaved frames as (channel, data) until [done] says so. */
+    private fun readInterleaved(input: InputStream, done: (List<Pair<Int, ByteArray>>) -> Boolean): List<Pair<Int, ByteArray>> {
+        val data = DataInputStream(input)
+        val frames = mutableListOf<Pair<Int, ByteArray>>()
+        try {
+            while (!done(frames)) {
+                assertEquals("expected an interleaved frame", '$'.code, data.readUnsignedByte())
+                val channel = data.readUnsignedByte()
+                val packet = ByteArray(data.readUnsignedShort())
+                data.readFully(packet)
+                frames.add(channel to packet)
+            }
+        } catch (e: SocketTimeoutException) {
+            throw AssertionError("stream went quiet after channels ${frames.map { it.first }}", e)
+        }
+        return frames
+    }
+
+    private fun auSize(rtp: ByteArray): Int = (((rtp[14].toInt() and 0xFF) shl 8) or (rtp[15].toInt() and 0xFF)) shr 3
+
+    private fun rtpTimestamp(rtp: ByteArray): Long = readUInt32(rtp, 4)
+
+    private fun srRtpTimestamp(report: ByteArray): Long = readUInt32(report, 16)
+
+    private fun readUInt32(bytes: ByteArray, offset: Int): Long =
+        (0 until 4).fold(0L) { acc, i -> (acc shl 8) or (bytes[offset + i].toLong() and 0xFF) }
 
     /** Build an RTSP request for the stream (or [suffix] below it) with optional extra header lines. */
     private fun request(method: String, cseq: Int, headers: String = "", suffix: String = ""): String =

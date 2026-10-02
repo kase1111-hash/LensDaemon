@@ -1,5 +1,7 @@
 package com.lensdaemon.camera
 
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.MpegTsMode
@@ -28,6 +30,14 @@ class MpegTsCoordinator {
         publisher?.sendFrame(frame)
     }
 
+    /** Forwards encoded AAC frames to the publisher */
+    val audioListener: (EncodedAudioFrame) -> Unit = { frame ->
+        publisher?.sendAudio(frame)
+    }
+
+    /** The audio carried with new and running publishers, or null for video only. */
+    private var audioConfig: AudioConfig? = null
+
     /** Asks the encoder for a keyframe when a receiver starts. */
     var onKeyframeRequest: (() -> Unit)? = null
 
@@ -55,6 +65,7 @@ class MpegTsCoordinator {
 
         publisher = MpegTsUdpPublisher(config).also {
             it.setCodecConfig(codec, sps, pps, vps)
+            it.setAudioConfig(audioConfig)
             it.onKeyframeRequest = { onKeyframeRequest?.invoke() }
         }
 
@@ -74,6 +85,12 @@ class MpegTsCoordinator {
         publisher = null
         _running.value = false
         Timber.i("MPEG-TS/UDP publisher stopped")
+    }
+
+    /** Carry [config]'s AAC stream (none when null), now and in publishers started later. */
+    fun setAudioConfig(config: AudioConfig?) {
+        audioConfig = config
+        publisher?.setAudioConfig(config)
     }
 
     /** Switch the running publisher to [codec]; its parameter sets follow from the stream. */

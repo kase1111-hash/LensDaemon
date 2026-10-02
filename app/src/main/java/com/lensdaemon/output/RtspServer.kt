@@ -1,5 +1,7 @@
 package com.lensdaemon.output
 
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.NalUnitParser
@@ -92,6 +94,17 @@ class RtspServer(
     /** Encoder settings advertised to clients in the SDP. */
     @Volatile
     private var streamConfig: EncoderConfig = EncoderConfig()
+
+    /** The AAC stream offered as a second track, or null for video only. */
+    @Volatile
+    private var audioConfig: AudioConfig? = null
+
+    /**
+     * Now, in microseconds, on the clock frame presentation times are
+     * stamped on (the camera's). Sender reports map it to wall-clock time.
+     */
+    @Volatile
+    var mediaClockUs: () -> Long = { System.nanoTime() / 1000 }
 
     // Server address
     private var serverAddress: String = "0.0.0.0"
@@ -214,6 +227,25 @@ class RtspServer(
     }
 
     /**
+     * Offer [config] as an audio track to clients that DESCRIBE from now on,
+     * or no audio track when null. Sessions already set up keep their tracks.
+     */
+    fun setAudioConfig(config: AudioConfig?) {
+        audioConfig = config
+        sessions.values.forEach { it.audioConfig = config }
+    }
+
+    /**
+     * Send an encoded AAC frame to every playing client that set up audio.
+     */
+    fun sendAudio(frame: EncodedAudioFrame) {
+        if (!isRunning.get()) return
+        for (session in sessions.values) {
+            if (session.isPlaying()) session.sendAudio(frame)
+        }
+    }
+
+    /**
      * Update codec parameters (called when SPS/PPS change)
      */
     fun updateCodecParams(sps: ByteArray?, pps: ByteArray?, vps: ByteArray? = null) {
@@ -315,13 +347,15 @@ class RtspServer(
                 sessions.remove(closedSession.sessionId)
                 Timber.i("$TAG: Session ${closedSession.sessionId} removed, active: ${sessions.size}")
             },
-            onStartedPlaying = { onClientStartsPlaying() }
+            onStartedPlaying = { onClientStartsPlaying() },
+            mediaClockUs = { mediaClockUs() }
         )
 
         // Initialize session
         session.initialize()
         session.setCodecConfig(codec, sps, pps, vps)
         session.streamConfig = streamConfig
+        session.audioConfig = audioConfig
 
         // Add to active sessions
         sessions[session.sessionId] = session

@@ -2,6 +2,7 @@ package com.lensdaemon.storage
 
 import android.content.Context
 import android.media.MediaFormat
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.output.*
@@ -115,6 +116,13 @@ class StorageManager(
 
     private var retentionJob: Job? = null
     private var videoFormat: MediaFormat? = null
+
+    /** AAC track format recorded from the next segment on, or null for video only. */
+    var audioFormat: MediaFormat? = null
+        set(value) {
+            field = value
+            fileWriter?.setAudioFormat(value)
+        }
     private var sps: ByteArray? = null
     private var pps: ByteArray? = null
     private var vps: ByteArray? = null
@@ -193,6 +201,7 @@ class StorageManager(
         writer.addListener(this)
         writer.setVideoFormat(format)
         writer.setParameterSets(sps, pps, vps)
+        writer.setAudioFormat(audioFormat)
         writer.onKeyFrameRequest = onKeyFrameRequest
 
         if (!writer.startRecording()) {
@@ -270,6 +279,11 @@ class StorageManager(
      */
     fun writeFrame(frame: EncodedFrame): Boolean {
         return fileWriter?.writeFrame(frame) == true
+    }
+
+    /** Writes an encoded AAC frame to the current recording; returns whether it was written. */
+    val audioFrameWriter: (EncodedAudioFrame) -> Boolean = { frame ->
+        fileWriter?.writeAudioFrame(frame) == true
     }
 
     /**

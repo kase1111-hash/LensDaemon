@@ -1,5 +1,7 @@
 package com.lensdaemon.output
 
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
@@ -11,14 +13,13 @@ import java.io.EOFException
 import java.io.IOException
 import java.io.InputStream
 import java.io.OutputStream
-import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.Socket
 import java.net.SocketTimeoutException
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
@@ -43,19 +44,27 @@ class RtspSession(
     private val serverAddress: String,
     private val onSessionClosed: (RtspSession) -> Unit,
     /** Called when the client starts (or resumes) playing, so the server can ask for a keyframe. */
-    private val onStartedPlaying: (RtspSession) -> Unit = {}
+    private val onStartedPlaying: (RtspSession) -> Unit = {},
+    /** Now, on the clock media presentation times are stamped on, in microseconds. */
+    private val mediaClockUs: () -> Long = { System.nanoTime() / 1000 }
 ) {
     companion object {
         private const val TAG = "RtspSession"
         private const val READ_TIMEOUT_MS = 60_000
 
         /**
-         * Frames buffered per client before the backlog is dropped and the
-         * client resumes at the next keyframe. Roughly two seconds at 30 fps:
+         * Frames (video and audio) buffered per client before the backlog is
+         * dropped and the client resumes at the next keyframe. Roughly two
+         * seconds of 30 fps video plus 48 kHz AAC (about 47 frames a second):
          * enough to ride out a WiFi hiccup, short enough that a recovering
          * viewer catches up to live quickly.
          */
-        private const val OUTBOUND_QUEUE_CAPACITY = 60
+        private const val OUTBOUND_QUEUE_CAPACITY = 160
+
+        /** How often each track sends an RTCP sender report while playing. */
+        private const val SENDER_REPORT_INTERVAL_MS = 5_000L
+
+        private const val VIDEO_CLOCK_RATE = 90_000
 
         /**
          * If no frame write completes within this window while frames are
@@ -84,12 +93,16 @@ class RtspSession(
     val clientAddress: InetAddress = socket.inetAddress
     val clientPort: Int = socket.port
 
-    // Transport
-    private var transportParams: TransportParams? = null
+    // Transport: one entry per track the client has SET UP
+    private val tracks = ConcurrentHashMap<RtspTrack.Kind, RtspTrack>()
+    @Volatile
     private var rtpPacketizer: RtpPacketizer? = null
-    private var udpSocket: DatagramSocket? = null
-    private var serverRtpPort: Int = 0
-    private var serverRtcpPort: Int = 0
+    @Volatile
+    private var aacPacketizer: AacRtpPacketizer? = null
+
+    /** The AAC stream on offer, or null when the server has no audio. */
+    @Volatile
+    var audioConfig: AudioConfig? = null
 
     // Codec info
     private var codec: VideoCodec = VideoCodec.H264
@@ -132,14 +145,13 @@ class RtspSession(
      * output in turn, so a blocking write here would stall RTSP delivery to all
      * other viewers, the MPEG-TS publisher and the recorder along with it.
      */
-    private val outboundQueue = ArrayBlockingQueue<EncodedFrame>(OUTBOUND_QUEUE_CAPACITY)
+    private val outboundQueue = ArrayBlockingQueue<Outbound>(OUTBOUND_QUEUE_CAPACITY)
     private var writerThread: Thread? = null
 
     @Volatile
     private var lastWriteCompletedMs: Long = System.currentTimeMillis()
 
     // RTCP feedback
-    private var rtcpSocket: DatagramSocket? = null
     @Volatile var lastFractionLost: Int = 0; private set
     @Volatile var lastCumulativeLost: Int = 0; private set
     @Volatile var lastJitter: Long = 0; private set
@@ -293,7 +305,7 @@ class RtspSession(
         readFully(input, data)
 
         lastActivityMs = System.currentTimeMillis()
-        if (channel == transportParams?.interleavedRtcpChannel) {
+        if (tracks.values.any { it.isInterleaved && it.params.interleavedRtcpChannel == channel }) {
             applyReceiverReports(RtcpParser.parseReceiverReports(data))
         } else {
             Timber.tag(TAG).v("Session $sessionId: ignoring $length-byte interleaved frame on channel $channel")
@@ -356,14 +368,14 @@ class RtspSession(
 
         val sdp = sdpGenerator.generateSdp(
             serverAddress = localAddress,
-            serverPort = serverRtpPort.takeIf { it > 0 } ?: RtspConstants.DEFAULT_RTP_PORT,
+            serverPort = RtspConstants.DEFAULT_RTP_PORT,
             sessionName = "LensDaemon Stream",
             config = streamConfig.copy(codec = codec),
             vps = vps,
             sps = sps,
             pps = pps,
             trackId = "trackID=0"
-        )
+        ) + (audioConfig?.let { sdpGenerator.audioMediaSection(it) } ?: "")
 
         return RtspResponse.ok(request.cseq)
             .addHeader(RtspConstants.HEADER_CONTENT_BASE, request.uri + "/")
@@ -371,7 +383,9 @@ class RtspSession(
     }
 
     /**
-     * Handle SETUP request - configure transport
+     * Handle SETUP for one track: the video track (trackID=0, or the
+     * aggregate URL from clients that only ever ask for one track) or the
+     * audio track (trackID=1).
      */
     private fun handleSetup(request: RtspRequest): RtspResponse {
         val transport = request.transport
@@ -379,83 +393,41 @@ class RtspSession(
 
         val params = TransportParams.parse(transport)
             ?: return RtspResponse.unsupportedTransport(request.cseq)
+        if (params.mode == RtspTransportMode.UDP_MULTICAST) {
+            return RtspResponse.unsupportedTransport(request.cseq)
+        }
 
-        transportParams = params
+        val kind = if (request.uri.trimEnd('/').endsWith(SdpGenerator.AUDIO_TRACK_ID)) {
+            RtspTrack.Kind.AUDIO
+        } else {
+            RtspTrack.Kind.VIDEO
+        }
+        val audio = audioConfig
+        if (kind == RtspTrack.Kind.AUDIO && audio == null) {
+            return RtspResponse(RtspStatusCode.NOT_FOUND, request.cseq)
+        }
 
-        // Setup transport based on mode
-        when (params.mode) {
-            RtspTransportMode.UDP_UNICAST -> {
-                setupUdpTransport(params)
-            }
-            RtspTransportMode.TCP_INTERLEAVED -> {
-                // TCP uses existing connection
-                serverRtpPort = 0
-                serverRtcpPort = 0
-            }
-            RtspTransportMode.UDP_MULTICAST -> {
-                return RtspResponse.unsupportedTransport(request.cseq)
-            }
+        val track = RtspTrack(kind, params, clientAddress, outputStream, ::applyReceiverReports)
+        if (!track.open(sessionScope)) {
+            return RtspResponse(RtspStatusCode.INTERNAL_ERROR, request.cseq)
+        }
+        tracks.put(kind, track)?.close()
+
+        val ssrc = if (kind == RtspTrack.Kind.AUDIO && audio != null) {
+            val packetizer = aacPacketizer?.takeIf { it.clockRate == audio.sampleRate }
+                ?: AacRtpPacketizer(audio.sampleRate).also { aacPacketizer = it }
+            packetizer.getSsrc()
+        } else {
+            rtpPacketizer?.getSsrc() ?: 0L
         }
 
         state = SessionState.READY
-
-        val ssrc = rtpPacketizer?.getSsrc() ?: 0L
-        val transportResponse = params.toResponseHeader(serverRtpPort, serverRtcpPort, ssrc)
-
         return RtspResponse.ok(request.cseq)
             .setSession(sessionId)
-            .addHeader(RtspConstants.HEADER_TRANSPORT, transportResponse)
-    }
-
-    /**
-     * Setup UDP transport
-     */
-    private fun setupUdpTransport(params: TransportParams) {
-        try {
-            // Create UDP socket for RTP
-            udpSocket = DatagramSocket()
-            serverRtpPort = udpSocket?.localPort ?: 0
-            serverRtcpPort = serverRtpPort + 1
-
-            // Create RTCP socket on RTP port + 1 for receiver reports
-            try {
-                rtcpSocket = DatagramSocket(serverRtcpPort)
-                rtcpSocket?.soTimeout = 1000
-                startRtcpListener()
-            } catch (e: Exception) {
-                Timber.w("$TAG: Could not bind RTCP port $serverRtcpPort: ${e.message}")
-            }
-
-            Timber.i("$TAG: UDP transport setup - server port $serverRtpPort, client ${params.clientRtpPort}")
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Failed to setup UDP transport")
-        }
-    }
-
-    /**
-     * Listen for RTCP receiver reports on the RTCP port.
-     * Updates loss and jitter metrics from client feedback.
-     */
-    private fun startRtcpListener() {
-        sessionScope.launch {
-            val socket = rtcpSocket ?: return@launch
-            val buf = ByteArray(512)
-            val packet = DatagramPacket(buf, buf.size)
-
-            while (isRunning.get() && !socket.isClosed) {
-                try {
-                    socket.receive(packet)
-                    applyReceiverReports(RtcpParser.parseReceiverReports(buf.copyOf(packet.length)))
-                } catch (e: java.net.SocketTimeoutException) {
-                    // Expected — loop and check isRunning
-                } catch (e: Exception) {
-                    if (isRunning.get()) {
-                        Timber.tag(TAG).e(e, "RTCP listener error")
-                    }
-                    break
-                }
-            }
-        }
+            .addHeader(
+                RtspConstants.HEADER_TRANSPORT,
+                params.toResponseHeader(track.serverRtpPort, track.serverRtcpPort, ssrc)
+            )
     }
 
     /**
@@ -477,9 +449,15 @@ class RtspSession(
         startWriterLoop()
         onStartedPlaying(this)
 
-        // RTP-Info header
-        val seq = rtpPacketizer?.getSequenceNumber() ?: 0
-        val rtpInfo = "url=${request.uri}/trackID=0;seq=$seq;rtptime=0"
+        // RTP-Info header, one entry per track set up
+        val base = request.uri.trimEnd('/')
+        val rtpInfo = tracks.keys.sortedBy { it.trackId }.joinToString(",") { kind ->
+            val seq = when (kind) {
+                RtspTrack.Kind.AUDIO -> aacPacketizer?.getSequenceNumber()
+                RtspTrack.Kind.VIDEO -> rtpPacketizer?.getSequenceNumber()
+            }
+            "url=$base/trackID=${kind.trackId};seq=${seq ?: 0};rtptime=0"
+        }
 
         Timber.i("$TAG: Session $sessionId started playing")
 
@@ -561,7 +539,9 @@ class RtspSession(
         if (rtpPacketizer == null) return
 
         val accessUnit = synchronized(this) { aligner.process(frame) } ?: return
-        val outbound = if (accessUnit === frame.data) frame else frame.copy(data = accessUnit, size = accessUnit.size)
+        val outbound = Outbound.Video(
+            if (accessUnit === frame.data) frame else frame.copy(data = accessUnit, size = accessUnit.size)
+        )
 
         if (outboundQueue.offer(outbound)) return
 
@@ -593,6 +573,20 @@ class RtspSession(
     }
 
     /**
+     * Queue an AAC frame for this client, if it set up the audio track.
+     *
+     * Audio waits for the video's first keyframe when the client also plays
+     * video, so playback starts with both. Never blocks: when the backlog is
+     * full the frame is dropped and the video path deals with the stall.
+     */
+    fun sendAudio(frame: EncodedAudioFrame) {
+        if (!isPlaying.get() || frame.isConfig) return
+        if (!tracks.containsKey(RtspTrack.Kind.AUDIO) || aacPacketizer == null) return
+        if (tracks.containsKey(RtspTrack.Kind.VIDEO) && !synchronized(this) { aligner.started }) return
+        if (!outboundQueue.offer(Outbound.Audio(frame))) framesDropped.incrementAndGet()
+    }
+
+    /**
      * Drains the outbound queue onto the socket. Blocking writes are confined
      * to this thread, so a wedged client costs only its own session.
      */
@@ -603,7 +597,11 @@ class RtspSession(
         writerThread = Thread({
             val self = Thread.currentThread()
             while (isRunning.get() && !socket.isClosed && !self.isInterrupted) {
-                pollOutboundFrame()?.let { writeFrame(it) }
+                when (val next = pollOutboundFrame()) {
+                    is Outbound.Video -> writeFrame(next.frame)
+                    is Outbound.Audio -> writeAudio(next.frame)
+                    null -> Unit
+                }
             }
             Timber.tag(TAG).d("Session $sessionId writer loop exited")
         }, "rtsp-writer-$sessionId").apply {
@@ -617,7 +615,7 @@ class RtspSession(
      * in time or the writer thread was interrupted; the interrupt flag is
      * restored so the writer loop condition sees it and exits.
      */
-    private fun pollOutboundFrame(): EncodedFrame? {
+    private fun pollOutboundFrame(): Outbound? {
         return try {
             outboundQueue.poll(WRITER_POLL_MS, TimeUnit.MILLISECONDS)
         } catch (e: InterruptedException) {
@@ -631,10 +629,12 @@ class RtspSession(
      */
     private fun writeFrame(frame: EncodedFrame) {
         val packetizer = rtpPacketizer ?: return
+        val track = tracks[RtspTrack.Kind.VIDEO] ?: return
         try {
+            sendReportIfDue(track, VIDEO_CLOCK_RATE, packetizer.getSsrc())
             val packets = packetizer.packetize(frame.data, frame.presentationTimeUs)
             for (packet in packets) {
-                sendRtpPacket(packet)
+                track.sendRtp(packet)
             }
             packetsSent.addAndGet(packets.size.toLong())
             bytesSent.addAndGet(frame.size.toLong())
@@ -645,7 +645,7 @@ class RtspSession(
             // so it stands in for a keepalive. Over UDP it proves nothing: a
             // datagram to a vanished peer never fails, so a silent UDP viewer
             // must keep sending RTCP or RTSP keepalives or be evicted as idle.
-            if (transportParams?.mode == RtspTransportMode.TCP_INTERLEAVED) {
+            if (track.isInterleaved) {
                 lastActivityMs = now
             }
         } catch (e: IOException) {
@@ -660,57 +660,43 @@ class RtspSession(
         }
     }
 
-    /**
-     * Send RTP packet to client
-     */
-    private fun sendRtpPacket(packet: RtpPacket) {
-        val data = packet.toByteArray()
-        val params = transportParams ?: return
-
-        when (params.mode) {
-            RtspTransportMode.UDP_UNICAST -> {
-                sendUdpPacket(data, params.clientRtpPort)
-            }
-            RtspTransportMode.TCP_INTERLEAVED -> {
-                sendInterleavedPacket(data, params.interleavedRtpChannel)
-            }
-            else -> { /* Not supported */ }
-        }
-    }
-
-    /**
-     * Send UDP packet
-     */
-    private fun sendUdpPacket(data: ByteArray, port: Int) {
+    /** Packetize one AAC frame and write it to the client on the writer thread. */
+    private fun writeAudio(frame: EncodedAudioFrame) {
+        val packetizer = aacPacketizer ?: return
+        val track = tracks[RtspTrack.Kind.AUDIO] ?: return
+        val packet = packetizer.packetize(frame.data, frame.presentationTimeUs) ?: return
         try {
-            val packet = DatagramPacket(data, data.size, clientAddress, port)
-            udpSocket?.send(packet)
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Error sending UDP packet")
+            sendReportIfDue(track, packetizer.clockRate, packetizer.getSsrc())
+            track.sendRtp(packet)
+            packetsSent.incrementAndGet()
+            bytesSent.addAndGet(frame.size.toLong())
+        } catch (e: IOException) {
+            if (isRunning.get()) {
+                Timber.w("$TAG: Session $sessionId: audio write failed (${e.message}); closing")
+                close()
+            }
         }
     }
 
     /**
-     * Send TCP interleaved packet
-     * Format: $ + channel (1 byte) + length (2 bytes) + data
-     *
-     * A failed write means the connection is gone; the IOException propagates
-     * so the writer loop can close the session instead of counting the frame
-     * as delivered.
+     * Send [track] an RTCP sender report before its first packet and every
+     * few seconds after. Every track maps the same media-clock instant to the
+     * same wall-clock time, which is what lets players sync audio to video.
      */
-    private fun sendInterleavedPacket(data: ByteArray, channel: Int) {
-        val header = ByteArray(4)
-        header[0] = '$'.code.toByte()
-        header[1] = channel.toByte()
-        header[2] = (data.size shr 8).toByte()
-        header[3] = (data.size and 0xFF).toByte()
-
-        val out = outputStream ?: return
-        synchronized(out) {
-            out.write(header)
-            out.write(data)
-            out.flush()
-        }
+    private fun sendReportIfDue(track: RtspTrack, clockRate: Int, ssrc: Long) {
+        val nowMs = System.currentTimeMillis()
+        if (track.lastSenderReportMs != 0L && nowMs - track.lastSenderReportMs < SENDER_REPORT_INTERVAL_MS) return
+        val mediaNowUs = mediaClockUs()
+        val report = RtcpSenderReport.build(
+            ssrc = ssrc,
+            wallClockMs = nowMs,
+            rtpTimestamp = mediaNowUs * clockRate / 1_000_000,
+            packetCount = track.packetsSent,
+            octetCount = track.octetsSent,
+            cname = "lensdaemon@$serverAddress"
+        )
+        track.sendRtcp(report)
+        track.lastSenderReportMs = nowMs
     }
 
     /**
@@ -756,8 +742,7 @@ class RtspSession(
         // Closing the socket is what unblocks a writer stuck on a full send
         // buffer, so it has to happen before waiting on that thread.
         try {
-            rtcpSocket?.close()
-            udpSocket?.close()
+            tracks.values.forEach { it.close() }
             inputStream?.close()
             outputStream?.close()
             socket.close()
@@ -772,6 +757,12 @@ class RtspSession(
         sessionScope.cancel()
         onSessionClosed(this)
     }
+}
+
+/** What a session's writer thread sends next. */
+private sealed interface Outbound {
+    class Video(val frame: EncodedFrame) : Outbound
+    class Audio(val frame: EncodedAudioFrame) : Outbound
 }
 
 /**

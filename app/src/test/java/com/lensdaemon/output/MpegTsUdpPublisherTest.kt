@@ -1,5 +1,8 @@
 package com.lensdaemon.output
 
+import com.lensdaemon.encoder.Aac
+import com.lensdaemon.encoder.AudioConfig
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.VideoCodec
 import org.junit.Assert.assertEquals
@@ -382,6 +385,116 @@ class MpegTsUdpPublisherTest {
             assertNotNull("PES header with PTS expected at payload start", pts)
             assertEquals("PCR should trail PTS by the buffer delay", LATENCY_MS * 90, (pts!! - pcr!!) and PTS_MASK)
         }
+    }
+
+    @Test
+    fun `audio rides its own PID as ADTS once the video has started`() {
+        val audio = AudioConfig(sampleRate = 48_000, channelCount = 2)
+        val aac = ByteArray(300) { (it % 200).toByte() }
+        val packets = allPacketsOnTheWire(audio) { caller ->
+            caller.sendAudio(EncodedAudioFrame(aac, 0L))                       // before any picture: dropped
+            caller.sendFrame(EncodedFrame(nal(0x65, 600), 10_000L, FLAG_KEY_FRAME))
+            caller.sendAudio(EncodedAudioFrame(aac, 20_000L))
+        }
+
+        val pmt = packets.first { pid(it) == 4096 }
+        val entries = pmtStreams(pmt)
+        assertEquals("PMT should list video and audio", listOf(0x1B to 256, 0x0F to 257), entries)
+
+        val audioPackets = packets.filter { pid(it) == 257 }
+        assertEquals("one audio frame should have gone out", 1, audioPackets.count { (it[1].toInt() and 0x40) != 0 })
+        val pes = elementaryStreams(audioPackets).single()
+        val pesWithHeader = firstPes(audioPackets)
+        assertEquals("audio stream id", 0xC0, pesWithHeader[3].toInt() and 0xFF)
+        assertArrayEqualsMsg("ADTS header then the raw frame", Aac.adtsHeader(aac.size, 48_000, 2) + aac, pes)
+
+        val videoPts = readPts(firstPes(packets.filter { pid(it) == 256 }))!!
+        val audioPts = readPts(pesWithHeader)!!
+        assertEquals("audio 10 ms after the picture, on the same clock", 900L, (audioPts - videoPts) and PTS_MASK)
+    }
+
+    @Test
+    fun `without audio the PMT lists only video`() {
+        val packets = allPacketsOnTheWire(null) { caller ->
+            caller.sendFrame(EncodedFrame(nal(0x65, 200), 0L, FLAG_KEY_FRAME))
+            caller.sendAudio(EncodedAudioFrame(ByteArray(100), 10_000L))
+        }
+        assertEquals(listOf(0x1B to 256), pmtStreams(packets.first { pid(it) == 4096 }))
+        assertTrue("no audio PID without an audio config", packets.none { pid(it) == 257 })
+    }
+
+    private fun pid(pkt: ByteArray): Int = ((pkt[1].toInt() and 0x1F) shl 8) or (pkt[2].toInt() and 0xFF)
+
+    /** The (stream_type, PID) entries of a PMT packet, after checking its CRC. */
+    private fun pmtStreams(pmt: ByteArray): List<Pair<Int, Int>> {
+        val t = 5
+        val sectionLength = ((pmt[t + 1].toInt() and 0x0F) shl 8) or (pmt[t + 2].toInt() and 0xFF)
+        val sectionEnd = t + 3 + sectionLength
+        assertEquals("PMT CRC should cover the section", 0, crc32Mpeg(pmt, t, sectionEnd - t))
+        val entries = mutableListOf<Pair<Int, Int>>()
+        var w = t + 12
+        while (w < sectionEnd - 4) {
+            val type = pmt[w].toInt() and 0xFF
+            val pid = ((pmt[w + 1].toInt() and 0x1F) shl 8) or (pmt[w + 2].toInt() and 0xFF)
+            entries.add(type to pid)
+            w += 5
+        }
+        return entries
+    }
+
+    /** CRC-32/MPEG-2 over [length] bytes; 0 when the bytes end with their own valid CRC. */
+    private fun crc32Mpeg(data: ByteArray, offset: Int, length: Int): Int {
+        var crc = -1
+        for (i in offset until offset + length) {
+            crc = crc xor ((data[i].toInt() and 0xFF) shl 24)
+            repeat(8) { crc = if (crc and Int.MIN_VALUE != 0) (crc shl 1) xor 0x04C11DB7 else crc shl 1 }
+        }
+        return crc
+    }
+
+    /** Publishes in caller mode with [audio] and returns every TS packet received, in order. */
+    private fun allPacketsOnTheWire(audio: AudioConfig?, send: (MpegTsUdpPublisher) -> Unit): List<ByteArray> {
+        DatagramSocket(0, InetAddress.getLoopbackAddress()).use { receiver ->
+            receiver.soTimeout = 300
+            val caller = MpegTsUdpPublisher(
+                MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = receiver.localPort)
+            )
+            caller.setCodecConfig(VideoCodec.H264, SPS, PPS)
+            caller.setAudioConfig(audio)
+            assertTrue("publisher should start", caller.start())
+            try {
+                send(caller)
+            } finally {
+                caller.stop()
+            }
+            val packets = mutableListOf<ByteArray>()
+            val buf = ByteArray(65535)
+            while (true) {
+                val datagram = DatagramPacket(buf, buf.size)
+                try {
+                    receiver.receive(datagram)
+                } catch (expected: SocketTimeoutException) {
+                    break
+                }
+                for (off in 0 until datagram.length step TS_PACKET_SIZE) {
+                    packets.add(buf.copyOfRange(off, off + TS_PACKET_SIZE))
+                }
+            }
+            return packets
+        }
+    }
+
+    /** The first PES carried by [packets], header included. */
+    private fun firstPes(packets: List<ByteArray>): ByteArray {
+        fun unitStart(pkt: ByteArray) = (pkt[1].toInt() and 0x40) != 0
+        val first = packets.indexOfFirst { unitStart(it) }
+        if (first < 0) return ByteArray(0)
+        val pesPackets = listOf(packets[first]) + packets.drop(first + 1).takeWhile { !unitStart(it) }
+        val out = ByteArrayOutputStream()
+        for (pkt in pesPackets) {
+            payloadOffset(pkt)?.let { off -> out.write(pkt, off, TS_PACKET_SIZE - off) }
+        }
+        return out.toByteArray()
     }
 
     /** A NAL unit of [type] with a start code and [payloadSize] bytes of body. */

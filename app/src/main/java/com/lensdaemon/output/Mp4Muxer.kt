@@ -3,6 +3,7 @@ package com.lensdaemon.output
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.media.MediaMuxer
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.VideoCodec
 import timber.log.Timber
@@ -187,7 +188,7 @@ class Mp4Muxer(
     }
 
     /**
-     * Add audio track (for future audio support)
+     * Add the AAC audio track. Like the video track, it must be added before [start].
      */
     fun addAudioTrack(format: MediaFormat): Int {
         synchronized(lock) {
@@ -260,6 +261,22 @@ class Mp4Muxer(
 
         return writeFrame(videoTrackIndex, frame)
     }
+
+    /**
+     * Write one raw AAC frame to the audio track. Every AAC frame is a sync sample.
+     */
+    fun writeAudioFrame(frame: EncodedAudioFrame): Boolean {
+        if (!isStarted.get() || audioTrackIndex < 0 || frame.isConfig) {
+            return false
+        }
+        return writeFrame(
+            audioTrackIndex,
+            EncodedFrame(frame.data, frame.presentationTimeUs, MediaCodec.BUFFER_FLAG_KEY_FRAME)
+        )
+    }
+
+    /** True once an audio track has been added. */
+    fun hasAudioTrack(): Boolean = audioTrackIndex >= 0
 
     /**
      * Write a frame to the specified track

@@ -2,6 +2,7 @@ package com.lensdaemon.camera
 
 import android.content.Context
 import android.media.MediaFormat
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.output.RecordingEvent
@@ -45,6 +46,14 @@ class RecordingCoordinator(
     val frameListener: (EncodedFrame) -> Unit = { frame ->
         storageManager?.writeFrame(frame)
     }
+
+    /** Forwards encoded AAC frames to the file writer */
+    val audioListener: (EncodedAudioFrame) -> Unit = { frame ->
+        storageManager?.audioFrameWriter?.invoke(frame)
+    }
+
+    /** The audio track format for new segments, kept across re-initialization. */
+    private var audioFormat: MediaFormat? = null
 
     /** Callback for notification updates when recording state changes */
     var onStateChanged: (() -> Unit)? = null
@@ -104,6 +113,7 @@ class RecordingCoordinator(
         })
 
         storageManager?.onKeyFrameRequest = onKeyFrameRequest
+        storageManager?.audioFormat = audioFormat
         Timber.i("Storage manager initialized")
         return true
     }
@@ -114,6 +124,12 @@ class RecordingCoordinator(
      */
     fun setVideoFormat(format: MediaFormat, sps: ByteArray? = null, pps: ByteArray? = null, vps: ByteArray? = null) {
         storageManager?.setVideoFormat(format, sps, pps, vps)
+    }
+
+    /** Record audio described by [format] from the next segment, or video only when null. */
+    fun setAudioFormat(format: MediaFormat?) {
+        audioFormat = format
+        storageManager?.audioFormat = format
     }
 
     fun startRecording(): Boolean {

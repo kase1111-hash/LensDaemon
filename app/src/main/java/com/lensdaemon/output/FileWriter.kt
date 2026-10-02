@@ -3,6 +3,7 @@ package com.lensdaemon.output
 import android.content.Context
 import android.media.MediaFormat
 import android.os.Build
+import com.lensdaemon.encoder.EncodedAudioFrame
 import com.lensdaemon.encoder.EncodedFrame
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.NalUnitParser
@@ -157,6 +158,12 @@ class FileWriter(
     companion object {
         private const val TAG = "FileWriter"
         private const val FILENAME_PREFIX = "LensDaemon"
+
+        /** Audio counts as flowing if a frame arrived this recently. */
+        private const val AUDIO_FLOWING_MS = 1_000L
+
+        /** How long a new segment waits for audio that is on but not flowing yet. */
+        private const val AUDIO_START_WAIT_MS = 2_000L
         private val DATE_FORMAT = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US)
     }
 
@@ -179,6 +186,22 @@ class FileWriter(
 
     /** True until the current segment has been opened on its first keyframe. */
     private val awaitingKeyFrame = AtomicBoolean(false)
+
+    /** The AAC track format added to each new segment, or null to record video only. */
+    @Volatile
+    private var audioFormat: MediaFormat? = null
+
+    /** Presentation time of the current segment's first picture; audio before it is dropped. */
+    @Volatile
+    private var segmentStartUs = Long.MAX_VALUE
+
+    /** When the last audio frame arrived (0 = never). */
+    @Volatile
+    private var lastAudioFrameMs = 0L
+
+    /** When the current segment started waiting for its first keyframe. */
+    @Volatile
+    private var awaitingSinceMs = 0L
 
     /** Invoked whenever a segment starts and needs an IDR to begin decodably. */
     @Volatile
@@ -216,6 +239,32 @@ class FileWriter(
             this.videoFormat = format
             Timber.tag(TAG).d("Video format set: $format")
         }
+    }
+
+    /**
+     * Record [format]'s AAC audio from the next segment opened, or record
+     * video only when null. A segment's tracks are fixed once it opens.
+     */
+    fun setAudioFormat(format: MediaFormat?) {
+        audioFormat = format
+    }
+
+    /**
+     * Write one AAC frame to the current segment. Audio starts with the
+     * segment's first picture, so segments open on a keyframe with sound.
+     */
+    fun writeAudioFrame(frame: EncodedAudioFrame): Boolean {
+        if (!isRecording.get() || isPaused.get() || frame.isConfig) return false
+        val now = System.currentTimeMillis()
+        val wasFlowing = now - lastAudioFrameMs < AUDIO_FLOWING_MS
+        lastAudioFrameMs = now
+        if (awaitingKeyFrame.get()) {
+            // A segment held back for its audio can open on the next keyframe now
+            if (!wasFlowing && audioFormat != null) onKeyFrameRequest?.invoke()
+            return false
+        }
+        if (frame.presentationTimeUs < segmentStartUs) return false
+        return currentMuxer?.writeAudioFrame(frame) == true
     }
 
     /**
@@ -493,6 +542,7 @@ class FileWriter(
         segmentStartTimeMs = System.currentTimeMillis()
         segmentFrames.set(0)
         segmentBytes.set(0)
+        awaitingSinceMs = System.currentTimeMillis()
         awaitingKeyFrame.set(true)
         onKeyFrameRequest?.invoke()
 
@@ -519,16 +569,39 @@ class FileWriter(
                 return false
             }
 
-            if (muxer.state == MuxerState.INITIALIZED) {
-                if (muxer.addVideoTrack(format) < 0 || !muxer.start()) {
-                    Timber.tag(TAG).e("Failed to start muxer for ${muxer.getOutputPath()}")
-                    notifyListeners(RecordingEvent.Error("Failed to start muxer"))
-                    return false
-                }
-            }
+            // An audio track that never receives a sample can make the muxer
+            // fail to finalize the file, so a segment carries audio only when
+            // audio is actually flowing. Audio that is on but has not started
+            // yet (the AAC encoder starts just after the video) is worth a
+            // short wait so the segment is not silent for its whole length.
+            val now = System.currentTimeMillis()
+            val audio = audioFormat?.takeIf { now - lastAudioFrameMs < AUDIO_FLOWING_MS }
+            val waitForAudio = audioFormat != null && audio == null && now - awaitingSinceMs < AUDIO_START_WAIT_MS
+
+            if (waitForAudio || !startMuxer(muxer, format, audio)) return false
+            segmentStartUs = keyFrame.presentationTimeUs
             awaitingKeyFrame.set(false)
             return true
         }
+    }
+
+    /** Add the video (and [audio], if any) track and start [muxer], unless it already runs. */
+    private fun startMuxer(muxer: Mp4Muxer, video: MediaFormat, audio: MediaFormat?): Boolean {
+        if (muxer.state != MuxerState.INITIALIZED) return true
+        if (muxer.addVideoTrack(video) < 0) {
+            Timber.tag(TAG).e("Failed to add the video track to ${muxer.getOutputPath()}")
+            notifyListeners(RecordingEvent.Error("Failed to start muxer"))
+            return false
+        }
+        if (audio != null && muxer.addAudioTrack(audio) < 0) {
+            Timber.tag(TAG).w("Recording this segment without audio")
+        }
+        if (!muxer.start()) {
+            Timber.tag(TAG).e("Failed to start muxer for ${muxer.getOutputPath()}")
+            notifyListeners(RecordingEvent.Error("Failed to start muxer"))
+            return false
+        }
+        return true
     }
 
     /** Cache any SPS/PPS/VPS carried in [data]. */
