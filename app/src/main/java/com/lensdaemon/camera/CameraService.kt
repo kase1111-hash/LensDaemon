@@ -842,6 +842,10 @@ class CameraService : Service() {
      */
     @Synchronized
     private fun ensureEncoding(config: EncoderConfig): Boolean {
+        // Opens the camera only if it is not running: never opened, or closed
+        // or failed since. A running stream whose camera went away recovers.
+        startPreview(lensDaemonCameraManager.currentLens.value?.lensType ?: LensType.MAIN)
+
         if (isStreamingActive) {
             val running = getEncoderConfig()
             if (running != null && running != config) {
@@ -851,11 +855,6 @@ class CameraService : Service() {
                 )
             }
             return true
-        }
-
-        if (!isPreviewActive) {
-            Timber.i("Camera not running; starting it with the main lens")
-            startPreview(LensType.MAIN)
         }
 
         // A stopped MediaCodec cannot be restarted, so anything but a freshly
@@ -918,6 +917,7 @@ class CameraService : Service() {
         // buffer reaches them, so they parse it as the right codec.
         if (previous?.codec != config.codec) {
             rtspCoordinator.updateCodecConfig(config.codec, null, null, null)
+            rtspCoordinator.disconnectViewers()
             mpegTsCoordinator.updateCodec(config.codec)
         }
         rtspCoordinator.setStreamConfig(config)
@@ -925,6 +925,9 @@ class CameraService : Service() {
         if (!initializeEncoder(config) || !beginEncoding()) {
             Timber.e("Encoder restart failed; stopping outputs")
             stopStreaming()
+            // stopStreaming() found the encoder already marked stopped, so
+            // detach and release whatever is left of it here
+            releaseEncoderAfterDetach(encoderSurface)
             return false
         }
 
@@ -975,16 +978,23 @@ class CameraService : Service() {
 
         isStreamingActive = false
         updateNotification()
+        releaseEncoderAfterDetach(encoderSurface)
+    }
 
-        // Detach the encoder surface from the camera first so it never renders
-        // into a dead surface, then drop the encoder: a stopped MediaCodec
-        // cannot be restarted, so the next start builds a fresh one. The lock
-        // keeps this from releasing an encoder that a start on another thread
-        // has just built but not yet started.
-        serviceScope.launch {
-            lensDaemonCameraManager.removeEncoderSurface()
+    /**
+     * Detach [surface] from the camera first so it never renders into a dead
+     * surface, then drop its encoder: a stopped MediaCodec cannot be
+     * restarted, so the next start builds a fresh one.
+     *
+     * Runs off the main thread (codec teardown and the service lock can both
+     * take a while) and only touches [surface]'s own encoder: if a start has
+     * built a new encoder in the meantime, that one is left alone.
+     */
+    private fun releaseEncoderAfterDetach(surface: Surface?) {
+        serviceScope.launch(Dispatchers.Default) {
+            lensDaemonCameraManager.removeEncoderSurface(surface)
             synchronized(this@CameraService) {
-                if (!isStreamingActive) {
+                if (!isStreamingActive && encoderSurface === surface) {
                     encoderService?.stopEncoding()
                     encoderService?.releaseEncoder()
                     encoderSurface = null
@@ -1287,10 +1297,7 @@ class CameraService : Service() {
             return false
         }
 
-        if (!recordingCoordinator.isInitialized()) {
-            val config = getEncoderConfig() ?: EncoderConfig.PRESET_1080P
-            recordingCoordinator.initialize(config)
-        }
+        prepareRecorder(recordingCoordinator.segmentDuration)
 
         val format = encoderService?.getOutputFormat()
         if (format != null) {
@@ -1323,10 +1330,7 @@ class CameraService : Service() {
             return false
         }
 
-        if (!recordingCoordinator.isInitialized()) {
-            recordingCoordinator.initialize(config, segmentDuration)
-        }
-
+        prepareRecorder(segmentDuration)
         val started = startRecording()
         if (!started) stopEncoderIfUnused(Output.RECORDING)
         return started
@@ -1342,6 +1346,28 @@ class CameraService : Service() {
         val segments = recordingCoordinator.stopRecording()
         stopEncoderIfUnused(Output.RECORDING)
         return segments
+    }
+
+    /**
+     * Set the recorder up for the running encoder. The file writer takes its
+     * MIME type, NAL parser and track size from these settings, so a recorder
+     * built for other ones (an earlier stream, or settings that a shared
+     * encoder did not adopt) would never find a keyframe it can parse.
+     */
+    private fun prepareRecorder(segmentDuration: SegmentDuration) {
+        val running = getEncoderConfig() ?: return
+        val prepared = recordingCoordinator.getEncoderConfig()
+        if (prepared != null && prepared.codec == running.codec && prepared.resolution == running.resolution) {
+            if (segmentDuration != recordingCoordinator.segmentDuration) {
+                recordingCoordinator.setSegmentDuration(segmentDuration)
+            }
+            return
+        }
+        if (prepared != null) {
+            Timber.i("Re-initializing the recorder for ${running.width}x${running.height} ${running.codec}")
+            recordingCoordinator.release()
+        }
+        recordingCoordinator.initialize(running, segmentDuration)
     }
 
     fun pauseRecording(): Boolean = recordingCoordinator.pauseRecording()
@@ -1383,10 +1409,7 @@ class CameraService : Service() {
         if (!startRtspStreaming(config, rtspPort)) {
             return false
         }
-
-        if (!recordingCoordinator.isInitialized()) {
-            recordingCoordinator.initialize(config, segmentDuration)
-        }
+        recordingCoordinator.setSegmentDuration(segmentDuration)
 
         serviceScope.launch {
             delay(500)

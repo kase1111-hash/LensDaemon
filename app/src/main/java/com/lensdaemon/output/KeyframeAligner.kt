@@ -84,16 +84,30 @@ class KeyframeAligner(private val isHevc: Boolean) {
         val parts = listOfNotNull(if (isHevc) vps else null, sps, pps)
         if (parts.isEmpty()) return keyframe
 
+        // An access unit delimiter must stay the first NAL unit of the access unit
+        val insertAt = leadingAudLength(keyframe)
         val out = ByteArray(parts.sumOf { START_CODE.size + it.size } + keyframe.size)
-        var offset = 0
+        keyframe.copyInto(out, 0, 0, insertAt)
+        var offset = insertAt
         for (part in parts) {
             START_CODE.copyInto(out, offset)
             offset += START_CODE.size
             part.copyInto(out, offset)
             offset += part.size
         }
-        keyframe.copyInto(out, offset)
+        keyframe.copyInto(out, offset, insertAt)
         return out
+    }
+
+    /** Length of the access unit delimiter [accessUnit] opens with, or 0 if it has none. */
+    private fun leadingAudLength(accessUnit: ByteArray): Int {
+        val startCode = NalUnitParser.findStartCode(accessUnit, 0)
+        if (startCode == 0 || accessUnit.size <= startCode) return 0
+        val header = accessUnit[startCode].toInt()
+        val isAud = if (isHevc) ((header and 0x7E) shr 1) == H265NalType.AUD else (header and 0x1F) == H264NalType.AUD
+        if (!isAud) return 0
+        val next = NalUnitParser.findNextStartCode(accessUnit, startCode + 1)
+        return if (next < 0) accessUnit.size else next
     }
 
     /**

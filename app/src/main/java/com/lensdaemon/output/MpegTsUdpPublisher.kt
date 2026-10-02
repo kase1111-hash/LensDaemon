@@ -117,6 +117,10 @@ class MpegTsUdpPublisher(val config: MpegTsUdpConfig = MpegTsUdpConfig()) {
 
     private var continuityCounters = IntArray(8192)
     private var lastPatPmtTime = 0L
+
+    /** PMT version_number; bumped when the codec changes so receivers re-read the stream type. */
+    @Volatile
+    private var pmtVersion = 0
     private var startTimeMs = 0L
 
     /**
@@ -137,6 +141,8 @@ class MpegTsUdpPublisher(val config: MpegTsUdpConfig = MpegTsUdpConfig()) {
             if (codec != this.codec) {
                 this.codec = codec
                 aligner = KeyframeAligner(isHevc = codec == VideoCodec.H265)
+                pmtVersion = (pmtVersion + 1) and 0x1F
+                lastPatPmtTime = 0L // announce the new PMT with the next frame
             }
             aligner.setParameterSets(vps, sps, pps)
         }
@@ -337,7 +343,7 @@ class MpegTsUdpPublisher(val config: MpegTsUdpConfig = MpegTsUdpConfig()) {
         pkt[t] = 0x02                                                    // table_id (PMT)
         pkt[t + 1] = 0xB0.toByte(); pkt[t + 2] = 0x12                   // section_syntax + length=18
         pkt[t + 3] = 0x00; pkt[t + 4] = 0x01                            // program_number=1
-        pkt[t + 5] = 0xC1.toByte()                                      // version=0, current_next=1
+        pkt[t + 5] = (0xC1 or (pmtVersion shl 1)).toByte()              // version, current_next=1
         pkt[t + 6] = 0x00; pkt[t + 7] = 0x00                            // section/last section
         pkt[t + 8] = (0xE0 or ((VIDEO_PID shr 8) and 0x1F)).toByte()    // PCR PID high
         pkt[t + 9] = (VIDEO_PID and 0xFF).toByte()                      // PCR PID low

@@ -65,6 +65,14 @@ class RtspCoordinator {
         rtspServer?.setCodecConfig(codec, sps, pps, vps)
     }
 
+    /**
+     * Disconnect every viewer. Their SDP no longer matches the stream after a
+     * codec change; players such as OBS reconnect and DESCRIBE it afresh.
+     */
+    fun disconnectViewers() {
+        rtspServer?.disconnectAllSessions()
+    }
+
     /** Advertise [config]'s frame rate and bitrate to clients that DESCRIBE from now on. */
     fun setStreamConfig(config: EncoderConfig) {
         rtspServer?.setStreamConfig(config)

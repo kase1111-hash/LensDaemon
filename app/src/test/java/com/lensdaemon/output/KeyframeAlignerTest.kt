@@ -89,6 +89,19 @@ class KeyframeAlignerTest {
     }
 
     @Test
+    fun `parameter sets go after an access unit delimiter the encoder wrote`() {
+        val aligner = KeyframeAligner(isHevc = false)
+        aligner.setParameterSets(null, SPS, PPS)
+        val aud = START_CODE + byteArrayOf(0x09, 0xF0.toByte())
+
+        assertArrayEquals(
+            "the AUD must stay the first NAL unit",
+            aud + START_CODE + SPS + START_CODE + PPS + IDR,
+            aligner.process(frame(aud + IDR, FLAG_KEY_FRAME))
+        )
+    }
+
+    @Test
     fun `H265 keyframes get VPS, SPS and PPS`() {
         val aligner = KeyframeAligner(isHevc = true)
         aligner.process(frame(START_CODE + VPS_H265 + START_CODE + SPS_H265 + START_CODE + PPS_H265, FLAG_CODEC_CONFIG))

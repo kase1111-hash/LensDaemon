@@ -31,6 +31,13 @@ class RecordingCoordinator(
 ) {
     private var storageManager: StorageManager? = null
 
+    /** The encoder settings the file writer was built for (codec, size). */
+    private var encoderConfig: EncoderConfig? = null
+
+    /** The segment length in use, kept across a re-initialization. */
+    var segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
+        private set
+
     private val _recordingState = MutableStateFlow(RecordingState.IDLE)
     val recordingState: StateFlow<RecordingState> = _recordingState.asStateFlow()
 
@@ -58,6 +65,8 @@ class RecordingCoordinator(
             return true
         }
 
+        this.encoderConfig = encoderConfig
+        this.segmentDuration = segmentDuration
         storageManager = StorageManagerBuilder(context)
             .encoderConfig(encoderConfig)
             .segmentDuration(segmentDuration)
@@ -153,6 +162,7 @@ class RecordingCoordinator(
         storageManager?.getRecordingsDirectory()?.absolutePath ?: ""
 
     fun setSegmentDuration(duration: SegmentDuration) {
+        segmentDuration = duration
         storageManager?.updateSegmentDuration(duration)
     }
 
@@ -164,11 +174,13 @@ class RecordingCoordinator(
 
     fun isInitialized(): Boolean = storageManager != null
 
-    fun getEncoderConfig(): EncoderConfig? = null // Config comes from encoder, not storage
+    /** The encoder settings the recorder was initialized for, or null before [initialize]. */
+    fun getEncoderConfig(): EncoderConfig? = encoderConfig
 
     fun release() {
         storageManager?.release()
         storageManager = null
+        encoderConfig = null
         _recordingState.value = RecordingState.IDLE
     }
 }

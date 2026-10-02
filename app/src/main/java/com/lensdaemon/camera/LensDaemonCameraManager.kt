@@ -507,9 +507,14 @@ class LensDaemonCameraManager(private val context: Context) {
         return createSession(device, activeSurfaces())
     }
 
-    /** All surfaces the session must target right now. */
+    /**
+     * All surfaces the session must target right now. A surface can die before
+     * the change that removes it is applied (the activity's view is destroyed
+     * mid-rebuild, an encoder is replaced twice in quick succession); a session
+     * built with a dead surface fails outright, so those are left out.
+     */
     private fun activeSurfaces(): List<Surface> =
-        listOfNotNull(previewSurface, imageReader?.surface, encoderSurface)
+        listOfNotNull(previewSurface, imageReader?.surface, encoderSurface).filter { it.isValid }
 
     /**
      * Show the camera on [surface], or stop drawing to the screen when it is
@@ -546,6 +551,16 @@ class LensDaemonCameraManager(private val context: Context) {
                 }
             } catch (e: CameraAccessException) {
                 Timber.e(e, "Failed to create capture session")
+                _cameraState.value = CameraState.ERROR
+                continuation.resumeWithException(e)
+            } catch (e: IllegalArgumentException) {
+                // A target surface was released or abandoned
+                Timber.e(e, "Capture session rejected its surfaces")
+                _cameraState.value = CameraState.ERROR
+                continuation.resumeWithException(e)
+            } catch (e: IllegalStateException) {
+                // The camera device was closed underneath us
+                Timber.e(e, "Camera closed while creating the capture session")
                 _cameraState.value = CameraState.ERROR
                 continuation.resumeWithException(e)
             }
@@ -684,6 +699,11 @@ class LensDaemonCameraManager(private val context: Context) {
      * @param config capture settings to apply with it, e.g. the encoder's frame rate
      */
     suspend fun addEncoderSurface(surface: Surface, config: CaptureConfig? = null): Boolean = sessionMutex.withLock {
+        if (!surface.isValid) {
+            // Its encoder was replaced before this attach got to run
+            Timber.w("Not attaching an encoder surface that has already been released")
+            return@withLock false
+        }
         config?.let { currentConfig = it }
         if (encoderSurface === surface) {
             if (config != null) applyRepeatingRequest()
@@ -696,40 +716,34 @@ class LensDaemonCameraManager(private val context: Context) {
     /**
      * Detach the encoder surface. Call this before releasing the encoder so
      * the camera never renders into a dead surface.
+     *
+     * @param expected detach only if this is still the attached surface, so a
+     *   late detach for an old encoder never removes its replacement's surface
      */
-    suspend fun removeEncoderSurface(): Boolean = sessionMutex.withLock {
+    suspend fun removeEncoderSurface(expected: Surface? = null): Boolean = sessionMutex.withLock {
         if (encoderSurface == null) return@withLock true
+        if (expected != null && encoderSurface !== expected) return@withLock true
         encoderSurface = null
         reconfigureSessionIfActive("encoder surface detached")
     }
 
     /**
      * Rebuild the capture session with the current surface set.
-     * Returns true when no session was active or the rebuild succeeded.
+     *
+     * Also builds one when capture was started but the last build failed (no
+     * session left): otherwise every later surface change would be skipped and
+     * the camera would stay dark for good. Returns true when the camera is not
+     * open, capture has not been started yet (the next [startPreview] builds
+     * the session), or the rebuild succeeded.
      */
     private suspend fun reconfigureSessionIfActive(reason: String): Boolean {
         val device = cameraDevice ?: return true
-        val session = captureSession ?: return true
+        val session = captureSession
+        if (session == null && imageReader == null) return true
 
         Timber.i("Reconfiguring capture session: $reason")
         _cameraState.value = CameraState.CONFIGURING
-        val closed = CompletableDeferred<Unit>()
-        closingSession = session to closed
-        try {
-            session.stopRepeating()
-            session.close()
-        } catch (e: Exception) {
-            Timber.w(e, "Error closing capture session before reconfigure")
-        }
-        captureSession = null
-
-        // Some camera HALs (the emulator's among them) refuse a new stream
-        // configuration while the previous session still holds its buffers,
-        // so wait for it to report closed before configuring the next one.
-        if (withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { closed.await() } == null) {
-            Timber.w("Previous capture session did not report closed within $SESSION_CLOSE_TIMEOUT_MS ms")
-        }
-        closingSession = null
+        if (session != null) closeSessionAndWait(session)
 
         repeat(SESSION_CREATE_ATTEMPTS) { attempt ->
             try {
@@ -742,6 +756,28 @@ class LensDaemonCameraManager(private val context: Context) {
         Timber.e("Failed to reconfigure capture session")
         _cameraState.value = CameraState.ERROR
         return false
+    }
+
+    private suspend fun closeSessionAndWait(session: CameraCaptureSession) {
+        val closed = CompletableDeferred<Unit>()
+        closingSession = session to closed
+        try {
+            session.stopRepeating()
+            session.close()
+        } catch (e: CameraAccessException) {
+            Timber.w(e, "Error closing capture session before reconfigure")
+        } catch (e: IllegalStateException) {
+            Timber.w(e, "Capture session already closed before reconfigure")
+        }
+        captureSession = null
+
+        // Some camera HALs (the emulator's among them) refuse a new stream
+        // configuration while the previous session still holds its buffers,
+        // so wait for it to report closed before configuring the next one.
+        if (withTimeoutOrNull(SESSION_CLOSE_TIMEOUT_MS) { closed.await() } == null) {
+            Timber.w("Previous capture session did not report closed within $SESSION_CLOSE_TIMEOUT_MS ms")
+        }
+        closingSession = null
     }
 
     /**

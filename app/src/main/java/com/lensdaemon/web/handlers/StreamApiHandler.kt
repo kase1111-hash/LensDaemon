@@ -11,6 +11,9 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
+import timber.log.Timber
+import java.net.InetAddress
+import java.net.UnknownHostException
 
 /**
  * API handler for stream, RTSP, recording, and storage endpoints.
@@ -203,11 +206,21 @@ class StreamApiHandler {
                 "Caller mode needs targetHost: the address of the machine receiving the stream (e.g. the PC running OBS)"
             )
         }
+        // Resolve here, on the request thread, rather than inside the camera
+        // service's start (which holds a lock other threads wait on)
+        val resolvedHost = if (mode == MpegTsMode.CALLER) {
+            resolveHost(targetHost) ?: return ApiHandlerUtils.errorJson(
+                Status.BAD_REQUEST,
+                "Cannot resolve targetHost"
+            )
+        } else {
+            targetHost
+        }
 
         val mpegtsConfig = MpegTsUdpConfig(
             port = port,
             mode = mode,
-            targetHost = targetHost,
+            targetHost = resolvedHost,
             targetPort = targetPort,
             latencyMs = latencyMs
         )
@@ -483,6 +496,13 @@ class StreamApiHandler {
             bitrateBps = body?.optInt("bitrate", DEFAULT_BITRATE) ?: DEFAULT_BITRATE,
             frameRate = body?.optInt("frameRate", DEFAULT_FRAME_RATE) ?: DEFAULT_FRAME_RATE
         )
+    }
+
+    private fun resolveHost(host: String): String? = try {
+        InetAddress.getByName(host).hostAddress
+    } catch (e: UnknownHostException) {
+        Timber.w(e, "Cannot resolve MPEG-TS target $host")
+        null
     }
 
     private fun encoderConfigJson(config: EncoderConfig): JSONObject = JSONObject().apply {
