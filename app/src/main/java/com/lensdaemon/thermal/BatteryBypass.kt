@@ -469,8 +469,9 @@ class BatteryBypass(
     }
 
     /**
-     * Current status, with the battery readings and the recommendation worked out now
-     * (the stored status changes only with the bypass state)
+     * Current status, with the battery readings, the charging control and the
+     * recommendation worked out now (the stored status changes only with the bypass
+     * state, and is a placeholder until the bypass first starts)
      */
     @Synchronized
     fun getStatus(): BatteryBypassStatus = _status.value.copy(
@@ -481,6 +482,8 @@ class BatteryBypass(
         resumePercent = config.resumeChargePercent,
         isCharging = isCharging,
         chargingBlocked = !_chargingEnabled.value,
+        hasHardwareControl = hasHardwareControl,
+        softwareOnly = !hasHardwareControl,
         recommendation = generateRecommendation()
     )
 
