@@ -155,17 +155,31 @@ class RetentionPolicy(
 ) {
     companion object {
         private const val TAG = "RetentionPolicy"
+
+        /**
+         * Held while a policy is enforced. Every policy in the app works on the
+         * one recordings folder (the recorder's scheduled and low-space runs, a
+         * recording start, POST /api/storage/cleanup), so runs take turns
+         * instead of choosing and deleting the same files at once.
+         */
+        private val enforceLock = Any()
     }
 
     /**
-     * Enforce the retention policy on a directory
+     * Enforce the retention policy on a directory. Runs one at a time across
+     * all policies. A file that is already gone when its turn to be deleted
+     * comes (deleted by someone else meanwhile) is neither counted as deleted
+     * nor reported as failed.
      *
      * @param directory The directory to enforce policy on
      * @param exclude Paths of files to leave alone and leave out of the size and
      *   free-space sums, such as the segment being recorded; compared by canonical path
      * @return Result of the enforcement
      */
-    fun enforce(directory: File, exclude: Set<String> = emptySet()): RetentionResult {
+    fun enforce(directory: File, exclude: Set<String> = emptySet()): RetentionResult =
+        synchronized(enforceLock) { enforceNow(directory, exclude) }
+
+    private fun enforceNow(directory: File, exclude: Set<String>): RetentionResult {
         val startTime = System.currentTimeMillis()
 
         if (!directory.exists() || !directory.isDirectory) {
@@ -226,9 +240,11 @@ class RetentionPolicy(
                     filesDeleted++
                     bytesFreed += size
                     Timber.tag(TAG).d("Deleted: ${fileInfo.name} (${size / 1024}KB)")
-                } else {
+                } else if (fileInfo.exists()) {
                     failedFiles.add(fileInfo.absolutePath)
                     Timber.tag(TAG).w("Failed to delete: ${fileInfo.absolutePath}")
+                } else {
+                    Timber.tag(TAG).d("Already gone: ${fileInfo.name}")
                 }
             } catch (e: Exception) {
                 failedFiles.add(fileInfo.absolutePath)

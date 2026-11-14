@@ -46,6 +46,9 @@ class StreamApiHandler {
     /** Held while POST /api/recording/start checks for an open recording and starts one. */
     private val recordingStartLock = Any()
 
+    /** Held while POST /api/storage/cleanup runs a clean-up and reads back its result. */
+    private val cleanupLock = Any()
+
     /**
      * Handle request if URI matches. Returns null for unhandled URIs.
      */
@@ -552,10 +555,14 @@ class StreamApiHandler {
         }
     }
 
-    /** 409 when [recording] is the file being recorded (running or paused), else null. */
+    /**
+     * 409 when [recording] is the file the recorder holds open, else null. The
+     * open file decides, not the recording state: a recorder that reported an
+     * error (a segment whose muxer would not start, say) keeps its file open,
+     * and a later keyframe can still start writing to it.
+     */
     private fun liveFileConflict(camera: CameraService, recording: RecordingFile): NanoHTTPD.Response? {
-        val open = camera.isRecording() || camera.isRecordingPaused()
-        if (!open || !RecordingRequests.isSameFile(recording.path, camera.getRecordingStats().currentFilePath)) return null
+        if (!RecordingRequests.isSameFile(recording.path, camera.getRecordingStats().currentFilePath)) return null
         val json = JSONObject()
             .put("success", false)
             .put("error", "This file is being recorded: stop the recording or wait for the next file")
@@ -593,14 +600,21 @@ class StreamApiHandler {
     /**
      * POST /api/storage/cleanup: apply the retention policy (7 days, 10 GB,
      * keep 1 GB free; never the file being recorded) and answer once it has
-     * finished, with what it removed.
+     * finished, with what this clean-up removed.
      */
     private fun enforceRetention(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        // Runs the clean-up here, on the request thread
-        camera.enforceRetention()
-        val result = camera.getStorageStatus().lastRetentionResult
+        // Runs the clean-up here, on the request thread. The last result in the
+        // storage status is stored only by clean-ups run through
+        // CameraService.enforceRetention(), which nothing but this endpoint
+        // calls, so with them taking turns on this lock the result read back
+        // is this request's own, not that of one running at the same time
+        // (runs the recorder starts itself take turns with it in RetentionPolicy)
+        val result = synchronized(cleanupLock) {
+            camera.enforceRetention()
+            camera.getStorageStatus().lastRetentionResult
+        }
 
         val json = JSONObject().apply {
             put("success", true)

@@ -7,6 +7,7 @@ import android.media.MediaFormat
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
+import android.os.SystemClock
 import android.util.Size
 import android.view.Surface
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -158,7 +159,16 @@ class VideoEncoder(
     private val framesEncoded = AtomicLong(0)
     private val framesDropped = AtomicLong(0)
     private val totalBytes = AtomicLong(0)
+
+    /** Wall-clock start, reported as [EncoderStats.startTimeMs]; never used to measure intervals. */
     private var encodingStartTime = 0L
+
+    /**
+     * When encoding started, on the monotonic clock (SystemClock.elapsedRealtime)
+     * like every time below, so that setting the phone's clock (NTP, the
+     * network's time) neither freezes nor inflates the measurements.
+     */
+    private var encodingStartedAtMs = 0L
     private var lastStatsUpdate = 0L
 
     /** Arrival time (ms) and size (bytes) of each frame in the last [STATS_WINDOW_MS]; encoder thread only. */
@@ -315,7 +325,8 @@ class VideoEncoder(
             framesDropped.set(0)
             totalBytes.set(0)
             encodingStartTime = System.currentTimeMillis()
-            lastStatsUpdate = encodingStartTime
+            encodingStartedAtMs = SystemClock.elapsedRealtime()
+            lastStatsUpdate = encodingStartedAtMs
             recentFrames.clear()
             lastFrameAtMs = 0L
 
@@ -581,7 +592,7 @@ class VideoEncoder(
 
         val frameEndTime = System.nanoTime()
         val encodingTimeMs = (frameEndTime - frameStartTime) / 1_000_000f
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         recentFrames.addLast(longArrayOf(now, info.size.toLong()))
         lastFrameAtMs = now
 
@@ -609,11 +620,11 @@ class VideoEncoder(
      * change shows within seconds rather than being averaged over the session.
      */
     private fun updateStats(lastEncodingTimeMs: Float) {
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         while (recentFrames.isNotEmpty() && recentFrames.first()[0] < now - STATS_WINDOW_MS) {
             recentFrames.removeFirst()
         }
-        val windowMs = (now - encodingStartTime).coerceIn(1L, STATS_WINDOW_MS)
+        val windowMs = (now - encodingStartedAtMs).coerceIn(1L, STATS_WINDOW_MS)
         val windowBytes = recentFrames.sumOf { it[1] }
 
         _stats.value = EncoderStats(
@@ -634,7 +645,8 @@ class VideoEncoder(
      */
     fun currentStats(): EncoderStats {
         val stats = _stats.value
-        val stalled = System.currentTimeMillis() - lastFrameAtMs > STATS_WINDOW_MS
+        val lastFrame = lastFrameAtMs
+        val stalled = lastFrame == 0L || SystemClock.elapsedRealtime() - lastFrame > STATS_WINDOW_MS
         return if (stalled) stats.copy(currentFps = 0f, currentBitrateBps = 0L) else stats
     }
 }

@@ -9,6 +9,7 @@ import android.content.Context
 import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
+import android.net.NetworkCapabilities
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
@@ -57,7 +58,8 @@ data class UploadServiceStats(
  * - Upload queue with persistence; queued uploads resume when the service starts
  * - Automatic retry: 3 attempts, 2 s and 4 s apart, then kept as failed
  * - Progress notifications
- * - Failed uploads retried when the network comes back (kiosk networkRecovery.autoReconnect)
+ * - Failed uploads retried when the network, or its internet access, comes back
+ *   (kiosk networkRecovery.autoReconnect)
  * - One upload at a time
  */
 class UploadService : Service(), UploadEventListener {
@@ -148,30 +150,35 @@ class UploadService : Service(), UploadEventListener {
     @Volatile
     private var networkLost = false
 
+    /** Whether the default network last reported working internet access (validated). */
+    @Volatile
+    private var networkValidated = false
+
     /**
-     * Retries the failed uploads when the network comes back after a loss,
-     * while kiosk network recovery (networkRecovery.autoReconnect) is on.
-     * Uploads paused through [stopUploads] stay paused: their failed tasks
-     * are queued again for when they resume. Called on a system thread.
+     * Retries the failed uploads when the network comes back, while kiosk
+     * network recovery (networkRecovery.autoReconnect) is on: when a network
+     * is up again after a loss, which is enough for a share on the local
+     * network (that network may have no internet access at all), and again
+     * whenever the network gains working internet access. That often comes
+     * later: the router is back before its internet link, or internet access
+     * returns while the Wi-Fi stayed up. Called on a system thread.
      */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onLost(network: Network) {
             networkLost = true
+            networkValidated = false
         }
 
         override fun onAvailable(network: Network) {
             if (!networkLost) return
             networkLost = false
-            serviceScope.launch {
-                if ((application as LensDaemonApp).kioskManager.getConfig().networkRecovery.autoReconnect) {
-                    val retried = if (_state.value == UploadServiceState.PAUSED) {
-                        uploadQueue.retryFailed().also { updateStats() }
-                    } else {
-                        retryFailed()
-                    }
-                    Timber.tag(TAG).i("Network is back: retrying $retried failed uploads")
-                }
-            }
+            retryFailedOnReconnect("Network is back")
+        }
+
+        override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
+            val validated = capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+            if (validated && !networkValidated) retryFailedOnReconnect("Internet access is back")
+            networkValidated = validated
         }
     }
 
@@ -251,14 +258,39 @@ class UploadService : Service(), UploadEventListener {
         serviceScope.cancel()
     }
 
-    /** Watch the default network, so failed uploads are retried when it comes back. */
+    /**
+     * Watch the default network, so failed uploads are retried when it comes
+     * back. Starts from the network's state now, so the report of the current
+     * network that follows registration retries nothing.
+     */
     private fun watchNetwork() {
         try {
             val connectivity = getSystemService(ConnectivityManager::class.java)
-            networkLost = connectivity.activeNetwork == null
+            val active = connectivity.activeNetwork
+            networkLost = active == null
+            networkValidated = active?.let { connectivity.getNetworkCapabilities(it) }
+                ?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
             connectivity.registerDefaultNetworkCallback(networkCallback)
         } catch (e: SecurityException) {
             Timber.tag(TAG).w(e, "Cannot watch the network: failed uploads are not retried when it returns")
+        }
+    }
+
+    /**
+     * Queue the failed uploads again because the network came back ([reason]),
+     * if kiosk network recovery is on. Uploads paused through [stopUploads]
+     * stay paused: their failed tasks wait in the queue for the resume.
+     */
+    private fun retryFailedOnReconnect(reason: String) {
+        serviceScope.launch {
+            if ((application as LensDaemonApp).kioskManager.getConfig().networkRecovery.autoReconnect) {
+                val retried = if (_state.value == UploadServiceState.PAUSED) {
+                    uploadQueue.retryFailed().also { updateStats() }
+                } else {
+                    retryFailed()
+                }
+                if (retried > 0) Timber.tag(TAG).i("$reason: retrying $retried failed uploads")
+            }
         }
     }
 

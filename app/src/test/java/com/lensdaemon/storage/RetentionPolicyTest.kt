@@ -7,6 +7,7 @@ import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
 import java.io.File
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 
 class RetentionPolicyTest {
@@ -268,6 +269,26 @@ class RetentionPolicyTest {
         val toDelete = RetentionPolicy(config).preview(recordingsDir, setOf(recording.canonicalPath))
 
         assertEquals(listOf(old.absolutePath), toDelete.map { it.absolutePath })
+    }
+
+    // ==================== Clean-ups at the same time ====================
+
+    @Test
+    fun `clean-ups running at once delete each file once and report no failures`() {
+        val tenDaysAgo = System.currentTimeMillis() - TimeUnit.DAYS.toMillis(10)
+        val files = (1..200).map { i -> createTestFile("old$i.mp4", 10).also { it.setLastModified(tenDaysAgo) } }
+        val config = RetentionConfig(type = RetentionType.MAX_AGE, maxAgeMs = TimeUnit.DAYS.toMillis(1), minFreeSpaceBytes = 0L)
+
+        // Separate policies, as the recorder's own runs and the API's are
+        val results = Collections.synchronizedList(mutableListOf<RetentionResult>())
+        val threads = (1..4).map { Thread { results.add(RetentionPolicy(config).enforce(recordingsDir)) } }
+        threads.forEach { it.start() }
+        threads.forEach { it.join() }
+
+        assertEquals(4, results.size)
+        assertEquals(200, results.sumOf { it.filesDeleted })
+        assertTrue("no run reports a file another run deleted as failed", results.all { it.failedFiles.isEmpty() })
+        assertTrue(files.none { it.exists() })
     }
 
     // ==================== MAX_AGE_AND_SIZE Policy Tests ====================
