@@ -37,8 +37,6 @@ class ApiRoutes(
     private val context: Context
 ) {
     companion object {
-        private const val TAG = "ApiRoutes"
-
         // Default preview resolution for tap-to-focus coordinate mapping
         private const val DEFAULT_PREVIEW_WIDTH = 1920
         private const val DEFAULT_PREVIEW_HEIGHT = 1080
