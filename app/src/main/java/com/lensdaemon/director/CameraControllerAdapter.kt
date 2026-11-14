@@ -1,7 +1,6 @@
 package com.lensdaemon.director
 
 import com.lensdaemon.camera.CameraService
-import com.lensdaemon.camera.LensType
 import timber.log.Timber
 
 /**
@@ -100,15 +99,19 @@ class CameraControllerAdapter(
     }
 
     fun getCameraCapabilities(): ShotMapper.CameraCapabilities {
-        val lenses = cameraService.getAvailableLenses()
+        // The director's "wide" and "telephoto" are the lens families the phone
+        // and dashboard buttons use: an ultra-wide or a 5x periscope counts
+        val wide = cameraService.findLens("wide")
+        val main = cameraService.findLens("main")
+        val tele = cameraService.findLens("tele")
 
         return ShotMapper.CameraCapabilities(
-            hasWide = lenses.any { it.lensType == LensType.WIDE },
-            hasMain = lenses.any { it.lensType == LensType.MAIN },
-            hasTelephoto = lenses.any { it.lensType == LensType.TELEPHOTO },
-            wideFocalLength = lenses.find { it.lensType == LensType.WIDE }?.focalLength ?: 16f,
-            mainFocalLength = lenses.find { it.lensType == LensType.MAIN }?.focalLength ?: 24f,
-            telephotoFocalLength = lenses.find { it.lensType == LensType.TELEPHOTO }?.focalLength ?: 70f,
+            hasWide = wide != null,
+            hasMain = main != null,
+            hasTelephoto = tele != null,
+            wideFocalLength = wide?.focalLength ?: 16f,
+            mainFocalLength = main?.focalLength ?: 24f,
+            telephotoFocalLength = tele?.focalLength ?: 70f,
             maxDigitalZoom = cameraService.getMaxZoom(),
             supportsSmoothZoom = true,
             supportsFaceDetection = cameraService.supportsFaceDetection(),

@@ -12,6 +12,9 @@ import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileNotFoundException
 import java.net.InetAddress
 import java.net.UnknownHostException
 
@@ -34,6 +37,7 @@ class StreamApiHandler {
         const val DEFAULT_HEIGHT = 1080
         const val DEFAULT_BITRATE = 4_000_000
         const val DEFAULT_FRAME_RATE = 30
+        const val MIME_MP4 = "video/mp4"
     }
 
     var cameraService: CameraService? = null
@@ -72,6 +76,7 @@ class StreamApiHandler {
             // Recordings management
             uri == "/api/recordings" && method == NanoHTTPD.Method.GET -> listRecordings()
             uri.startsWith("/api/recordings/") && method == NanoHTTPD.Method.DELETE -> deleteRecording(uri)
+            uri.startsWith("/api/recordings/") && method == NanoHTTPD.Method.GET -> downloadRecording(uri)
 
             // Storage
             uri == "/api/storage/status" && method == NanoHTTPD.Method.GET -> getStorageStatus()
@@ -471,6 +476,27 @@ class StreamApiHandler {
             WebServer.MIME_JSON,
             json.toString()
         )
+    }
+
+    /** Download a recording as an MP4 file: GET /api/recordings/{name}. */
+    private fun downloadRecording(uri: String): NanoHTTPD.Response {
+        val camera = cameraService ?: return cameraUnavailable()
+
+        val filename = ApiHandlerUtils.sanitizeFileName(uri.substringAfterLast("/"))
+            ?: return ApiHandlerUtils.errorJson(Status.BAD_REQUEST, "Invalid filename")
+        // Only files the recordings list knows, so nothing outside the recordings folder
+        val recording = camera.listRecordings().find { it.name == filename }
+            ?: return ApiHandlerUtils.errorJson(Status.NOT_FOUND, "Recording not found")
+        val file = File(recording.path)
+
+        return try {
+            NanoHTTPD.newFixedLengthResponse(Status.OK, MIME_MP4, FileInputStream(file), file.length()).apply {
+                addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
+            }
+        } catch (e: FileNotFoundException) {
+            Timber.w(e, "Recording $filename is gone")
+            ApiHandlerUtils.errorJson(Status.NOT_FOUND, "Recording not found")
+        }
     }
 
     // ==================== Storage ====================

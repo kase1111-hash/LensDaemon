@@ -79,6 +79,25 @@
 
     </LinearLayout>
 
+    <!-- Where to open the web dashboard -->
+    <TextView
+        android:id="@+id/tvDashboardUrl"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginStart="16dp"
+        android:layout_marginTop="4dp"
+        android:paddingStart="12dp"
+        android:paddingEnd="12dp"
+        android:paddingTop="6dp"
+        android:paddingBottom="6dp"
+        android:background="@color/overlay_dark"
+        android:textColor="@color/white"
+        android:textSize="13sp"
+        android:textIsSelectable="true"
+        app:layout_constraintTop_toBottomOf="@id/overlayStatus"
+        app:layout_constraintStart_toStartOf="parent"
+        tools:text="Dashboard: http://192.168.1.50:8080" />
+
     <!-- Stream Info Overlay -->
     <LinearLayout
         android:id="@+id/overlayStreamInfo"

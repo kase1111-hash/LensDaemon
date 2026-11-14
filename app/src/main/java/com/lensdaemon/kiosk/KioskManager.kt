@@ -1,7 +1,9 @@
 package com.lensdaemon.kiosk
 
 import android.app.Activity
+import android.app.ActivityManager
 import android.app.admin.DevicePolicyManager
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -12,6 +14,7 @@ import android.view.WindowInsets
 import android.view.WindowInsetsController
 import android.view.WindowManager
 import com.lensdaemon.AdminReceiver
+import com.lensdaemon.MainActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -101,13 +104,32 @@ class KioskManager(
     }
 
     /**
-     * Check if Lock Task Mode is active
+     * Check if Lock Task Mode is active: LensDaemon is pinned to the screen
      */
     fun isLockTaskActive(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            devicePolicyManager.isLockTaskPermitted(context.packageName)
-        } else {
-            false
+        val activityManager = context.getSystemService(ActivityManager::class.java) ?: return false
+        return activityManager.lockTaskModeState != ActivityManager.LOCK_TASK_MODE_NONE
+    }
+
+    /**
+     * Turn kiosk mode on or off from outside the activity (the web API). The
+     * setting is saved, and also decides whether LensDaemon starts on boot; the
+     * activity on screen applies it, pinning or unpinning itself. Turning it on
+     * brings LensDaemon to the front when it is the device owner, which can
+     * start activities from the background.
+     */
+    fun requestKioskMode(enabled: Boolean) {
+        updateConfig(_config.value.copy(enabled = enabled))
+        logEvent(
+            if (enabled) KioskEventType.KIOSK_ENABLED else KioskEventType.KIOSK_DISABLED,
+            "Kiosk mode turned ${if (enabled) "on" else "off"} remotely"
+        )
+        if (enabled && isDeviceOwner()) {
+            try {
+                context.startActivity(Intent(context, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+            } catch (e: ActivityNotFoundException) {
+                Timber.tag(TAG).w(e, "Could not bring LensDaemon to the front")
+            }
         }
     }
 
@@ -375,6 +397,7 @@ class KioskManager(
     fun updateConfig(newConfig: KioskConfig) {
         _config.value = newConfig
         configStore.saveConfig(newConfig)
+        updateState()
         Timber.tag(TAG).d("Configuration updated")
     }
 
@@ -433,11 +456,14 @@ class KioskManager(
             message = message,
             details = details
         )
-        eventLog.add(event)
+        // The web API reads the log from its own threads
+        synchronized(eventLog) {
+            eventLog.add(event)
 
-        // Keep last 100 events
-        while (eventLog.size > 100) {
-            eventLog.removeAt(0)
+            // Keep last 100 events
+            while (eventLog.size > 100) {
+                eventLog.removeAt(0)
+            }
         }
 
         // Notify listeners
@@ -447,7 +473,7 @@ class KioskManager(
     /**
      * Get event log
      */
-    fun getEventLog(): List<KioskEvent> = eventLog.toList()
+    fun getEventLog(): List<KioskEvent> = synchronized(eventLog) { eventLog.toList() }
 
     /**
      * Record a restart (called by crash recovery)
@@ -505,18 +531,19 @@ class KioskManager(
     }
 
     /**
-     * Apply appliance preset
+     * Apply appliance preset. Kiosk mode stays on or off as it was: turning it
+     * on pins the screen, which is for [requestKioskMode] or [enableKiosk].
      */
     fun applyAppliancePreset() {
-        updateConfig(KioskConfig.APPLIANCE)
+        updateConfig(KioskConfig.APPLIANCE.copy(enabled = _config.value.enabled))
         Timber.tag(TAG).i("Applied APPLIANCE preset")
     }
 
     /**
-     * Apply interactive preset
+     * Apply interactive preset, leaving kiosk mode on or off as it was.
      */
     fun applyInteractivePreset() {
-        updateConfig(KioskConfig.INTERACTIVE)
+        updateConfig(KioskConfig.INTERACTIVE.copy(enabled = _config.value.enabled))
         Timber.tag(TAG).i("Applied INTERACTIVE preset")
     }
 
@@ -584,9 +611,12 @@ class KioskManager(
     }
 
     /**
-     * Get status for API
+     * Get status for API, as of now: lock task mode starts and stops with the activity
      */
-    fun getStatus(): KioskStatus = _kioskStatus.value
+    fun getStatus(): KioskStatus {
+        updateState()
+        return _kioskStatus.value
+    }
 
     /**
      * Release resources

@@ -14,6 +14,7 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Size
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -29,6 +30,8 @@ import com.lensdaemon.camera.CameraState
 import com.lensdaemon.camera.FocusState
 import com.lensdaemon.camera.LensType
 import com.lensdaemon.databinding.ActivityMainBinding
+import com.lensdaemon.kiosk.KioskActivityController
+import com.lensdaemon.thermal.ThermalService
 import com.lensdaemon.web.WebServerService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -51,6 +54,12 @@ class MainActivity : AppCompatActivity() {
     }
 
     private lateinit var binding: ActivityMainBinding
+
+    /** Dashboard address and temperatures over the preview. */
+    private lateinit var overlays: PhoneOverlays
+
+    /** Pins the app to the screen while kiosk mode is on; Vol Up + Vol Down held leaves it. */
+    private lateinit var kiosk: KioskActivityController
 
     /** Refreshes the stream overlay while the activity is visible. */
     private var streamStatusJob: Job? = null
@@ -124,6 +133,9 @@ class MainActivity : AppCompatActivity() {
         hideSystemUI()
         setupUI()
         setupGestureDetectors()
+        overlays = PhoneOverlays(this, binding)
+        kiosk = KioskActivityController(this, (application as LensDaemonApp).kioskManager)
+        kiosk.attach()
 
         if (hasAllPermissions()) {
             startCameraService()
@@ -135,6 +147,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         startStreamStatusUpdates()
+        overlays.start()
     }
 
     override fun onResume() {
@@ -145,11 +158,17 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         streamStatusJob?.cancel()
         streamStatusJob = null
+        overlays.stop()
         super.onStop()
     }
 
+    /** While kiosk mode pins the app, the volume keys are the way out (held together). */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        kiosk.onKeyEvent(event) || super.dispatchKeyEvent(event)
+
     override fun onDestroy() {
         super.onDestroy()
+        kiosk.release()
         focusHandler.removeCallbacks(hideFocusIndicatorRunnable)
         if (serviceBound) {
             unbindService(serviceConnection)
@@ -349,6 +368,10 @@ class MainActivity : AppCompatActivity() {
         // The dashboard and REST API run in their own foreground service; the
         // documented flow is "open the app, then browse to http://<ip>:8080".
         ContextCompat.startForegroundService(this, WebServerService.createStartIntent(this))
+
+        // Temperature monitoring and throttling run only once started: binding
+        // (as the web server does, for the API) creates the service but not the governor
+        ContextCompat.startForegroundService(this, ThermalService.createStartIntent(this))
     }
 
     private fun onCameraServiceConnected() {

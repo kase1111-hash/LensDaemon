@@ -318,6 +318,13 @@ class UploadService : Service(), UploadEventListener {
     }
 
     /**
+     * Test S3 settings without saving them, so they can be checked before they
+     * replace the saved ones.
+     */
+    suspend fun testS3Connection(credentials: S3Credentials): Result<Boolean> =
+        S3Client(credentials).testConnection()
+
+    /**
      * Configure SMB credentials
      */
     fun configureSmb(credentials: SmbCredentials) {
@@ -334,6 +341,20 @@ class UploadService : Service(), UploadEventListener {
     suspend fun testSmbConnection(): Result<Boolean> {
         val client = smbClient ?: return Result.failure(Exception("SMB not configured"))
         return client.testConnection()
+    }
+
+    /**
+     * Test SMB settings without saving them, so they can be checked before they
+     * replace the saved ones.
+     */
+    suspend fun testSmbConnection(credentials: SmbCredentials): Result<Boolean> {
+        val client = SmbClient(credentials)
+        return try {
+            client.testConnection()
+        } finally {
+            // A failed attempt can leave a connection half open
+            client.disconnect()
+        }
     }
 
     /**

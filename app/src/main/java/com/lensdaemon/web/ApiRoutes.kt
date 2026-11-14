@@ -2,13 +2,14 @@ package com.lensdaemon.web
 
 import android.content.Context
 import android.os.Build
+import com.lensdaemon.BuildConfig
 import com.lensdaemon.camera.CameraService
-import com.lensdaemon.camera.LensType
+import com.lensdaemon.camera.LensSelection
 import com.lensdaemon.director.DirectorManager
-import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.kiosk.KioskManager
 import com.lensdaemon.storage.UploadService
 import com.lensdaemon.thermal.ThermalGovernor
+import com.lensdaemon.web.handlers.ApiHandlerUtils
 import com.lensdaemon.web.handlers.DirectorApiHandler
 import com.lensdaemon.web.handlers.KioskApiHandler
 import com.lensdaemon.web.handlers.StreamApiHandler
@@ -18,7 +19,6 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
-import timber.log.Timber
 import java.io.ByteArrayInputStream
 
 /**
@@ -164,19 +164,21 @@ class ApiRoutes(
      * Handle API request - main dispatcher
      */
     fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
+        val uri = session.uri
+        val method = session.method
+
+        // Read the body of a POST or PUT before anything can answer early: NanoHTTPD
+        // does not skip an unread body, which would be taken for the next request
+        // on a kept-alive connection
+        val body = if (method == NanoHTTPD.Method.POST || method == NanoHTTPD.Method.PUT) {
+            RequestBody.readJson(session)
+        } else null
+
         // Check authentication first
         checkAuth(session)?.let { return it }
 
         // Check rate limit
         checkRateLimit(session)?.let { return it }
-
-        val uri = session.uri
-        val method = session.method
-
-        // Parse request body for POST/PUT
-        val body = if (method == NanoHTTPD.Method.POST || method == NanoHTTPD.Method.PUT) {
-            parseBody(session)
-        } else null
 
         // Delegate to per-module handlers by URI prefix
         when {
@@ -226,26 +228,10 @@ class ApiRoutes(
             uri == "/api/encoder/capabilities" && method == NanoHTTPD.Method.GET -> getEncoderCapabilities()
 
             // Not found
-            else -> NanoHTTPD.newFixedLengthResponse(
+            else -> ApiHandlerUtils.jsonResponse(
                 Status.NOT_FOUND,
-                WebServer.MIME_JSON,
-                """{"error": "Endpoint not found", "uri": "$uri", "method": "${method.name}"}"""
+                JSONObject().put("error", "Endpoint not found").put("uri", uri).put("method", method.name).toString()
             )
-        }
-    }
-
-    /**
-     * Parse request body
-     */
-    private fun parseBody(session: NanoHTTPD.IHTTPSession): JSONObject? {
-        return try {
-            val files = mutableMapOf<String, String>()
-            session.parseBody(files)
-            val postData = files["postData"] ?: return null
-            JSONObject(postData)
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Error parsing request body")
-            null
         }
     }
 
@@ -256,87 +242,14 @@ class ApiRoutes(
         val json = JSONObject().apply {
             put("status", "ok")
             put("timestamp", System.currentTimeMillis())
-
-            // Camera status
-            put("camera", JSONObject().apply {
-                put("previewActive", camera?.isPreviewActive() ?: false)
-                put("streamingActive", camera?.isStreaming() ?: false)
-                val currentLens = camera?.getCurrentLens()?.value
-                put("currentLens", currentLens?.lensType?.name ?: "none")
-                put("zoom", camera?.currentZoom?.value ?: 1.0f)
-            })
-
-            // Encoder status
-            put("encoder", JSONObject().apply {
-                val state = camera?.encoderState?.value ?: EncoderState.IDLE
-                put("state", state.name)
-                val stats = camera?.getEncoderStats()
-                if (stats != null) {
-                    put("framesEncoded", stats.framesEncoded)
-                    put("currentBitrate", stats.currentBitrateBps)
-                    put("currentFps", stats.currentFps)
-                }
-                camera?.getEncoderConfig()?.let { config ->
-                    put("width", config.width)
-                    put("height", config.height)
-                    put("frameRate", config.frameRate)
-                    put("bitrate", config.bitrateBps)
-                    put("codec", config.codec.name)
-                }
-            })
-
-            // RTSP status
-            put("rtsp", JSONObject().apply {
-                put("running", camera?.isRtspServerRunning() ?: false)
-                put("url", camera?.getRtspUrl() ?: "")
-                put("clients", camera?.getRtspClientCount() ?: 0)
-                put("playing", camera?.getRtspPlayingCount() ?: 0)
-            })
-
-            // MPEG-TS/UDP status
-            put("mpegts", JSONObject().apply {
-                put("running", camera?.isMpegTsRunning() ?: false)
-                val stats = camera?.getMpegTsStats()
-                if (stats != null) {
-                    put("mode", stats.mode.name)
-                    put("connected", stats.isConnected)
-                    put("remoteAddress", stats.remoteAddress)
-                    put("port", stats.port)
-                }
-            })
-
-            // Microphone
+            put("camera", StatusReport.camera(camera))
+            put("encoder", StatusReport.encoder(camera))
+            put("rtsp", StatusReport.rtsp(camera))
+            put("mpegts", StatusReport.mpegTs(camera))
             camera?.let { put("audio", streamHandler.audioStatusJson(it)) }
-
-            // Recording status
-            put("recording", JSONObject().apply {
-                put("active", camera?.isRecording() ?: false)
-                put("paused", camera?.isRecordingPaused() ?: false)
-            })
-
-            // Director status
-            directorManager?.let { director ->
-                put("director", JSONObject().apply {
-                    val status = director.getStatus()
-                    put("enabled", status.enabled)
-                    put("state", status.state.name)
-                    put("currentScene", status.currentScene ?: "")
-                    put("currentCue", status.currentCue ?: "")
-                    put("currentTake", status.takeNumber)
-                    put("stats", JSONObject().apply {
-                        val takeManager = director.getTakeManager()
-                        val takes = takeManager.recordedTakes.value
-                        val goodTakes = takes.count { it.qualityScore >= 7.0f }
-                        val avgScore = if (takes.isNotEmpty()) {
-                            takes.map { it.qualityScore }.average().toFloat()
-                        } else 0f
-                        put("totalTakes", takes.size)
-                        put("goodTakes", goodTakes)
-                        put("averageScore", avgScore)
-                        put("sessionTime", director.getSessionDuration())
-                    })
-                })
-            }
+            put("recording", StatusReport.recording(camera))
+            thermalGovernor?.let { put("thermal", StatusReport.thermal(it)) }
+            directorManager?.let { put("director", StatusReport.director(it)) }
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -354,7 +267,7 @@ class ApiRoutes(
             put("device", Build.DEVICE)
             put("androidVersion", Build.VERSION.RELEASE)
             put("sdkVersion", Build.VERSION.SDK_INT)
-            put("appVersion", "1.0.0")
+            put("appVersion", BuildConfig.VERSION_NAME)
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -362,26 +275,30 @@ class ApiRoutes(
 
     // ==================== Lens Control ====================
 
+    /**
+     * Switch to the lens a name asks for: "wide", "main" or "tele" (the nearest
+     * lens of that family on this phone) or a lens type such as "ultra_wide".
+     */
     private fun switchLens(uri: String): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
         val lensName = uri.substringAfterLast("/")
-        val lensType = when (lensName.lowercase()) {
-            "wide", "ultrawide" -> LensType.WIDE
-            "main", "primary" -> LensType.MAIN
-            "tele", "telephoto", "zoom" -> LensType.TELEPHOTO
-            else -> return NanoHTTPD.newFixedLengthResponse(
+        if (!LensSelection.isKnownName(lensName)) {
+            return ApiHandlerUtils.jsonResponse(
                 Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Unknown lens type: $lensName"}"""
+                JSONObject().put("success", false).put("error", "Unknown lens: $lensName").toString()
             )
         }
+        val lens = camera.findLens(lensName) ?: return ApiHandlerUtils.jsonResponse(
+            Status.NOT_FOUND,
+            JSONObject().put("success", false).put("error", "This phone has no $lensName lens").toString()
+        )
 
-        camera.switchLens(lensType)
+        camera.switchLens(lens.lensType)
 
         return NanoHTTPD.newFixedLengthResponse(
             Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "lens": "${lensType.name}"}"""
+            """{"success": true, "lens": "${lens.lensType.name}"}"""
         )
     }
 
@@ -398,6 +315,8 @@ class ApiRoutes(
                     put(JSONObject().apply {
                         put("type", lens.lensType.name)
                         put("displayName", lens.lensType.displayName)
+                        put("group", LensSelection.familyOf(lens.lensType))
+                        put("zoomFactor", lens.lensType.zoomFactor)
                         put("cameraId", lens.cameraId)
                         put("focalLength", lens.focalLength)
                         put("aperture", lens.aperture)

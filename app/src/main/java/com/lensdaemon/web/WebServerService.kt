@@ -158,10 +158,12 @@ class WebServerService : Service() {
             // Wire thermal throttle callbacks to camera service
             thermalService?.onReduceBitrate = reduceBitrate@{ percent ->
                 val camera = cameraService ?: return@reduceBitrate
-                val currentBitrate = camera.getEncoderStats()?.currentBitrateBps ?: 4_000_000L
-                val newBitrate = (currentBitrate * (100 - percent) / 100).coerceAtLeast(500_000L)
+                // A share of the configured bitrate (bitrate changes leave the configuration
+                // as it was), so a 0% reduction restores it instead of keeping the throttled rate
+                val configured = camera.getEncoderConfig()?.bitrateBps ?: return@reduceBitrate
+                val newBitrate = (configured.toLong() * (100 - percent) / 100).coerceAtLeast(500_000L)
                 camera.updateEncoderBitrate(newBitrate.toInt())
-                Timber.w("$TAG: Thermal throttle: reduced bitrate by $percent% to $newBitrate bps")
+                Timber.w("$TAG: Thermal throttle: bitrate at ${100 - percent}% of $configured bps: $newBitrate bps")
             }
 
             thermalService?.onPauseStreaming = {
@@ -214,6 +216,9 @@ class WebServerService : Service() {
         // Load API token from prefs (null = auth disabled for first-boot setup)
         val prefs = getSharedPreferences("lensdaemon_security", MODE_PRIVATE)
         apiRoutes?.apiToken = prefs.getString("api_token", null)
+
+        // Kiosk mode (/api/kiosk/*, used by the setup wizard and the dashboard)
+        apiRoutes?.kioskManager = (application as LensDaemonApp).kioskManager
 
         // Bind to camera service
         bindCameraService()

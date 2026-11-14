@@ -586,34 +586,40 @@ class CameraService : Service() {
     }
 
     /**
-     * Switch to a different camera lens.
+     * Switch to a different camera lens: that type, or the nearest of its family
+     * when the phone lacks it (a WIDE request takes the ultra-wide on a phone
+     * without a plain wide lens). Returns false when the phone has no such lens.
      */
-    fun switchLens(lensType: LensType) {
-        Timber.i("Switching lens to: $lensType")
-        serviceScope.launch {
-            val lens = lensDaemonCameraManager.availableLenses.find { it.lensType == lensType }
-            if (lens != null) {
-                openCameraAndStartPreview(lens)
-            } else {
-                Timber.w("Lens type $lensType not available")
-            }
+    fun switchLens(lensType: LensType): Boolean {
+        val available = lensDaemonCameraManager.availableLenses
+        val type = LensSelection.pick(lensType, available.map { it.lensType })
+        val lens = type?.let { picked -> available.find { it.lensType == picked } }
+        if (lens == null) {
+            Timber.w("No $lensType lens on this phone")
+            return false
         }
+        Timber.i("Switching lens to: ${lens.lensType}")
+        serviceScope.launch { openCameraAndStartPreview(lens) }
+        return true
     }
 
     /**
-     * Switch to a specific lens by name (wide, main, tele).
+     * Switch to a lens by name: "wide", "main", "tele" or a [LensType] name.
+     * Returns false when the phone has no such lens or the name is unknown.
      */
-    fun switchLens(lensName: String) {
-        val lensType = when (lensName.lowercase()) {
-            "wide", "ultrawide", "ultra_wide" -> LensType.WIDE
-            "main", "primary", "default" -> LensType.MAIN
-            "tele", "telephoto", "zoom" -> LensType.TELEPHOTO
-            else -> {
-                Timber.w("Unknown lens name: $lensName")
-                return
-            }
+    fun switchLens(lensName: String): Boolean {
+        val lens = findLens(lensName) ?: run {
+            Timber.w("No lens matching \"$lensName\" on this phone")
+            return false
         }
-        switchLens(lensType)
+        return switchLens(lens.lensType)
+    }
+
+    /** The lens a name asks for ("wide", "main", "tele" or a [LensType] name), or null when the phone has none. */
+    fun findLens(lensName: String): CameraLens? {
+        val available = lensDaemonCameraManager.availableLenses
+        val type = LensSelection.pick(lensName, available.map { it.lensType }) ?: return null
+        return available.find { it.lensType == type }
     }
 
     // ==================== Zoom Control (Phase 3) ====================
@@ -833,6 +839,9 @@ class CameraService : Service() {
     fun getExposureCompensationRange(): android.util.Range<Int> {
         return exposureController.getExposureCompensationRange()
     }
+
+    /** Size of one exposure compensation step, in EV (often 1/6 or 1/3). */
+    fun getExposureCompensationStep(): Float = exposureController.getExposureCompensationStep()
 
     // ==================== Resolution Control ====================
 

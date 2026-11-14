@@ -243,15 +243,9 @@ class LensDaemonCameraManager(private val context: Context) {
             6.0f
         }
 
-        val equivalent35mm = focalLength * cropFactor
-
-        return when {
-            equivalent35mm < 18 -> LensType.ULTRA_WIDE
-            equivalent35mm < 28 -> LensType.WIDE
-            equivalent35mm < 50 -> LensType.MAIN
-            equivalent35mm < 100 -> LensType.TELEPHOTO
-            else -> LensType.SUPER_TELEPHOTO
-        }
+        // Phone terms: the ~24mm main camera is MAIN (with photography's 28-50mm
+        // "normal" range it was WIDE, so "main" found no lens on most phones)
+        return LensSelection.typeForEquivalentFocalLength(focalLength * cropFactor)
     }
 
     /**
@@ -383,8 +377,9 @@ class LensDaemonCameraManager(private val context: Context) {
      */
     @SuppressLint("MissingPermission")
     suspend fun openCamera(lensType: LensType): Boolean {
-        val lens = _availableLenses.find { it.lensType == lensType }
-            ?: _availableLenses.find { it.lensType == LensType.MAIN }
+        val types = _availableLenses.map { it.lensType }
+        val type = LensSelection.pick(lensType, types) ?: LensSelection.pick(LensType.MAIN, types)
+        val lens = _availableLenses.find { it.lensType == type }
             ?: _availableLenses.firstOrNull()
 
         if (lens == null) {

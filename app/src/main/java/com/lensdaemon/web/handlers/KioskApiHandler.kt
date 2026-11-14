@@ -63,29 +63,38 @@ class KioskApiHandler(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /**
+     * Turn kiosk mode on: LensDaemon starts on boot and, when it is the device
+     * owner, pins itself to the screen at once. Without Device Owner the screen
+     * cannot be locked, which the answer says (lockTask: false).
+     */
     private fun enableKiosk(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
-        if (!kiosk.isDeviceOwner()) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.BAD_REQUEST, WebServer.MIME_JSON,
-                """{"success": false, "error": "Device Owner not set. Run: adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver"}"""
-            )
-        }
+        kiosk.requestKioskMode(true)
+        val deviceOwner = kiosk.isDeviceOwner()
         val json = JSONObject().apply {
             put("success", true)
-            put("message", "Kiosk mode will be enabled. Restart app or use the dashboard to activate.")
-            put("note", "Full kiosk activation requires activity context")
+            put("lockTask", deviceOwner)
+            put(
+                "message",
+                if (deviceOwner) {
+                    "Kiosk mode on: LensDaemon is pinned to the screen and starts on boot"
+                } else {
+                    "LensDaemon will start on boot, but it cannot lock the screen until it is the device owner: " +
+                        "adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver"
+                }
+            )
         }
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /** Turn kiosk mode off: LensDaemon unpins itself and no longer starts on boot. */
     private fun disableKiosk(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
-        val newConfig = kiosk.getConfig().copy(enabled = false)
-        kiosk.updateConfig(newConfig)
+        kiosk.requestKioskMode(false)
         return NanoHTTPD.newFixedLengthResponse(
             Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Kiosk mode disabled in config. Restart app to fully exit."}"""
+            """{"success": true, "message": "Kiosk mode off: LensDaemon is unpinned and no longer starts on boot"}"""
         )
     }
 
