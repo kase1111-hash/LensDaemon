@@ -14,7 +14,7 @@ enum class DirectorState {
     READY,          // Script parsed, ready to run
     RUNNING,        // Actively executing cues
     PAUSED,         // Paused mid-script
-    THERMAL_HOLD    // Disabled due to thermal protection
+    THERMAL_HOLD    // Stopped by thermal protection until the phone cools down
 }
 
 /**
@@ -23,7 +23,7 @@ enum class DirectorState {
 enum class InferenceMode {
     OFF,            // No AI processing, manual cues only
     PRE_PARSED,     // Cues parsed once at script load, no runtime inference
-    REMOTE          // External LLM API for dynamic interpretation
+    REMOTE          // Not available yet: the API refuses it and a saved REMOTE loads as PRE_PARSED
 }
 
 /**
@@ -199,11 +199,13 @@ data class TakeQualityFactors(
     val exposureStability: Float = 0f,   // 0-1, how stable exposure was
     val motionStability: Float = 0f,     // 0-1, how stable the image was
     val audioLevelOk: Boolean = true,    // Audio levels within range
-    val cueTimingAccuracy: Float = 0f    // How well cues hit their marks
+    val cueTimingAccuracy: Float = 0f    // 0-1, how well script cues hit their marks; 0 when none ran (not scored then)
 )
 
 /**
- * Parsed script with scenes and cues
+ * Parsed script with scenes and cues. [errors] lists the problems found in it: lines that
+ * are not cues, unknown shot names and extra cues on a line (from [ScriptParser]), plus,
+ * once loaded by [DirectorManager], scenes without cues and shots the camera can't do.
  */
 data class ParsedScript(
     val id: String = java.util.UUID.randomUUID().toString(),
@@ -230,7 +232,7 @@ data class DirectorSession(
     val currentSceneIndex: Int = 0,
     val currentCueIndex: Int = 0,
     val takes: List<RecordedTake> = emptyList(),
-    val startTimeMs: Long = 0,
+    val startTimeMs: Long = 0,                  // When the script was loaded (0 = unknown)
     val state: DirectorState = DirectorState.READY
 ) {
     val currentScene: DirectorScene? get() = script.scenes.getOrNull(currentSceneIndex)
@@ -320,12 +322,34 @@ data class DirectorConfig(
 }
 
 /**
- * Director configuration persistence
+ * Where [DirectorManager] keeps its configuration: [DirectorConfigStore] on the phone,
+ * an in-memory stand-in in JVM tests.
  */
-class DirectorConfigStore(private val context: Context) {
+interface DirectorConfigPersistence {
+    /** The saved configuration, or the defaults when nothing usable is saved. */
+    fun loadConfig(): DirectorConfig
+
+    /** Saves [config] for the next [loadConfig]. */
+    fun saveConfig(config: DirectorConfig)
+}
+
+/**
+ * Director configuration persistence in the app's shared preferences.
+ */
+class DirectorConfigStore(private val context: Context) : DirectorConfigPersistence {
     companion object {
         private const val PREFS_NAME = "lensdaemon_director_config"
         private const val KEY_CONFIG_JSON = "config_json"
+
+        /**
+         * The inference mode a saved name stands for. REMOTE is not available yet, so a
+         * saved REMOTE (or an unknown name) loads as PRE_PARSED.
+         */
+        private fun savedInferenceMode(name: String): InferenceMode =
+            when (val mode = InferenceMode.entries.find { it.name == name }) {
+                null, InferenceMode.REMOTE -> InferenceMode.PRE_PARSED
+                else -> mode
+            }
     }
 
     private val prefs: SharedPreferences by lazy {
@@ -335,7 +359,7 @@ class DirectorConfigStore(private val context: Context) {
     /**
      * Save director configuration
      */
-    fun saveConfig(config: DirectorConfig) {
+    override fun saveConfig(config: DirectorConfig) {
         val json = JSONObject().apply {
             put("enabled", config.enabled)
             put("inferenceMode", config.inferenceMode.name)
@@ -363,7 +387,7 @@ class DirectorConfigStore(private val context: Context) {
     /**
      * Load director configuration
      */
-    fun loadConfig(): DirectorConfig {
+    override fun loadConfig(): DirectorConfig {
         val jsonStr = prefs.getString(KEY_CONFIG_JSON, null) ?: return DirectorConfig.DEFAULT
 
         return try {
@@ -372,11 +396,7 @@ class DirectorConfigStore(private val context: Context) {
 
             DirectorConfig(
                 enabled = json.optBoolean("enabled", false),
-                inferenceMode = try {
-                    InferenceMode.valueOf(json.optString("inferenceMode", "PRE_PARSED"))
-                } catch (e: Exception) {
-                    InferenceMode.PRE_PARSED
-                },
+                inferenceMode = savedInferenceMode(json.optString("inferenceMode", InferenceMode.PRE_PARSED.name)),
                 llmConfig = if (llmJson != null) {
                     LlmConfig(
                         endpoint = llmJson.optString("endpoint", ""),

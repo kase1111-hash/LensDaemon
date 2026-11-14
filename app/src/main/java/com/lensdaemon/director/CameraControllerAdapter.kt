@@ -1,7 +1,11 @@
 package com.lensdaemon.director
 
 import com.lensdaemon.camera.CameraService
+import com.lensdaemon.camera.FocusMode
+import com.lensdaemon.camera.LensSelection
 import timber.log.Timber
+import kotlin.math.abs
+import kotlin.math.roundToInt
 
 /**
  * Camera Controller Adapter
@@ -12,6 +16,10 @@ import timber.log.Timber
  * This adapter lives in :app because it depends on CameraService and LensType.
  * The CameraController interface in :director uses Strings for lens names so the
  * module has no dependency on :app camera types.
+ *
+ * Commands are compared with the camera's own state (the open lens, the applied zoom,
+ * the focus mode), not with what the adapter last asked for, so a cue still acts after
+ * the lens, zoom or focus was changed on the phone or the dashboard.
  */
 class CameraControllerAdapter(
     private val cameraService: CameraService
@@ -19,84 +27,129 @@ class CameraControllerAdapter(
 
     companion object {
         private const val TAG = "CameraControllerAdapter"
+
+        /** Zoom levels closer than this count as the same. */
+        private const val ZOOM_TOLERANCE = 0.01f
+
+        /** Exposure compensation of each preset, in EV, as [ExposurePreset] documents them. */
+        private fun evFor(preset: ExposurePreset): Float = when (preset) {
+            ExposurePreset.AUTO -> 0f
+            ExposurePreset.BRIGHT -> 1f
+            ExposurePreset.DARK -> -1f
+            ExposurePreset.BACKLIT -> 2f
+            ExposurePreset.SILHOUETTE -> -2f
+        }
     }
 
-    // Track current state for change detection
-    private var currentLens: String = "main"
-    private var currentZoom: Float = 1.0f
-    private var currentFocusTarget: FocusTarget = FocusTarget.AUTO
+    /** A focus target the adapter applied, with the lens family and camera focus mode it left. */
+    private data class AppliedFocus(val target: FocusTarget, val lensFamily: String?, val mode: FocusMode)
+
+    /** The lens family ("wide", "main", "tele") of the last switch the camera accepted. */
+    @Volatile
+    private var lastAcceptedLens: String? = null
+
+    /** The zoom an animation of ours is heading to, until [animationEndsAtMs]. */
+    @Volatile
+    private var animatingTo: Float? = null
+
+    @Volatile
+    private var animationEndsAtMs = 0L
+
+    @Volatile
+    private var appliedFocus: AppliedFocus? = null
 
     /**
-     * Switch camera lens. Maps String → LensType at the module boundary.
+     * Switch camera lens ("wide", "main", "tele"), unless that family is open already or is
+     * the one the camera is reopening for. Maps String → LensType at the module boundary.
      */
     override fun switchLens(lens: String) {
-        if (lens != currentLens) {
-            Timber.tag(TAG).d("Switching lens: $currentLens -> $lens")
-            cameraService.switchLens(lens)
-            currentLens = lens
+        val current = currentLensFamily()
+        if (lens == current || (current == null && lens == lastAcceptedLens)) return
+
+        Timber.tag(TAG).d("Switching lens: ${current ?: "(camera reopening)"} -> $lens")
+        if (cameraService.switchLens(lens)) {
+            lastAcceptedLens = lens
+        } else {
+            Timber.tag(TAG).w("The camera has no \"$lens\" lens")
         }
     }
 
+    /**
+     * Zoom to [level] (clamped to what the open lens allows), unless the camera is there
+     * already or an animation of ours is still heading there.
+     */
     override fun setZoom(level: Float, animated: Boolean, durationMs: Long) {
-        val clampedLevel = level.coerceIn(0.5f, 10.0f)
+        val target = level.coerceIn(1f, cameraService.getMaxZoom().coerceAtLeast(1f))
+        val now = System.currentTimeMillis()
+        val heading = animatingTo?.takeIf { now < animationEndsAtMs }
+        val reached = heading ?: cameraService.currentZoom.value
+        if (abs(target - reached) <= ZOOM_TOLERANCE) return
 
-        if (kotlin.math.abs(clampedLevel - currentZoom) > 0.01f) {
-            Timber.tag(TAG).d("Setting zoom: $currentZoom -> $clampedLevel (animated=$animated, duration=${durationMs}ms)")
-
-            if (animated && durationMs > 0) {
-                cameraService.animateZoom(clampedLevel, durationMs)
-            } else {
-                cameraService.setZoom(clampedLevel)
-            }
-            currentZoom = clampedLevel
+        Timber.tag(TAG).d("Setting zoom: $reached -> $target (animated=$animated, duration=${durationMs}ms)")
+        if (animated && durationMs > 0) {
+            cameraService.animateZoom(target, durationMs)
+            animatingTo = target
+            animationEndsAtMs = now + durationMs
+        } else {
+            cameraService.setZoom(target)
+            animatingTo = null
         }
     }
 
+    /**
+     * Apply a focus target, unless it is the one applied last and neither the lens family
+     * nor the camera's focus mode has changed since.
+     */
     override fun setFocusMode(target: FocusTarget) {
-        if (target != currentFocusTarget) {
-            Timber.tag(TAG).d("Setting focus target: $currentFocusTarget -> $target")
+        val family = currentLensFamily()
+        val applied = appliedFocus
+        if (applied == AppliedFocus(target, family, cameraService.getConfig().focusMode)) return
 
-            when (target) {
-                FocusTarget.AUTO -> {
-                    cameraService.setAutoFocus()
-                }
-                FocusTarget.FACE -> {
-                    cameraService.enableFaceDetectionFocus()
-                }
-                FocusTarget.HANDS -> {
-                    cameraService.triggerTapToFocus(0.5f, 0.7f, android.util.Size(1920, 1080))
-                }
-                FocusTarget.OBJECT -> {
-                    cameraService.triggerTapToFocus(0.5f, 0.5f, android.util.Size(1920, 1080))
-                }
-                FocusTarget.BACKGROUND -> {
-                    cameraService.setFocusDistance(0f)
-                }
-                FocusTarget.MANUAL -> {
-                    cameraService.lockFocus()
-                }
+        Timber.tag(TAG).d("Setting focus target: ${applied?.target} -> $target")
+        when (target) {
+            FocusTarget.AUTO -> {
+                cameraService.setAutoFocus()
             }
-            currentFocusTarget = target
+            FocusTarget.FACE -> {
+                // Continuous autofocus: the camera has no face priority yet
+                cameraService.enableFaceDetectionFocus()
+            }
+            FocusTarget.HANDS -> {
+                cameraService.triggerTapToFocus(0.5f, 0.7f, android.util.Size(1920, 1080))
+            }
+            FocusTarget.OBJECT -> {
+                cameraService.triggerTapToFocus(0.5f, 0.5f, android.util.Size(1920, 1080))
+            }
+            FocusTarget.BACKGROUND -> {
+                cameraService.setFocusDistance(0f)
+            }
+            FocusTarget.MANUAL -> {
+                cameraService.lockFocus()
+            }
         }
+        appliedFocus = AppliedFocus(target, family, cameraService.getConfig().focusMode)
     }
 
+    /**
+     * Set the exposure compensation of a preset: AUTO 0, BRIGHT +1, DARK −1, BACKLIT +2 and
+     * SILHOUETTE −2 EV, in the camera's own steps and within its range. The director calls
+     * this only when the preset changes.
+     */
     override fun setExposurePreset(preset: ExposurePreset) {
-        Timber.tag(TAG).d("Setting exposure preset: $preset")
+        val step = cameraService.getExposureCompensationStep()
+        val steps = if (step > 0f) (evFor(preset) / step).roundToInt() else 0
+        val range = cameraService.getExposureCompensationRange()
+        val value = steps.coerceIn(range.lower, range.upper)
 
-        val evCompensation = when (preset) {
-            ExposurePreset.AUTO -> 0
-            ExposurePreset.BRIGHT -> 2
-            ExposurePreset.DARK -> -2
-            ExposurePreset.BACKLIT -> 3
-            ExposurePreset.SILHOUETTE -> -3
-        }
-
-        cameraService.setExposureCompensation(evCompensation)
+        Timber.tag(TAG).d("Setting exposure preset: $preset ($value steps of $step EV)")
+        cameraService.setExposureCompensation(value)
     }
 
     override fun getCurrentTemperature(): Int {
         return cameraService.getCurrentCpuTemperature()
     }
+
+    override fun getCapabilities(): ShotMapper.CameraCapabilities = getCameraCapabilities()
 
     fun getCameraCapabilities(): ShotMapper.CameraCapabilities {
         // The director's "wide" and "telephoto" are the lens families the phone
@@ -112,7 +165,8 @@ class CameraControllerAdapter(
             wideFocalLength = wide?.focalLength ?: 16f,
             mainFocalLength = main?.focalLength ?: 24f,
             telephotoFocalLength = tele?.focalLength ?: 70f,
-            maxDigitalZoom = cameraService.getMaxZoom(),
+            // The main lens's limit, read when the lenses were listed, holds before the camera opens
+            maxDigitalZoom = main?.maxZoom?.takeIf { it > 1f } ?: cameraService.getMaxZoom(),
             supportsSmoothZoom = true,
             supportsFaceDetection = cameraService.supportsFaceDetection(),
             supportsManualFocus = cameraService.supportsManualFocus()
@@ -125,17 +179,17 @@ class CameraControllerAdapter(
 
     fun getMotionShakiness(): Float = cameraService.getMotionShakiness()
 
+    /** Forgets the lens request, zoom animation and focus target the adapter remembers. */
     fun reset() {
-        currentLens = "main"
-        currentZoom = 1.0f
-        currentFocusTarget = FocusTarget.AUTO
+        lastAcceptedLens = null
+        animatingTo = null
+        animationEndsAtMs = 0L
+        appliedFocus = null
     }
 
-    fun syncWithCamera() {
-        currentLens = cameraService.getCurrentLens().value?.lensType?.name?.lowercase() ?: "main"
-        currentZoom = cameraService.currentZoom.value
-        Timber.tag(TAG).d("Synced with camera: lens=$currentLens, zoom=$currentZoom")
-    }
+    /** The family of the open lens, or null while the camera is closed or reopening. */
+    private fun currentLensFamily(): String? =
+        cameraService.getCurrentLens().value?.lensType?.let(LensSelection::familyOf)
 }
 
 /**
@@ -143,6 +197,10 @@ class CameraControllerAdapter(
  *
  * Lives in :app (not :director) because CameraControllerAdapter depends on
  * CameraService; :director must not reference :app types.
+ *
+ * Focus lock is the camera's focus state. Exposure and motion are placeholders: the
+ * configured exposure compensation (not a measurement) and a constant shake per
+ * stabilisation mode. Audio isn't sampled.
  */
 fun CameraControllerAdapter.asMetricsSource(): QualityMetricsCollector.MetricsSource {
     val adapter = this

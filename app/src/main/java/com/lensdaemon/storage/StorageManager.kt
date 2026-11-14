@@ -442,7 +442,9 @@ class StorageManager(
      * Release all resources
      */
     fun release() {
-        if (isRecording() || isPaused()) {
+        // Any open writer is finalized, including one left in ERROR (a full
+        // disk reports the error before the owner gets to stop the recording)
+        if (fileWriter != null) {
             stopRecording()
         }
 

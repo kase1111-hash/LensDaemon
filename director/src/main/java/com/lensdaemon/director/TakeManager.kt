@@ -6,7 +6,6 @@ import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
 import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.max
-import kotlin.math.min
 
 /**
  * Take Manager
@@ -14,15 +13,23 @@ import kotlin.math.min
  * Manages take recording, automatic segmentation, quality scoring,
  * and best take suggestions for post-production efficiency.
  *
+ * Takes score 0-10: at least [EXCELLENT_SCORE] is excellent, [GOOD_SCORE] good, and the
+ * best take of a scene is suggested when it scores at least [SUGGESTED_MIN_SCORE].
  * Quality scoring considers:
  * - Focus lock percentage (was subject in focus?)
  * - Exposure stability (was lighting consistent?)
  * - Motion stability (was the shot steady?)
- * - Cue timing accuracy (did cues hit their marks?)
+ * - Cue timing accuracy (did script cues hit their marks? left out when no script cue ran)
  * - Audio levels (was audio in acceptable range?)
+ *
+ * The samples come from QualityMetricsCollector while a take runs; samples outside a take
+ * are ignored. On the phone the exposure and motion inputs are placeholders: the exposure
+ * is the configured compensation, not a measurement, and the shake is a constant per
+ * stabilisation mode, so those two factors say little until they come from capture results
+ * or motion sensors. Audio isn't sampled, which leaves the audio factor at "OK".
  */
 class TakeManager(
-    private val config: DirectorConfig = DirectorConfig.DEFAULT
+    config: DirectorConfig = DirectorConfig.DEFAULT
 ) {
     companion object {
         private const val TAG = "TakeManager"
@@ -39,6 +46,18 @@ class TakeManager(
         const val WEIGHT_MOTION = 0.25f
         const val WEIGHT_CUE_TIMING = 0.15f
         const val WEIGHT_AUDIO = 0.10f
+
+        /** Scores run from 0 to this. */
+        const val MAX_SCORE = 10f
+
+        /** A take scoring at least this is excellent. */
+        const val EXCELLENT_SCORE = 8f
+
+        /** A take scoring at least this is good. */
+        const val GOOD_SCORE = 6f
+
+        /** The best take of a scene is suggested (and listed as a best take) from this score. */
+        const val SUGGESTED_MIN_SCORE = 5f
     }
 
     /**
@@ -84,7 +103,13 @@ class TakeManager(
         val recommendation: String
     )
 
+    /** The settings in force (quality scoring on or off); [DirectorManager] replaces them when they change. */
+    @Volatile
+    internal var config: DirectorConfig = config
+
     private val _currentTake = MutableStateFlow<ActiveTake?>(null)
+
+    /** The take in progress, or null between takes: quality samples count only while it is set. */
     val currentTake: StateFlow<ActiveTake?> = _currentTake.asStateFlow()
 
     private val _recordedTakes = MutableStateFlow<List<RecordedTake>>(emptyList())
@@ -93,6 +118,8 @@ class TakeManager(
     private val _bestTakeSuggestion = MutableStateFlow<RecordedTake?>(null)
     val bestTakeSuggestion: StateFlow<RecordedTake?> = _bestTakeSuggestion.asStateFlow()
 
+    /** Guards the take in progress and the recorded takes (script, HTTP and sampling threads). */
+    private val lock = Any()
     private var takeCounter = 0
     private val qualityMetricsQueue = ConcurrentLinkedQueue<QualityMetricSample>()
 
@@ -108,11 +135,13 @@ class TakeManager(
     )
 
     /**
-     * Start a new take
+     * Start a new take. Callers end the take in progress first (and announce it); one still
+     * open here is ended without notice.
      */
-    fun startTake(sceneId: String, sceneLabel: String): RecordedTake {
-        // End any existing take
-        _currentTake.value?.let { endTake() }
+    fun startTake(sceneId: String, sceneLabel: String): RecordedTake = synchronized(lock) {
+        _currentTake.value?.let { endTakeLocked(null) }
+        // Samples queued before this take belong to no take
+        qualityMetricsQueue.clear()
 
         takeCounter++
         val take = ActiveTake(
@@ -125,7 +154,7 @@ class TakeManager(
 
         Timber.tag(TAG).i("Started take #$takeCounter for scene: $sceneLabel")
 
-        return RecordedTake(
+        RecordedTake(
             takeNumber = takeCounter,
             sceneId = sceneId,
             sceneLabel = sceneLabel,
@@ -136,16 +165,18 @@ class TakeManager(
     /**
      * End current take and calculate quality score
      */
-    fun endTake(filePath: String? = null): RecordedTake? {
+    fun endTake(filePath: String? = null): RecordedTake? = synchronized(lock) { endTakeLocked(filePath) }
+
+    private fun endTakeLocked(filePath: String?): RecordedTake? {
         val active = _currentTake.value ?: return null
         val endTimeMs = System.currentTimeMillis()
 
         // Process any pending quality metrics
-        processQueuedMetrics()
+        processQueuedMetrics(active)
 
         // Calculate quality factors
         val qualityFactors = calculateQualityFactors(active)
-        val qualityScore = calculateOverallScore(qualityFactors)
+        val qualityScore = calculateOverallScore(qualityFactors, hasCueTimings = active.cueTimings.isNotEmpty())
 
         val recordedTake = RecordedTake(
             takeNumber = active.takeNumber,
@@ -162,9 +193,7 @@ class TakeManager(
         )
 
         // Add to recorded takes
-        val takes = _recordedTakes.value.toMutableList()
-        takes.add(recordedTake)
-        _recordedTakes.value = takes
+        _recordedTakes.value = _recordedTakes.value + recordedTake
 
         // Update best take suggestion for this scene
         updateBestTakeSuggestion(active.sceneId)
@@ -178,13 +207,14 @@ class TakeManager(
             recordedTake.durationMs
         )
 
-        return recordedTake
+        return _recordedTakes.value.lastOrNull { it.takeNumber == active.takeNumber } ?: recordedTake
     }
 
     /**
-     * Record a focus state sample
+     * Record a focus state sample (ignored outside a take)
      */
     fun recordFocusSample(locked: Boolean) {
+        if (_currentTake.value == null) return
         qualityMetricsQueue.add(
             QualityMetricSample(
                 timestamp = System.currentTimeMillis(),
@@ -194,9 +224,10 @@ class TakeManager(
     }
 
     /**
-     * Record an exposure value sample (normalized 0-1)
+     * Record an exposure value sample (normalized 0-1; ignored outside a take)
      */
     fun recordExposureSample(value: Float) {
+        if (_currentTake.value == null) return
         qualityMetricsQueue.add(
             QualityMetricSample(
                 timestamp = System.currentTimeMillis(),
@@ -206,9 +237,10 @@ class TakeManager(
     }
 
     /**
-     * Record a motion/stability sample (0 = perfectly stable, 1 = very shaky)
+     * Record a motion/stability sample (0 = perfectly stable, 1 = very shaky; ignored outside a take)
      */
     fun recordMotionSample(shakiness: Float) {
+        if (_currentTake.value == null) return
         qualityMetricsQueue.add(
             QualityMetricSample(
                 timestamp = System.currentTimeMillis(),
@@ -218,9 +250,10 @@ class TakeManager(
     }
 
     /**
-     * Record an audio level sample (dB normalized to 0-1)
+     * Record an audio level sample (dB normalized to 0-1; ignored outside a take)
      */
     fun recordAudioSample(level: Float) {
+        if (_currentTake.value == null) return
         qualityMetricsQueue.add(
             QualityMetricSample(
                 timestamp = System.currentTimeMillis(),
@@ -230,18 +263,22 @@ class TakeManager(
     }
 
     /**
-     * Record a cue execution for timing accuracy
+     * Record a cue execution in the take in progress. [expectedTimeMs] is when a script
+     * meant the cue to run; with null (a cue run by hand) only the success or failure counts.
      */
-    fun recordCueExecution(cueId: String, expectedTimeMs: Long, success: Boolean) {
-        _currentTake.value?.let { take ->
-            take.cueTimings.add(
-                CueTiming(
-                    cueId = cueId,
-                    expectedTimeMs = expectedTimeMs,
-                    actualTimeMs = System.currentTimeMillis(),
-                    success = success
+    fun recordCueExecution(cueId: String, expectedTimeMs: Long?, success: Boolean) {
+        synchronized(lock) {
+            val take = _currentTake.value ?: return
+            if (expectedTimeMs != null) {
+                take.cueTimings.add(
+                    CueTiming(
+                        cueId = cueId,
+                        expectedTimeMs = expectedTimeMs,
+                        actualTimeMs = System.currentTimeMillis(),
+                        success = success
+                    )
                 )
-            )
+            }
             if (success) {
                 take.cuesExecuted++
             } else {
@@ -251,11 +288,9 @@ class TakeManager(
     }
 
     /**
-     * Process queued quality metrics into current take
+     * Process queued quality metrics into [take]
      */
-    private fun processQueuedMetrics() {
-        val take = _currentTake.value ?: return
-
+    private fun processQueuedMetrics(take: ActiveTake) {
         while (qualityMetricsQueue.isNotEmpty()) {
             val sample = qualityMetricsQueue.poll() ?: break
 
@@ -289,7 +324,7 @@ class TakeManager(
             1f - take.motionSamples.average().toFloat()
         } else 0f
 
-        // Cue timing accuracy
+        // Cue timing accuracy (0 when no script cue ran; the score then leaves it out)
         val cueTimingAccuracy = if (take.cueTimings.isNotEmpty()) {
             take.cueTimings.map { it.timingAccuracy }.average().toFloat()
         } else 0f
@@ -310,29 +345,42 @@ class TakeManager(
     }
 
     /**
-     * Calculate overall quality score from factors
+     * The overall score, 0-10: the weighted factors times [MAX_SCORE]. Without cue timings
+     * (no script cue ran) the other weights are scaled up to fill the timing's share.
      */
-    private fun calculateOverallScore(factors: TakeQualityFactors): Float {
+    private fun calculateOverallScore(factors: TakeQualityFactors, hasCueTimings: Boolean): Float {
         if (!config.qualityScoring) return 0f
 
         val focusScore = factors.focusLockPercent / 100f
         val audioScore = if (factors.audioLevelOk) 1f else 0.5f
 
-        return (focusScore * WEIGHT_FOCUS +
+        var weighted = focusScore * WEIGHT_FOCUS +
                 factors.exposureStability * WEIGHT_EXPOSURE +
                 factors.motionStability * WEIGHT_MOTION +
-                factors.cueTimingAccuracy * WEIGHT_CUE_TIMING +
-                audioScore * WEIGHT_AUDIO)
+                audioScore * WEIGHT_AUDIO
+        var weights = WEIGHT_FOCUS + WEIGHT_EXPOSURE + WEIGHT_MOTION + WEIGHT_AUDIO
+        if (hasCueTimings) {
+            weighted += factors.cueTimingAccuracy * WEIGHT_CUE_TIMING
+            weights += WEIGHT_CUE_TIMING
+        }
+        return (weighted / weights * MAX_SCORE).coerceIn(0f, MAX_SCORE)
     }
 
     /**
-     * Update best take suggestion for a scene
+     * Marks the best take of a scene as suggested (when it scores at least
+     * [SUGGESTED_MIN_SCORE]) and the scene's other takes as not suggested.
      */
     private fun updateBestTakeSuggestion(sceneId: String) {
-        val sceneTakes = _recordedTakes.value.filter { it.sceneId == sceneId }
-        val best = sceneTakes.maxByOrNull { it.qualityScore }
+        val takes = _recordedTakes.value
+        val best = takes.filter { it.sceneId == sceneId }
+            .maxByOrNull { it.qualityScore }
+            ?.takeIf { it.qualityScore >= SUGGESTED_MIN_SCORE }
 
-        if (best != null && best.qualityScore > 0.5f) {
+        _recordedTakes.value = takes.map { take ->
+            if (take.sceneId == sceneId) take.copy(suggested = take.takeNumber == best?.takeNumber) else take
+        }
+
+        if (best != null) {
             _bestTakeSuggestion.value = best.copy(suggested = true)
             Timber.tag(TAG).d("Best take for scene $sceneId: #${best.takeNumber} (score: %.2f)", best.qualityScore)
         }
@@ -341,7 +389,7 @@ class TakeManager(
     /**
      * Manually mark a take quality
      */
-    fun markTake(takeNumber: Int, quality: TakeQuality, notes: String = ""): Boolean {
+    fun markTake(takeNumber: Int, quality: TakeQuality, notes: String = ""): Boolean = synchronized(lock) {
         val takes = _recordedTakes.value.toMutableList()
         val index = takes.indexOfFirst { it.takeNumber == takeNumber }
 
@@ -349,9 +397,10 @@ class TakeManager(
             takes[index] = takes[index].copy(manualMark = quality, notes = notes)
             _recordedTakes.value = takes
             Timber.tag(TAG).d("Marked take #$takeNumber as $quality")
-            return true
+            true
+        } else {
+            false
         }
-        return false
     }
 
     /**
@@ -385,9 +434,9 @@ class TakeManager(
         val recommendation = buildString {
             if (best != null) {
                 append("Take #${best.takeNumber} recommended")
-                if (best.qualityScore >= 0.8f) {
+                if (best.qualityScore >= EXCELLENT_SCORE) {
                     append(" (excellent quality)")
-                } else if (best.qualityScore >= 0.6f) {
+                } else if (best.qualityScore >= GOOD_SCORE) {
                     append(" (good quality)")
                 } else {
                     append(" (acceptable, consider re-shooting)")
@@ -415,13 +464,14 @@ class TakeManager(
     }
 
     /**
-     * Get all best take suggestions across scenes
+     * The best take of each scene, keyed by scene id, for scenes whose best take scores at
+     * least [SUGGESTED_MIN_SCORE]
      */
     fun getAllBestTakes(): Map<String, RecordedTake> {
         return _recordedTakes.value
             .groupBy { it.sceneId }
             .mapValues { (_, takes) -> takes.maxByOrNull { it.qualityScore }!! }
-            .filter { it.value.qualityScore > 0.5f }
+            .filter { it.value.qualityScore >= SUGGESTED_MIN_SCORE }
     }
 
     /**
@@ -478,11 +528,13 @@ class TakeManager(
      * Reset take counter for a new session
      */
     fun resetSession() {
-        takeCounter = 0
-        _currentTake.value = null
-        _recordedTakes.value = emptyList()
-        _bestTakeSuggestion.value = null
-        qualityMetricsQueue.clear()
+        synchronized(lock) {
+            takeCounter = 0
+            _currentTake.value = null
+            _recordedTakes.value = emptyList()
+            _bestTakeSuggestion.value = null
+            qualityMetricsQueue.clear()
+        }
         Timber.tag(TAG).i("Take manager session reset")
     }
 
@@ -497,9 +549,9 @@ class TakeManager(
     fun getCurrentTakeNumber(): Int = _currentTake.value?.takeNumber ?: 0
 
     /**
-     * Link a take to its recording file
+     * Link a take to its recording file. False when there is no such take.
      */
-    fun linkTakeToFile(takeNumber: Int, filePath: String) {
+    fun linkTakeToFile(takeNumber: Int, filePath: String): Boolean = synchronized(lock) {
         val takes = _recordedTakes.value.toMutableList()
         val index = takes.indexOfFirst { it.takeNumber == takeNumber }
 
@@ -508,8 +560,10 @@ class TakeManager(
             takes[index] = take.copy(filePath = filePath)
             _recordedTakes.value = takes
             Timber.tag(TAG).i("Linked take #$takeNumber to file: $filePath")
+            true
         } else {
             Timber.tag(TAG).w("Cannot link file - take #$takeNumber not found")
+            false
         }
     }
 

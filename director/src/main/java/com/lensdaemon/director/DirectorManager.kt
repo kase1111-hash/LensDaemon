@@ -1,8 +1,23 @@
 package com.lensdaemon.director
 
 import android.content.Context
-import kotlinx.coroutines.*
-import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.BufferOverflow
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import timber.log.Timber
 
 /**
@@ -13,16 +28,42 @@ import timber.log.Timber
  *
  * Design principles:
  * - Completely inert when disabled (zero thermal impact)
- * - Thermal-aware operation with automatic throttling
+ * - Thermal-aware: a run that gets as hot as [DirectorConfig.thermalThresholdDisable]
+ *   stops in [DirectorState.THERMAL_HOLD], which clears (without resuming) once the
+ *   phone is [THERMAL_RESUME_MARGIN_C] °C cooler
  * - Clean separation from camera pipeline
  * - Observable state via StateFlow
+ *
+ * A script runs in its own coroutine, one cue after another: [BEAT] and [HOLD] wait,
+ * [TAKE] starts the next take, and the other cues become camera commands. Stop and the
+ * end of the script go back to the first scene; pause and a thermal hold keep the
+ * position, and resuming continues the paused take. The public methods are meant for
+ * HTTP threads: control methods run one at a time, and those that stop a running
+ * script wait for its coroutine to finish.
  */
-class DirectorManager(
-    private val context: Context,
-    private var config: DirectorConfig = DirectorConfig.DEFAULT
+class DirectorManager internal constructor(
+    private val persistence: DirectorConfigPersistence,
+    private val thermalMonitorIntervalMs: Long
 ) {
+    /** A director whose settings live in [persistence]. */
+    constructor(persistence: DirectorConfigPersistence) : this(persistence, THERMAL_MONITOR_INTERVAL_MS)
+
+    /** A director whose settings live in the app's preferences. */
+    constructor(context: Context) : this(DirectorConfigStore(context))
+
     companion object {
         private const val TAG = "DirectorManager"
+
+        /** A thermal hold clears once the phone is this many °C below [DirectorConfig.thermalThresholdDisable]. */
+        const val THERMAL_RESUME_MARGIN_C = 5
+
+        /** Between cues, a run reads the temperature at most this often. */
+        private const val THERMAL_CHECK_INTERVAL_MS = 5_000L
+
+        /** How often the temperature is checked while a script runs or is held for heat. */
+        private const val THERMAL_MONITOR_INTERVAL_MS = 10_000L
+
+        private const val EVENT_BUFFER = 64
     }
 
     /**
@@ -34,6 +75,12 @@ class DirectorManager(
         fun setFocusMode(target: FocusTarget)
         fun setExposurePreset(preset: ExposurePreset)
         fun getCurrentTemperature(): Int
+
+        /**
+         * What the camera can do now (lenses, zoom, focus), for mapping shots; null when
+         * unknown. Read when a script loads or starts and before each cue run by hand.
+         */
+        fun getCapabilities(): ShotMapper.CameraCapabilities? = null
     }
 
     /**
@@ -49,8 +96,14 @@ class DirectorManager(
         data class ThermalWarning(val temperature: Int, val action: String) : DirectorEvent()
     }
 
+    /** A place in the script: a scene, and a cue in it. */
+    private data class Position(val scene: Int, val cue: Int)
+
+    // Settings first: the components are built with them
+    @Volatile
+    private var config: DirectorConfig = persistence.loadConfig()
+
     // Components
-    private val configStore = DirectorConfigStore(context)
     private val scriptParser = ScriptParser(config)
     private val shotMapper = ShotMapper(config)
     private val takeManager = TakeManager(config)
@@ -62,25 +115,56 @@ class DirectorManager(
     private val _currentSession = MutableStateFlow<DirectorSession?>(null)
     val currentSession: StateFlow<DirectorSession?> = _currentSession.asStateFlow()
 
-    private val _events = MutableSharedFlow<DirectorEvent>(extraBufferCapacity = 64)
+    // Events never wait for listeners: when one falls behind, the oldest events are dropped
+    private val _events = MutableSharedFlow<DirectorEvent>(
+        extraBufferCapacity = EVENT_BUFFER,
+        onBufferOverflow = BufferOverflow.DROP_OLDEST
+    )
     val events: SharedFlow<DirectorEvent> = _events.asSharedFlow()
 
     // Controller reference (set when camera service binds)
+    @Volatile
     private var cameraController: CameraController? = null
 
     // Coroutine scope for director operations
     private val scope = CoroutineScope(Dispatchers.Default + SupervisorJob())
+
+    /** Makes the control methods run one at a time; the script's coroutine never takes it. */
+    private val controlLock = Any()
+
+    /** Guards the state, the session position, [cueExecutionJob] and [runGeneration]; held briefly. */
+    private val sessionLock = Any()
+
+    /** Keeps the shot mapper and the camera calls of one cue together. */
+    private val cameraLock = Any()
+
+    /** The coroutine running the script (under [sessionLock]). */
     private var cueExecutionJob: Job? = null
 
+    /** Counts started and stopped runs (under [sessionLock]); a run with an old number can't move the session. */
+    private var runGeneration = 0
+
+    /**
+     * The exposure preset the director last applied (under [cameraLock]). Commands with the
+     * same preset leave the camera's exposure alone, so cues that don't change exposure never
+     * undo a value set on the dashboard.
+     */
+    private var lastAppliedExposure = ExposurePreset.AUTO
+
     // Thermal monitoring
+    @Volatile
     private var thermalCheckJob: Job? = null
-    private var lastThermalCheck = 0L
+
+    @Volatile
+    private var lastThermalCheckMs = 0L
+
+    @Volatile
+    private var lastTemperatureC: Int? = null
 
     init {
-        // Load saved config
-        config = configStore.loadConfig()
         if (config.enabled) {
             _state.value = DirectorState.IDLE
+            startThermalMonitoring()
         }
     }
 
@@ -88,26 +172,31 @@ class DirectorManager(
      * Enable AI Director
      */
     fun enable() {
-        if (_state.value == DirectorState.DISABLED) {
+        synchronized(controlLock) {
+            if (_state.value != DirectorState.DISABLED) return
             _state.value = DirectorState.IDLE
-            config = config.copy(enabled = true)
-            configStore.saveConfig(config)
+            applyConfig(config.copy(enabled = true))
             startThermalMonitoring()
-            emitEvent(DirectorEvent.StateChanged(DirectorState.IDLE))
-            Timber.tag(TAG).i("AI Director enabled")
         }
+        emitEvent(DirectorEvent.StateChanged(DirectorState.IDLE))
+        Timber.tag(TAG).i("AI Director enabled")
     }
 
     /**
-     * Disable AI Director (returns to inert state)
+     * Disable AI Director (returns to inert state): a running script stops, its take ends
+     * and the script is unloaded. Saves the director as disabled.
      */
     fun disable() {
-        stopExecution()
-        stopThermalMonitoring()
-        _currentSession.value = null
-        _state.value = DirectorState.DISABLED
-        config = config.copy(enabled = false)
-        configStore.saveConfig(config)
+        synchronized(controlLock) {
+            stopRunAndWait()
+            stopThermalMonitoring()
+            synchronized(sessionLock) {
+                _currentSession.value = null
+                _state.value = DirectorState.DISABLED
+            }
+            resetCameraState()
+            applyConfig(config.copy(enabled = false))
+        }
         emitEvent(DirectorEvent.StateChanged(DirectorState.DISABLED))
         Timber.tag(TAG).i("AI Director disabled (inert)")
     }
@@ -118,173 +207,162 @@ class DirectorManager(
     fun isEnabled(): Boolean = _state.value != DirectorState.DISABLED
 
     /**
-     * Set camera controller for command execution
+     * Set camera controller for command execution; the shot mapper takes its capabilities
      */
     fun setCameraController(controller: CameraController?) {
         cameraController = controller
-        controller?.let {
-            // Update shot mapper with camera capabilities
-            // (In real implementation, get capabilities from controller)
-        }
+        refreshCapabilities()
     }
 
     /**
-     * Load and parse a script
+     * Load and parse a script. Refused while a script runs or is paused, and when the text
+     * holds no cues; a refused load keeps the previous script. The loaded script's errors
+     * list the parser's problems, scenes without cues and shots the camera can't do.
      */
     fun loadScript(scriptText: String): Result<ParsedScript> {
-        if (_state.value == DirectorState.DISABLED) {
-            return Result.failure(IllegalStateException("Director is disabled"))
-        }
-
-        _state.value = DirectorState.PARSING
-        emitEvent(DirectorEvent.StateChanged(DirectorState.PARSING))
-
-        return try {
-            val parsedScript = scriptParser.parseScript(scriptText)
-            val errors = scriptParser.getErrors()
-            val warnings = scriptParser.validateScript(parsedScript)
-
-            if (parsedScript.scenes.isEmpty() || parsedScript.totalCues == 0) {
-                _state.value = DirectorState.IDLE
-                return Result.failure(IllegalArgumentException("Script contains no valid scenes or cues"))
+        synchronized(controlLock) {
+            when (_state.value) {
+                DirectorState.DISABLED -> return Result.failure(IllegalStateException("The director is off"))
+                DirectorState.RUNNING, DirectorState.PAUSED ->
+                    return Result.failure(IllegalStateException("Stop the director before loading another script"))
+                else -> Unit
             }
 
-            // Validate against camera capabilities
-            val mappingIssues = shotMapper.validateMapping(parsedScript)
-            if (mappingIssues.isNotEmpty()) {
-                Timber.tag(TAG).w("Script mapping issues: $mappingIssues")
+            val parsed = try {
+                scriptParser.parseScript(scriptText)
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "Script parsing failed")
+                return Result.failure(IllegalArgumentException("Could not read the script: ${e.message}", e))
+            }
+            if (parsed.scenes.isEmpty() || parsed.totalCues == 0) {
+                val reason = (listOf("Script contains no valid scenes or cues") + parsed.errors).joinToString("; ")
+                return Result.failure(IllegalArgumentException(reason))
             }
 
-            // Create new session
-            _currentSession.value = DirectorSession(
-                script = parsedScript,
-                currentSceneIndex = 0,
-                currentCueIndex = 0,
-                state = DirectorState.READY
-            )
+            // Validate against what the camera can do now
+            refreshCapabilities()
+            val problems = parsed.errors + scriptParser.validateScript(parsed) +
+                shotMapper.validateMapping(parsed, firstLineNumber = 1)
+            val script = parsed.copy(errors = problems)
 
-            _state.value = DirectorState.READY
-            emitEvent(DirectorEvent.ScriptLoaded(parsedScript))
-            emitEvent(DirectorEvent.StateChanged(DirectorState.READY))
+            resetCameraState()
+            val newState = synchronized(sessionLock) {
+                _currentSession.value = DirectorSession(script = script, startTimeMs = System.currentTimeMillis())
+                // A thermal hold stays until the phone cools
+                if (_state.value != DirectorState.THERMAL_HOLD) _state.value = DirectorState.READY
+                _state.value
+            }
+            emitEvent(DirectorEvent.ScriptLoaded(script))
+            emitEvent(DirectorEvent.StateChanged(newState))
 
             Timber.tag(TAG).i(
-                "Script loaded: ${parsedScript.scenes.size} scenes, ${parsedScript.totalCues} cues, " +
-                        "est. duration: ${parsedScript.estimatedDurationFormatted}"
+                "Script loaded: ${script.scenes.size} scenes, ${script.totalCues} cues, " +
+                    "est. duration: ${script.estimatedDurationFormatted}, ${problems.size} problems"
             )
-
-            Result.success(parsedScript)
-        } catch (e: Exception) {
-            _state.value = DirectorState.IDLE
-            emitEvent(DirectorEvent.Error("Failed to parse script: ${e.message}"))
-            Timber.tag(TAG).e(e, "Script parsing failed")
-            Result.failure(e)
+            return Result.success(script)
         }
     }
 
     /**
-     * Start executing the loaded script
+     * Start executing the loaded script, or resume a paused one, from the current cue (from
+     * the next scene with cues when the current one has none). Refused without a script, in
+     * other states, and while the phone is too hot, which is read now: a thermal hold clears
+     * here when the phone has cooled enough.
      */
     fun startExecution(): Boolean {
-        val session = _currentSession.value ?: run {
-            emitEvent(DirectorEvent.Error("No script loaded"))
-            return false
+        synchronized(controlLock) {
+            if (_currentSession.value == null) return false
+            if (_state.value == DirectorState.THERMAL_HOLD && !leaveThermalHoldIfCool()) return false
+            val from = _state.value
+            if (from != DirectorState.READY && from != DirectorState.PAUSED) return false
+            refreshCapabilities()
+            if (!checkThermalState(fresh = true)) return false
+
+            synchronized(sessionLock) {
+                val session = _currentSession.value ?: return false
+                val start = runnablePosition(session)
+                if (start == null || _state.value != from) return false
+                _currentSession.value = session.copy(currentSceneIndex = start.scene, currentCueIndex = start.cue)
+                _state.value = DirectorState.RUNNING
+                emitEvent(DirectorEvent.StateChanged(DirectorState.RUNNING))
+                continueOrStartTake(session.script.scenes[start.scene])
+                startCueExecutionLoop()
+            }
         }
-
-        if (_state.value != DirectorState.READY && _state.value != DirectorState.PAUSED) {
-            emitEvent(DirectorEvent.Error("Cannot start: invalid state ${_state.value}"))
-            return false
-        }
-
-        // Check thermal state
-        if (!checkThermalState()) {
-            return false
-        }
-
-        _state.value = DirectorState.RUNNING
-        emitEvent(DirectorEvent.StateChanged(DirectorState.RUNNING))
-
-        // Start first take
-        val currentScene = session.currentScene
-        if (currentScene != null && config.autoTakeSeparation) {
-            val take = takeManager.startTake(currentScene.id, currentScene.label)
-            emitEvent(DirectorEvent.TakeStarted(take))
-        }
-
-        // Start cue execution loop
-        startCueExecutionLoop()
-
         Timber.tag(TAG).i("Script execution started")
         return true
     }
 
     /**
-     * Pause execution
+     * Pause execution: the run stops where it is, and its take stays open for resume
      */
     fun pauseExecution() {
-        if (_state.value == DirectorState.RUNNING) {
-            cueExecutionJob?.cancel()
-            _state.value = DirectorState.PAUSED
-            emitEvent(DirectorEvent.StateChanged(DirectorState.PAUSED))
-            Timber.tag(TAG).i("Execution paused")
+        synchronized(controlLock) {
+            if (_state.value != DirectorState.RUNNING) return
+            stopRunCoroutine()
+            synchronized(sessionLock) {
+                // A thermal hold may have come in meanwhile
+                if (_state.value != DirectorState.RUNNING) return
+                _state.value = DirectorState.PAUSED
+            }
         }
+        emitEvent(DirectorEvent.StateChanged(DirectorState.PAUSED))
+        Timber.tag(TAG).i("Execution paused")
     }
 
     /**
-     * Resume execution
+     * Resume a paused run (or one held for heat, once the phone has cooled)
      */
     fun resumeExecution(): Boolean {
-        if (_state.value == DirectorState.PAUSED) {
-            return startExecution()
-        }
-        return false
+        val current = _state.value
+        return if (current == DirectorState.PAUSED || current == DirectorState.THERMAL_HOLD) startExecution() else false
     }
 
     /**
-     * Stop execution and end current take
+     * Stop execution: a running or paused script stops, its take ends, and the position goes
+     * back to the first scene. A thermal hold stays until the phone cools.
      */
     fun stopExecution() {
-        cueExecutionJob?.cancel()
-        cueExecutionJob = null
-
-        // End current take
-        if (takeManager.isRecording()) {
-            val take = takeManager.endTake()
-            take?.let { emitEvent(DirectorEvent.TakeEnded(it)) }
+        val newState = synchronized(controlLock) {
+            stopRunAndWait()
+            resetShotMapper()
+            synchronized(sessionLock) {
+                rewindLocked()
+                when (_state.value) {
+                    DirectorState.RUNNING, DirectorState.PAUSED, DirectorState.PARSING ->
+                        _state.value = if (_currentSession.value != null) DirectorState.READY else DirectorState.IDLE
+                    else -> Unit
+                }
+                _state.value
+            }
         }
-
-        if (_state.value != DirectorState.DISABLED) {
-            _state.value = if (_currentSession.value != null) DirectorState.READY else DirectorState.IDLE
-            emitEvent(DirectorEvent.StateChanged(_state.value))
+        if (newState != DirectorState.DISABLED) {
+            emitEvent(DirectorEvent.StateChanged(newState))
         }
-
         Timber.tag(TAG).i("Execution stopped")
     }
 
     /**
-     * Execute a single cue manually
+     * Execute a single cue now, by hand: [BEAT] and [HOLD] succeed without waiting, [TAKE]
+     * starts the next take, and the other cues become a camera command. A cue run by hand
+     * counts in the take in progress, without timing.
      */
     fun executeCue(cue: DirectorCue): Boolean {
         if (_state.value == DirectorState.DISABLED) {
             return false
         }
+        refreshCapabilities()
 
-        val result = shotMapper.mapCue(cue)
-        if (!result.success || result.command == null) {
-            emitEvent(DirectorEvent.CueExecuted(cue, false))
-            return false
+        val success = when (cue.type) {
+            CueType.BEAT -> true
+            CueType.TAKE -> {
+                takeBoundary(generation = null)
+                true
+            }
+            else -> executeCameraCue(cue)
         }
-
-        val success = executeCommand(result.command)
         emitEvent(DirectorEvent.CueExecuted(cue, success))
-
-        if (takeManager.isRecording()) {
-            takeManager.recordCueExecution(
-                cueId = cue.id,
-                expectedTimeMs = System.currentTimeMillis(),
-                success = success
-            )
-        }
-
+        takeManager.recordCueExecution(cue.id, expectedTimeMs = null, success = success)
         return success
     }
 
@@ -297,82 +375,57 @@ class DirectorManager(
     }
 
     /**
-     * Advance to next cue
+     * Go to the next cue (the first cue of the next scene with cues, at the end of a scene).
+     * While a script runs, that cue runs at once, and going past the last cue ends the run;
+     * otherwise only the position moves. Returns the cue, or null when there is none.
      */
-    fun advanceCue(): DirectorCue? {
-        val session = _currentSession.value ?: return null
-        val currentScene = session.currentScene ?: return null
-
-        val nextCueIndex = session.currentCueIndex + 1
-        if (nextCueIndex < currentScene.cues.size) {
-            _currentSession.value = session.copy(currentCueIndex = nextCueIndex)
-            return currentScene.cues[nextCueIndex]
-        } else {
-            // Move to next scene
-            return advanceScene()?.cues?.firstOrNull()
-        }
-    }
-
-    /**
-     * Advance to next scene
-     */
-    fun advanceScene(): DirectorScene? {
-        val session = _currentSession.value ?: return null
-
-        // End current take
-        if (config.autoTakeSeparation && takeManager.isRecording()) {
-            val take = takeManager.endTake()
-            take?.let { emitEvent(DirectorEvent.TakeEnded(it)) }
-        }
-
-        val nextSceneIndex = session.currentSceneIndex + 1
-        if (nextSceneIndex < session.script.scenes.size) {
-            val nextScene = session.script.scenes[nextSceneIndex]
-            _currentSession.value = session.copy(
-                currentSceneIndex = nextSceneIndex,
-                currentCueIndex = 0
-            )
-
-            // Start new take for new scene
-            if (config.autoTakeSeparation && _state.value == DirectorState.RUNNING) {
-                val take = takeManager.startTake(nextScene.id, nextScene.label)
-                emitEvent(DirectorEvent.TakeStarted(take))
+    fun nextCue(): DirectorCue? {
+        synchronized(controlLock) {
+            val running = _state.value == DirectorState.RUNNING
+            if (running) stopRunCoroutine()
+            synchronized(sessionLock) {
+                val session = _currentSession.value ?: return null
+                // A thermal hold may have come in while the run stopped
+                val stillRunning = running && _state.value == DirectorState.RUNNING
+                val next = positionAfter(session)
+                if (next == null) {
+                    if (stillRunning) completeRun(generation = null)
+                    return null
+                }
+                moveToLocked(session, next, running = stillRunning)
+                if (stillRunning) startCueExecutionLoop()
+                return session.script.scenes[next.scene].cues[next.cue]
             }
-
-            return nextScene
         }
-
-        // No more scenes
-        stopExecution()
-        return null
     }
 
     /**
-     * Jump to specific scene
+     * Go to the start of scene [index]. While a script runs, a new take starts and that
+     * scene's first cue (or the next scene's, when it has none) runs at once; otherwise
+     * only the position moves. False when the loaded script has no such scene.
      */
-    fun jumpToScene(sceneIndex: Int): Boolean {
-        val session = _currentSession.value ?: return false
-        if (sceneIndex < 0 || sceneIndex >= session.script.scenes.size) return false
-
-        // End current take if recording
-        if (config.autoTakeSeparation && takeManager.isRecording()) {
-            val take = takeManager.endTake()
-            take?.let { emitEvent(DirectorEvent.TakeEnded(it)) }
+    fun goToScene(index: Int): Boolean {
+        synchronized(controlLock) {
+            val scenes = _currentSession.value?.script?.scenes ?: return false
+            if (index !in scenes.indices) return false
+            val running = _state.value == DirectorState.RUNNING
+            if (running) stopRunCoroutine()
+            synchronized(sessionLock) {
+                val session = _currentSession.value ?: return false
+                if (!(running && _state.value == DirectorState.RUNNING)) {
+                    moveToLocked(session, Position(index, 0), running = false, newTake = true)
+                } else {
+                    val scene = firstSceneWithCues(session.script, index)
+                    if (scene == null) {
+                        completeRun(generation = null)
+                    } else {
+                        moveToLocked(session, Position(scene, 0), running = true, newTake = true)
+                        startCueExecutionLoop()
+                    }
+                }
+            }
         }
-
-        _currentSession.value = session.copy(
-            currentSceneIndex = sceneIndex,
-            currentCueIndex = 0
-        )
-
-        // Start new take
-        val scene = session.script.scenes[sceneIndex]
-        if (config.autoTakeSeparation && _state.value == DirectorState.RUNNING) {
-            val take = takeManager.startTake(scene.id, scene.label)
-            emitEvent(DirectorEvent.TakeStarted(take))
-        }
-
-        Timber.tag(TAG).d("Jumped to scene $sceneIndex: ${scene.label}")
+        Timber.tag(TAG).d("Jumped to scene $index")
         return true
     }
 
@@ -413,19 +466,40 @@ class DirectorManager(
     }
 
     /**
-     * Update configuration
+     * Update configuration: saved, passed on to the parser, mapper and take manager, and the
+     * thermal monitor starts or stops with enabled and thermalAutoDisable
      */
     fun updateConfig(newConfig: DirectorConfig) {
-        val wasEnabled = config.enabled
-        config = newConfig
-        configStore.saveConfig(config)
-
-        if (!wasEnabled && config.enabled) {
-            enable()
-        } else if (wasEnabled && !config.enabled) {
-            disable()
+        synchronized(controlLock) {
+            val wasEnabled = isEnabled()
+            applyConfig(newConfig)
+            when {
+                newConfig.enabled && !wasEnabled -> enable()
+                !newConfig.enabled && wasEnabled -> disable()
+                newConfig.enabled -> {
+                    // Without thermal protection nothing would clear a hold
+                    if (!newConfig.thermalAutoDisable) leaveThermalHold()
+                    startThermalMonitoring()
+                }
+                else -> Unit
+            }
         }
     }
+
+    /**
+     * The configuration in force
+     */
+    fun getConfig(): DirectorConfig = config
+
+    /**
+     * The temperature (°C) read at the last thermal check, or null before the first
+     */
+    fun lastTemperature(): Int? = lastTemperatureC
+
+    /**
+     * A thermal hold clears once the phone is below this temperature (°C)
+     */
+    fun thermalResumeTemperature(): Int = config.thermalThresholdDisable - THERMAL_RESUME_MARGIN_C
 
     /**
      * Get take manager for direct access
@@ -445,54 +519,122 @@ class DirectorManager(
     fun recordMotionSample(shakiness: Float) = takeManager.recordMotionSample(shakiness)
     fun recordAudioSample(level: Float) = takeManager.recordAudioSample(level)
 
+    /**
+     * Get session duration in seconds: the time since the script was loaded, 0 without one
+     */
+    fun getSessionDuration(): Long {
+        val session = _currentSession.value ?: return 0
+        if (session.startTimeMs == 0L) return 0
+        return (System.currentTimeMillis() - session.startTimeMs) / 1000
+    }
+
+    /**
+     * Unload the script: a run stops and its take ends. Recorded takes stay.
+     */
+    fun clearScript() {
+        val newState = synchronized(controlLock) {
+            stopRunAndWait()
+            resetCameraState()
+            synchronized(sessionLock) {
+                _currentSession.value = null
+                // A thermal hold stays until the phone cools
+                if (_state.value != DirectorState.DISABLED && _state.value != DirectorState.THERMAL_HOLD) {
+                    _state.value = DirectorState.IDLE
+                }
+                _state.value
+            }
+        }
+        if (newState != DirectorState.DISABLED) {
+            emitEvent(DirectorEvent.StateChanged(newState))
+        }
+        Timber.tag(TAG).i("Script cleared")
+    }
+
+    /**
+     * Release the director when its service goes away: a run stops (its take ends) and the
+     * monitoring ends. The saved settings stay as they are, enabled included.
+     */
+    fun destroy() {
+        cancelRun()
+        endCurrentTake()
+        stopThermalMonitoring()
+        scope.cancel()
+        Timber.tag(TAG).i("Director released")
+    }
+
     // Private implementation
 
+    /**
+     * Runs the script from the current cue in a new coroutine. Call it holding
+     * [sessionLock], with the state RUNNING.
+     */
     private fun startCueExecutionLoop() {
+        val generation = ++runGeneration
+        cueExecutionJob?.cancel()
         cueExecutionJob = scope.launch {
+            // When each cue is meant to run: the start plus the waits before it
+            var expectedAtMs = System.currentTimeMillis()
             while (isActive && _state.value == DirectorState.RUNNING) {
-                val session = _currentSession.value ?: break
-                val cue = session.currentCue
-
-                if (cue != null) {
-                    // Execute current cue
-                    val result = shotMapper.mapCue(cue)
-                    val success = if (result.success && result.command != null) {
-                        executeCommand(result.command)
-                    } else false
-
-                    emitEvent(DirectorEvent.CueExecuted(cue, success))
-                    takeManager.recordCueExecution(cue.id, System.currentTimeMillis(), success)
-
-                    // Wait for cue duration
-                    val waitTime = when (cue.type) {
-                        CueType.TRANSITION -> cue.transitionDurationMs
-                        CueType.BEAT -> if (cue.holdDurationMs > 0) cue.holdDurationMs else config.defaultHoldDurationMs
-                        else -> 0L
-                    }
-
-                    if (waitTime > 0) {
-                        delay(waitTime)
-                    }
-
-                    // Advance to next cue
-                    advanceCue() ?: break
-                } else {
-                    // No more cues, try next scene
-                    if (advanceScene() == null) break
+                val cue = _currentSession.value?.currentCue
+                if (cue == null) {
+                    completeRun(generation)
+                    break
                 }
-
-                // Check thermal periodically
-                checkThermalState()
-            }
-
-            // Execution complete
-            if (_state.value == DirectorState.RUNNING) {
-                stopExecution()
-                Timber.tag(TAG).i("Script execution complete")
+                val waitMs = runCue(cue, expectedAtMs, generation)
+                if (waitMs > 0) {
+                    delay(waitMs)
+                }
+                expectedAtMs += waitMs
+                // A run stopped during the cue must not move the session
+                ensureActive()
+                if (!checkThermalState(fresh = false)) break
+                if (!advanceRun(generation)) {
+                    completeRun(generation)
+                    break
+                }
             }
         }
     }
 
+    /**
+     * Runs one cue of a script and returns how long the script then waits, in ms. Only a
+     * camera cue that could not be mapped or run counts as failed.
+     */
+    private fun runCue(cue: DirectorCue, expectedAtMs: Long, generation: Int): Long {
+        val success = when (cue.type) {
+            CueType.BEAT -> true
+            CueType.TAKE -> {
+                takeBoundary(generation)
+                true
+            }
+            else -> executeCameraCue(cue)
+        }
+        emitEvent(DirectorEvent.CueExecuted(cue, success))
+        takeManager.recordCueExecution(cue.id, expectedAtMs, success)
+
+        return when (cue.type) {
+            CueType.TRANSITION -> cue.transitionDurationMs
+            CueType.BEAT -> if (cue.holdDurationMs > 0) cue.holdDurationMs else config.defaultHoldDurationMs
+            else -> 0L
+        }
+    }
+
+    /**
+     * Maps a camera cue to a command and runs it; false when the cue can't be mapped or the
+     * camera call failed
+     */
+    private fun executeCameraCue(cue: DirectorCue): Boolean = synchronized(cameraLock) {
+        val result = shotMapper.mapCue(cue)
+        val command = result.command
+        if (result.success && command != null) {
+            executeCommand(command)
+        } else {
+            Timber.tag(TAG).w("Cue not mapped: ${cue.rawText} ${result.warnings}")
+            false
+        }
+    }
+
+    /** Runs a camera command (holding [cameraLock]); the exposure preset only when it changed. */
     private fun executeCommand(command: ShotMapper.CameraCommand): Boolean {
         val controller = cameraController ?: run {
             Timber.tag(TAG).w("No camera controller set, command not executed")
@@ -504,17 +646,18 @@ class DirectorManager(
             controller.switchLens(command.lens)
 
             // Execute zoom
-            val animated = command.transitionType in listOf(
-                TransitionType.PUSH_IN,
-                TransitionType.PULL_BACK
-            )
+            val animated = command.transitionType == TransitionType.PUSH_IN ||
+                command.transitionType == TransitionType.PULL_BACK
             controller.setZoom(command.zoomLevel, animated, command.transitionDurationMs)
 
             // Set focus mode
             controller.setFocusMode(command.focusMode)
 
-            // Set exposure preset
-            controller.setExposurePreset(command.exposurePreset)
+            // Set exposure preset, when a cue changed it
+            if (command.exposurePreset != lastAppliedExposure) {
+                controller.setExposurePreset(command.exposurePreset)
+                lastAppliedExposure = command.exposurePreset
+            }
 
             Timber.tag(TAG).d("Executed command: ${command.notes}")
             true
@@ -524,40 +667,241 @@ class DirectorManager(
         }
     }
 
-    private fun checkThermalState(): Boolean {
-        if (!config.thermalAutoDisable) return true
-
-        val now = System.currentTimeMillis()
-        if (now - lastThermalCheck < 5000) return _state.value != DirectorState.THERMAL_HOLD
-        lastThermalCheck = now
-
-        val temp = cameraController?.getCurrentTemperature() ?: return true
-
-        when {
-            temp >= config.thermalThresholdDisable -> {
-                Timber.tag(TAG).w("Thermal threshold exceeded ($temp°C), disabling director")
-                _state.value = DirectorState.THERMAL_HOLD
-                stopExecution()
-                emitEvent(DirectorEvent.ThermalWarning(temp, "Director disabled due to high temperature"))
-                emitEvent(DirectorEvent.StateChanged(DirectorState.THERMAL_HOLD))
-                return false
-            }
-            temp >= config.thermalThresholdInference && config.inferenceMode == InferenceMode.REMOTE -> {
-                Timber.tag(TAG).w("Thermal warning ($temp°C), disabling remote inference")
-                emitEvent(DirectorEvent.ThermalWarning(temp, "Remote inference disabled due to temperature"))
-            }
+    /**
+     * A [TAKE] cue: the take in progress ends and the next one starts, for the current
+     * scene. [generation] is the run's (null for a cue run by hand).
+     */
+    private fun takeBoundary(generation: Int?) {
+        synchronized(sessionLock) {
+            if (generation != null && generation != runGeneration) return
+            endCurrentTake()
+            _currentSession.value?.currentScene?.let { startTakeFor(it) }
         }
-
-        return true
     }
 
+    /**
+     * Moves a run to its next cue, past scenes without cues (with one take boundary).
+     * False at the end of the script, or when the run was stopped meanwhile.
+     */
+    private fun advanceRun(generation: Int): Boolean = synchronized(sessionLock) {
+        if (generation != runGeneration || _state.value != DirectorState.RUNNING) return false
+        val session = _currentSession.value ?: return false
+        val next = positionAfter(session) ?: return false
+        moveToLocked(session, next, running = true)
+        true
+    }
+
+    /**
+     * Ends a run that went past its last cue: the take ends, the position goes back to the
+     * first scene and the state to READY. [generation] is the run's; null when the caller
+     * already stopped the run's coroutine.
+     */
+    private fun completeRun(generation: Int?) {
+        val newState = synchronized(sessionLock) {
+            if (generation != null && generation != runGeneration) return
+            if (_state.value != DirectorState.RUNNING) return
+            runGeneration++
+            endCurrentTake()
+            rewindLocked()
+            resetShotMapper()
+            val done = if (_currentSession.value != null) DirectorState.READY else DirectorState.IDLE
+            _state.value = done
+            done
+        }
+        emitEvent(DirectorEvent.StateChanged(newState))
+        Timber.tag(TAG).i("Script execution complete")
+    }
+
+    /**
+     * Sets the position (holding [sessionLock]). Entering another scene, or [newTake], ends
+     * the take in progress and, when [running], starts the scene's take.
+     */
+    private fun moveToLocked(session: DirectorSession, target: Position, running: Boolean, newTake: Boolean = false) {
+        _currentSession.value = session.copy(currentSceneIndex = target.scene, currentCueIndex = target.cue)
+        if (config.autoTakeSeparation && (newTake || target.scene != session.currentSceneIndex)) {
+            endCurrentTake()
+            if (running) startTakeFor(session.script.scenes[target.scene])
+        }
+    }
+
+    /** Back to the first cue of the first scene (holding [sessionLock]). */
+    private fun rewindLocked() {
+        _currentSession.value = _currentSession.value?.copy(currentSceneIndex = 0, currentCueIndex = 0)
+    }
+
+    /** The cue after the current one: the next in the scene, else the first of the next scene with cues; null at the end. */
+    private fun positionAfter(session: DirectorSession): Position? {
+        val scene = session.currentSceneIndex
+        val cuesInScene = session.script.scenes.getOrNull(scene)?.cues?.size ?: 0
+        if (session.currentCueIndex + 1 < cuesInScene) {
+            return Position(scene, session.currentCueIndex + 1)
+        }
+        return firstSceneWithCues(session.script, scene + 1)?.let { Position(it, 0) }
+    }
+
+    /** Where a run starts: the current cue, else the next scene with cues (from the top when none is left). */
+    private fun runnablePosition(session: DirectorSession): Position? {
+        if (session.currentCue != null) {
+            return Position(session.currentSceneIndex, session.currentCueIndex)
+        }
+        val scene = firstSceneWithCues(session.script, session.currentSceneIndex)
+            ?: firstSceneWithCues(session.script, 0)
+            ?: return null
+        return Position(scene, 0)
+    }
+
+    /** The index of the first scene from [from] on that has cues. */
+    private fun firstSceneWithCues(script: ParsedScript, from: Int): Int? =
+        (from.coerceAtLeast(0) until script.scenes.size).firstOrNull { script.scenes[it].cues.isNotEmpty() }
+
+    /** A run's take: the paused take of this scene continues; otherwise the next one starts. */
+    private fun continueOrStartTake(scene: DirectorScene) {
+        if (!config.autoTakeSeparation) return
+        if (takeManager.currentTake.value?.sceneId == scene.id) return
+        endCurrentTake()
+        startTakeFor(scene)
+    }
+
+    private fun startTakeFor(scene: DirectorScene) {
+        emitEvent(DirectorEvent.TakeStarted(takeManager.startTake(scene.id, scene.label)))
+    }
+
+    /** Ends the take in progress, if any, and announces it. */
+    private fun endCurrentTake() {
+        takeManager.endTake()?.let { emitEvent(DirectorEvent.TakeEnded(it)) }
+    }
+
+    /** Cancels the script's coroutine without waiting for it; that run can no longer move the session. */
+    private fun cancelRun(): Job? {
+        val job = synchronized(sessionLock) {
+            runGeneration++
+            cueExecutionJob.also { cueExecutionJob = null }
+        }
+        job?.cancel()
+        return job
+    }
+
+    /**
+     * Cancels the script's coroutine and waits until it has finished its current cue. Only
+     * for callers outside that coroutine (HTTP threads), never while holding [sessionLock].
+     */
+    private fun stopRunCoroutine() {
+        cancelRun()?.let { job -> runBlocking { job.join() } }
+    }
+
+    /** [stopRunCoroutine], then the take in progress ends. */
+    private fun stopRunAndWait() {
+        stopRunCoroutine()
+        endCurrentTake()
+    }
+
+    private fun resetShotMapper() {
+        synchronized(cameraLock) {
+            shotMapper.reset()
+        }
+    }
+
+    /** Forgets what the director set on the camera: the mapper starts afresh and exposure counts as AUTO. */
+    private fun resetCameraState() {
+        synchronized(cameraLock) {
+            shotMapper.reset()
+            lastAppliedExposure = ExposurePreset.AUTO
+        }
+    }
+
+    private fun refreshCapabilities() {
+        val capabilities = try {
+            cameraController?.getCapabilities()
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Could not read the camera's capabilities")
+            null
+        }
+        capabilities?.let { shotMapper.updateCapabilities(it) }
+    }
+
+    private fun applyConfig(newConfig: DirectorConfig) {
+        config = newConfig
+        scriptParser.config = newConfig
+        shotMapper.config = newConfig
+        takeManager.config = newConfig
+        persistence.saveConfig(newConfig)
+    }
+
+    /**
+     * Reads the temperature (now when [fresh], else at most every few seconds) and stops a
+     * run in a thermal hold when it reached the disable threshold. False while held.
+     */
+    private fun checkThermalState(fresh: Boolean): Boolean {
+        if (!config.thermalAutoDisable) return true
+        if (_state.value == DirectorState.THERMAL_HOLD) return false
+        if (!fresh && System.currentTimeMillis() - lastThermalCheckMs < THERMAL_CHECK_INTERVAL_MS) return true
+
+        val temp = readTemperature() ?: return true
+        if (temp < config.thermalThresholdDisable) return true
+        enterThermalHold(temp)
+        return false
+    }
+
+    private fun readTemperature(): Int? {
+        val controller = cameraController ?: return null
+        val temp = try {
+            controller.getCurrentTemperature()
+        } catch (e: Exception) {
+            Timber.tag(TAG).w(e, "Could not read the temperature")
+            return null
+        }
+        lastTemperatureC = temp
+        lastThermalCheckMs = System.currentTimeMillis()
+        return temp
+    }
+
+    /**
+     * Stops in THERMAL_HOLD: a run stops where it is (its take ends) without waiting, as
+     * this may be the run's own coroutine. Announced once, when the hold begins.
+     */
+    private fun enterThermalHold(temp: Int) {
+        synchronized(sessionLock) {
+            val current = _state.value
+            if (current == DirectorState.THERMAL_HOLD || current == DirectorState.DISABLED) return
+            _state.value = DirectorState.THERMAL_HOLD
+        }
+        cancelRun()
+        endCurrentTake()
+        Timber.tag(TAG).w("Thermal threshold reached ($temp°C): director held until below ${thermalResumeTemperature()}°C")
+        emitEvent(
+            DirectorEvent.ThermalWarning(temp, "Stopped until the phone cools below ${thermalResumeTemperature()}°C")
+        )
+        emitEvent(DirectorEvent.StateChanged(DirectorState.THERMAL_HOLD))
+    }
+
+    /** Leaves a thermal hold for READY (or IDLE without a script); nothing resumes by itself. */
+    private fun leaveThermalHold() {
+        val newState = synchronized(sessionLock) {
+            if (_state.value != DirectorState.THERMAL_HOLD) return
+            val cooled = if (_currentSession.value != null) DirectorState.READY else DirectorState.IDLE
+            _state.value = cooled
+            cooled
+        }
+        Timber.tag(TAG).i("Thermal hold cleared at ${lastTemperatureC}°C")
+        emitEvent(DirectorEvent.StateChanged(newState))
+    }
+
+    /** In a thermal hold: reads the temperature now and leaves the hold when the phone has cooled. False while still too hot. */
+    private fun leaveThermalHoldIfCool(): Boolean {
+        val temp = readTemperature()
+        val cool = !config.thermalAutoDisable || (temp != null && temp < thermalResumeTemperature())
+        if (cool) leaveThermalHold()
+        return cool
+    }
+
+    /** Starts (or restarts) the thermal monitor, when thermal protection is on. */
     private fun startThermalMonitoring() {
-        if (config.thermalAutoDisable) {
-            thermalCheckJob = scope.launch {
-                while (isActive) {
-                    checkThermalState()
-                    delay(10_000) // Check every 10 seconds
-                }
+        stopThermalMonitoring()
+        if (!config.thermalAutoDisable) return
+        thermalCheckJob = scope.launch {
+            while (isActive) {
+                monitorTemperature()
+                delay(thermalMonitorIntervalMs)
             }
         }
     }
@@ -567,38 +911,22 @@ class DirectorManager(
         thermalCheckJob = null
     }
 
+    /**
+     * One monitor check: a hot run stops in a thermal hold, and a hold clears once the phone
+     * has cooled. A director that isn't running reads nothing.
+     */
+    private fun monitorTemperature() {
+        when (_state.value) {
+            DirectorState.RUNNING -> checkThermalState(fresh = true)
+            DirectorState.THERMAL_HOLD -> {
+                val temp = readTemperature() ?: return
+                if (temp < thermalResumeTemperature()) leaveThermalHold()
+            }
+            else -> Unit
+        }
+    }
+
     private fun emitEvent(event: DirectorEvent) {
-        scope.launch {
-            _events.emit(event)
-        }
-    }
-
-    /**
-     * Get session duration in seconds
-     */
-    fun getSessionDuration(): Long {
-        val session = _currentSession.value ?: return 0
-        return (System.currentTimeMillis() - session.startTimeMs) / 1000
-    }
-
-    /**
-     * Clear loaded script and reset session
-     */
-    fun clearScript() {
-        stopExecution()
-        _currentSession.value = null
-        if (_state.value != DirectorState.DISABLED) {
-            _state.value = DirectorState.IDLE
-            emitEvent(DirectorEvent.StateChanged(DirectorState.IDLE))
-        }
-        Timber.tag(TAG).i("Script cleared")
-    }
-
-    /**
-     * Clean up resources
-     */
-    fun destroy() {
-        disable()
-        scope.cancel()
+        _events.tryEmit(event)
     }
 }

@@ -43,6 +43,9 @@ class StreamApiHandler {
 
     var cameraService: CameraService? = null
 
+    /** Held while POST /api/recording/start checks for an open recording and starts one. */
+    private val recordingStartLock = Any()
+
     /**
      * Handle request if URI matches. Returns null for unhandled URIs.
      */
@@ -334,11 +337,12 @@ class StreamApiHandler {
     /**
      * POST /api/recording/start. While a recording is open (running or
      * paused) it is left as it is and the reply says so, so a double click or
-     * a retry does no harm.
+     * a retry does no harm. Starts run one at a time: a second one waits for
+     * the first and then finds its recording open, instead of reaching the
+     * camera service while the first is still starting the encoder.
      */
     private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
-        if (camera.isRecording() || camera.isRecordingPaused()) return alreadyRecording(camera)
 
         val segmentMinutes = body?.optInt("segmentMinutes", 5) ?: 5
 
@@ -352,8 +356,12 @@ class StreamApiHandler {
             else -> SegmentDuration.FIVE_MINUTES
         }
 
-        val success = camera.startRecording(encoderConfigFrom(body), segmentDuration)
-        // A start that lost a race with another one finds that recording open
+        val success = synchronized(recordingStartLock) {
+            if (camera.isRecording() || camera.isRecordingPaused()) return alreadyRecording(camera)
+            camera.startRecording(encoderConfigFrom(body), segmentDuration)
+        }
+        // A start that lost a race with one from elsewhere (the phone, kiosk
+        // auto-start) finds that recording open
         if (!success && (camera.isRecording() || camera.isRecordingPaused())) return alreadyRecording(camera)
 
         val json = JSONObject().apply {

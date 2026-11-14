@@ -13,16 +13,22 @@ import java.util.regex.Pattern
  * - [TRANSITION: PUSH IN|PULL BACK] - {duration}
  * - [FOCUS: FACE|HANDS|OBJECT|BACKGROUND]
  * - [EXPOSURE: AUTO|BRIGHT|DARK|BACKLIT]
- * - [DOF: SHALLOW|DEEP|AUTO]
  * - [BEAT] or [HOLD: {seconds}]
  * - [TAKE: {number}]
  * - [CUT TO: shot]
+ *
+ * One cue per line. [parseScript] reports what it could not use in [ParsedScript.errors]:
+ * bracketed lines that are not cues, unknown shot names (which become MEDIUM) and lines
+ * with more than one cue (only the first is used). Lines of plain prose are narration.
  */
 class ScriptParser(
-    private val config: DirectorConfig = DirectorConfig.DEFAULT
+    config: DirectorConfig = DirectorConfig.DEFAULT
 ) {
     companion object {
         private const val TAG = "ScriptParser"
+
+        /** At most this many problems are listed one by one; the rest are counted. */
+        private const val MAX_LISTED_PROBLEMS = 10
 
         // Regex patterns for cue detection
         private val SCENE_PATTERN = Pattern.compile(
@@ -30,8 +36,9 @@ class ScriptParser(
             Pattern.CASE_INSENSITIVE
         )
 
+        // Any shot name: unknown ones are reported and become MEDIUM
         private val SHOT_PATTERN = Pattern.compile(
-            """\[SHOT[:\s]+(ESTABLISHING|WIDE|FULL[_\s]?SHOT|MEDIUM[_\s]?CLOSE|MEDIUM|CLOSE[_\s]?UP|EXTREME[_\s]?CLOSE[_\s]?UP|ECU|OVER[_\s]?SHOULDER|OTS)\]""",
+            """\[SHOT[:\s]+([^\]\s][^\]]*?)\s*\]""",
             Pattern.CASE_INSENSITIVE
         )
 
@@ -50,11 +57,6 @@ class ScriptParser(
             Pattern.CASE_INSENSITIVE
         )
 
-        private val DOF_PATTERN = Pattern.compile(
-            """\[DOF[:\s]+(SHALLOW|DEEP|AUTO)\]""",
-            Pattern.CASE_INSENSITIVE
-        )
-
         private val BEAT_PATTERN = Pattern.compile(
             """\[BEAT\]|\[HOLD[:\s]+(\d+(?:\.\d+)?)\s*s?\]""",
             Pattern.CASE_INSENSITIVE
@@ -69,6 +71,14 @@ class ScriptParser(
             """\[CUT\s+TO[:\s]+(WIDE|MEDIUM|CLOSE[_\s]?UP|ESTABLISHING|.+?)\]""",
             Pattern.CASE_INSENSITIVE
         )
+
+        /** The patterns of the cue types, for counting the cues on a line. */
+        private val CUE_PATTERNS = listOf(
+            SHOT_PATTERN, TRANSITION_PATTERN, FOCUS_PATTERN, EXPOSURE_PATTERN, BEAT_PATTERN, TAKE_PATTERN, CUT_TO_PATTERN
+        )
+
+        /** One bracketed part of a line, such as "[SHOT: WIDE]". */
+        private val BRACKETED = Pattern.compile("""\[[^\[\]]*\]""")
 
         // Shorthand patterns for natural language
         private val WIDE_SHOT_NATURAL = Pattern.compile(
@@ -87,14 +97,22 @@ class ScriptParser(
         )
     }
 
-    private val errors = mutableListOf<String>()
+    /**
+     * The settings in force (default transition and hold durations). [DirectorManager]
+     * replaces them when the director's configuration changes.
+     */
+    @Volatile
+    internal var config: DirectorConfig = config
+
+    /** The problems found by the last [parseScript]. */
+    @Volatile
+    private var lastErrors: List<String> = emptyList()
 
     /**
      * Parse a complete script into scenes and cues
      */
     fun parseScript(script: String): ParsedScript {
-        errors.clear()
-
+        val problems = ProblemList()
         val lines = script.lines()
         val scenes = mutableListOf<DirectorScene>()
         var currentScene: DirectorScene? = null
@@ -138,6 +156,7 @@ class ScriptParser(
 
             // Parse cues from the line
             val cues = parseCuesFromLine(trimmedLine, lineNumber)
+            lineProblems(trimmedLine, lineNumber, cues).forEach(problems::add)
             currentCues.addAll(cues)
             totalCues += cues.size
 
@@ -170,14 +189,16 @@ class ScriptParser(
             ))
         }
 
-        Timber.tag(TAG).i("Parsed script: ${scenes.size} scenes, $totalCues cues")
+        val errors = problems.toList()
+        lastErrors = errors
+        Timber.tag(TAG).i("Parsed script: ${scenes.size} scenes, $totalCues cues, ${errors.size} problems")
 
         return ParsedScript(
             rawScript = script,
             scenes = scenes,
             totalCues = totalCues,
             estimatedDurationMs = estimatedDurationMs,
-            errors = errors.toList()
+            errors = errors
         )
     }
 
@@ -205,8 +226,7 @@ class ScriptParser(
         // SHOT cue
         val shotMatcher = SHOT_PATTERN.matcher(line)
         if (shotMatcher.find()) {
-            val shotTypeStr = shotMatcher.group(1)?.uppercase()?.replace(" ", "_")?.replace("-", "_") ?: ""
-            val shotType = parseShotType(shotTypeStr)
+            val shotType = shotTypeOrNull(normalizeShotName(shotMatcher.group(1) ?: "")) ?: ShotType.MEDIUM
             return DirectorCue(
                 type = CueType.SHOT,
                 rawText = line,
@@ -288,8 +308,7 @@ class ScriptParser(
         // CUT TO cue
         val cutMatcher = CUT_TO_PATTERN.matcher(line)
         if (cutMatcher.find()) {
-            val targetShot = cutMatcher.group(1)?.uppercase()?.replace(" ", "_") ?: "WIDE"
-            val shotType = parseShotType(targetShot)
+            val shotType = shotTypeOrNull(normalizeShotName(cutMatcher.group(1) ?: "")) ?: ShotType.MEDIUM
             return DirectorCue(
                 type = CueType.CUT,
                 rawText = line,
@@ -344,9 +363,55 @@ class ScriptParser(
     }
 
     /**
-     * Parse shot type string to enum
+     * The problems with one script line, numbered from 1 as an editor shows them: a
+     * bracketed line that is not a cue, an unknown shot name, or more than one cue.
      */
-    private fun parseShotType(str: String): ShotType {
+    private fun lineProblems(line: String, lineNumber: Int, cues: List<DirectorCue>): List<String> {
+        val shownLine = lineNumber + 1
+        val cue = cues.firstOrNull()
+            ?: return if (line.startsWith("[")) listOf("Line $shownLine: not a cue: $line") else emptyList()
+        val problems = mutableListOf<String>()
+        unknownShotName(line, cue)?.let { problems.add("Line $shownLine: unknown shot $it, using MEDIUM") }
+        if (explicitCueCount(line) > 1) {
+            problems.add("Line $shownLine: only the first cue on a line is used")
+        }
+        return problems
+    }
+
+    /** The shot name a [SHOT] or [CUT TO] cue on [line] asked for, when the director doesn't know it. */
+    private fun unknownShotName(line: String, cue: DirectorCue): String? {
+        val pattern = when (cue.type) {
+            CueType.SHOT -> SHOT_PATTERN
+            CueType.CUT -> CUT_TO_PATTERN
+            else -> return null
+        }
+        val matcher = pattern.matcher(line)
+        // A shot found in plain words has no bracketed name
+        if (!matcher.find()) return null
+        val name = matcher.group(1)?.trim() ?: return null
+        if (shotTypeOrNull(normalizeShotName(name)) != null) return null
+        return name.ifEmpty { "(none)" }
+    }
+
+    /** How many bracketed cues [line] holds. */
+    private fun explicitCueCount(line: String): Int {
+        val matcher = BRACKETED.matcher(line)
+        var count = 0
+        while (matcher.find()) {
+            val part = matcher.group()
+            if (CUE_PATTERNS.any { it.matcher(part).find() }) count++
+        }
+        return count
+    }
+
+    /** A shot name as [shotTypeOrNull] reads it: upper case, with underscores for spaces and hyphens. */
+    private fun normalizeShotName(name: String): String =
+        name.trim().uppercase().replace(" ", "_").replace("-", "_")
+
+    /**
+     * Parse shot type string to enum; null for a name the director doesn't know
+     */
+    private fun shotTypeOrNull(str: String): ShotType? {
         return when {
             str.contains("ESTABLISHING") -> ShotType.ESTABLISHING
             str.contains("EXTREME") || str == "ECU" -> ShotType.EXTREME_CLOSE
@@ -356,7 +421,7 @@ class ScriptParser(
             str.contains("FULL") -> ShotType.FULL_SHOT
             str.contains("OVER") || str == "OTS" -> ShotType.OVER_SHOULDER
             str.contains("WIDE") -> ShotType.WIDE
-            else -> ShotType.MEDIUM
+            else -> null
         }
     }
 
@@ -445,5 +510,21 @@ class ScriptParser(
     /**
      * Get parsing errors from last parse operation
      */
-    fun getErrors(): List<String> = errors.toList()
+    fun getErrors(): List<String> = lastErrors
+
+    /** Problems of one parse: the first [MAX_LISTED_PROBLEMS] are listed, the rest counted. */
+    private class ProblemList {
+        private val listed = mutableListOf<String>()
+        private var unlisted = 0
+
+        fun add(problem: String) {
+            if (listed.size < MAX_LISTED_PROBLEMS) listed.add(problem) else unlisted++
+        }
+
+        fun toList(): List<String> = when (unlisted) {
+            0 -> listed.toList()
+            1 -> listed + "1 more problem not listed"
+            else -> listed + "$unlisted more problems not listed"
+        }
+    }
 }

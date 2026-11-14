@@ -1822,4 +1822,42 @@ class ShotMapperTest {
         assertEquals(24f, ShotMapper.MAIN_FOCAL_LENGTH, 0.001f)
         assertEquals(70f, ShotMapper.TELEPHOTO_FOCAL_LENGTH, 0.001f)
     }
+
+    // ========================================================================
+    // Exposure carried by shots and cuts
+    // ========================================================================
+
+    @Test
+    fun `EXPOSURE BACKLIT then SHOT CLOSE_UP keeps BACKLIT`() {
+        mapper.mapCue(exposureCue(ExposurePreset.BACKLIT))
+
+        val result = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
+
+        assertTrue(result.success)
+        assertEquals(ExposurePreset.BACKLIT, result.command!!.exposurePreset)
+    }
+
+    @Test
+    fun `EXPOSURE DARK then CUT TO WIDE keeps DARK`() {
+        mapper.mapCue(shotCue(ShotType.MEDIUM))
+        mapper.mapCue(exposureCue(ExposurePreset.DARK))
+
+        val result = mapper.mapCue(cutCue(ShotType.WIDE))
+
+        assertEquals(ExposurePreset.DARK, result.command!!.exposurePreset)
+        assertEquals("wide", result.command!!.lens)
+    }
+
+    @Test
+    fun `validateMapping numbers lines from the first line number given`() {
+        mapper.updateCapabilities(minimalCapabilities)
+        val scene = DirectorScene(
+            label = "Test",
+            cues = listOf(DirectorCue(type = CueType.SHOT, rawText = "[SHOT: WIDE]", shotType = ShotType.WIDE, lineNumber = 0))
+        )
+        val script = ParsedScript(rawScript = "", scenes = listOf(scene), totalCues = 1, estimatedDurationMs = 0)
+
+        assertTrue(mapper.validateMapping(script, firstLineNumber = 1).any { it.contains("line 1:") })
+        assertTrue(mapper.validateMapping(script).any { it.contains("line 0:") })
+    }
 }

@@ -151,7 +151,8 @@ class UploadService : Service(), UploadEventListener {
     /**
      * Retries the failed uploads when the network comes back after a loss,
      * while kiosk network recovery (networkRecovery.autoReconnect) is on.
-     * Called on a system thread.
+     * Uploads paused through [stopUploads] stay paused: their failed tasks
+     * are queued again for when they resume. Called on a system thread.
      */
     private val networkCallback = object : ConnectivityManager.NetworkCallback() {
         override fun onLost(network: Network) {
@@ -163,7 +164,11 @@ class UploadService : Service(), UploadEventListener {
             networkLost = false
             serviceScope.launch {
                 if ((application as LensDaemonApp).kioskManager.getConfig().networkRecovery.autoReconnect) {
-                    val retried = retryFailed()
+                    val retried = if (_state.value == UploadServiceState.PAUSED) {
+                        uploadQueue.retryFailed().also { updateStats() }
+                    } else {
+                        retryFailed()
+                    }
                     Timber.tag(TAG).i("Network is back: retrying $retried failed uploads")
                 }
             }

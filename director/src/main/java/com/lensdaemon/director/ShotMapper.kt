@@ -9,10 +9,11 @@ import timber.log.Timber
  * camera commands (lens selection, zoom level, focus mode).
  *
  * The mapper considers available hardware capabilities and calculates
- * optimal settings to achieve the desired shot composition.
+ * optimal settings to achieve the desired shot composition. Each command carries
+ * on the settings it doesn't change, the exposure preset included.
  */
 class ShotMapper(
-    private val config: DirectorConfig = DirectorConfig.DEFAULT
+    config: DirectorConfig = DirectorConfig.DEFAULT
 ) {
     companion object {
         private const val TAG = "ShotMapper"
@@ -85,6 +86,11 @@ class ShotMapper(
         val fallbackUsed: Boolean = false
     )
 
+    /** The settings in force (shot presets); [DirectorManager] replaces them when the configuration changes. */
+    @Volatile
+    internal var config: DirectorConfig = config
+
+    @Volatile
     private var capabilities = CameraCapabilities()
     private var currentCommand: CameraCommand? = null
 
@@ -144,6 +150,8 @@ class ShotMapper(
             lens = lens,
             zoomLevel = zoom,
             focusMode = focusMode,
+            // A new framing keeps the exposure an [EXPOSURE] cue chose
+            exposurePreset = currentCommand?.exposurePreset ?: ExposurePreset.AUTO,
             transitionType = cue.transitionType ?: TransitionType.CUT,
             transitionDurationMs = cue.transitionDurationMs,
             notes = "Shot: ${shotType.name}"
@@ -319,6 +327,7 @@ class ShotMapper(
             lens = lens,
             zoomLevel = zoom,
             focusMode = focusMode,
+            exposurePreset = currentCommand?.exposurePreset ?: ExposurePreset.AUTO,
             transitionType = TransitionType.CUT,
             transitionDurationMs = 0,
             notes = "Cut to: ${shotType.name}"
@@ -442,23 +451,27 @@ class ShotMapper(
     }
 
     /**
-     * Validate that a script can be mapped with current capabilities
+     * Validate that a script can be mapped with current capabilities.
+     *
+     * @param firstLineNumber the number shown for the script's first line: cue line
+     *   numbers count from 0, and an editor shows the first line as 1
      */
-    fun validateMapping(script: ParsedScript): List<String> {
+    fun validateMapping(script: ParsedScript, firstLineNumber: Int = 0): List<String> {
         val issues = mutableListOf<String>()
 
         // Check for shots requiring unavailable hardware
         script.scenes.flatMap { it.cues }.forEach { cue ->
+            val line = cue.lineNumber + firstLineNumber
             if (cue.type == CueType.SHOT) {
                 when (cue.shotType) {
                     ShotType.ESTABLISHING, ShotType.WIDE -> {
                         if (!capabilities.hasWide) {
-                            issues.add("Scene at line ${cue.lineNumber}: Wide shot requested but wide lens not available")
+                            issues.add("Scene at line $line: Wide shot requested but wide lens not available")
                         }
                     }
                     ShotType.CLOSE_UP, ShotType.EXTREME_CLOSE -> {
                         if (!capabilities.hasTelephoto && capabilities.maxDigitalZoom < 3.0f) {
-                            issues.add("Scene at line ${cue.lineNumber}: Close-up requested but telephoto/adequate zoom not available")
+                            issues.add("Scene at line $line: Close-up requested but telephoto/adequate zoom not available")
                         }
                     }
                     else -> { /* Main lens can handle most shots */ }
@@ -466,7 +479,7 @@ class ShotMapper(
             }
 
             if (cue.type == CueType.FOCUS && cue.focusTarget == FocusTarget.FACE && !capabilities.supportsFaceDetection) {
-                issues.add("Scene at line ${cue.lineNumber}: Face focus requested but face detection not available")
+                issues.add("Scene at line $line: Face focus requested but face detection not available")
             }
         }
 
