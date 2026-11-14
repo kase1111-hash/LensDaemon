@@ -20,6 +20,14 @@ If no `apiToken` is configured, all endpoints are accessible without credentials
 
 ---
 
+## Request bodies
+
+POST and PUT bodies are JSON objects, read as UTF-8 unless the `Content-Type`
+names another charset. Errors come back as `{"error": "..."}` (with
+`"success": false` where the endpoint reports success), with a 4xx or 5xx status.
+
+---
+
 ## Core
 
 ### GET /api/status
@@ -36,7 +44,9 @@ two seconds.
     "previewActive": true,
     "streamingActive": true,
     "currentLens": "MAIN",
-    "zoom": 1.0
+    "zoom": 1.0,
+    "maxZoom": 8.0,
+    "exposure": { "value": 0, "min": -24, "max": 24, "step": 0.16666667 }
   },
   "encoder": {
     "state": "ENCODING",
@@ -74,7 +84,62 @@ two seconds.
     "channels": 2,
     "bitrate": 128000,
     "framesEncoded": 28125
+  },
+  "thermal": {
+    "cpuTemperatureC": 41.5,
+    "batteryTemperatureC": 33.0,
+    "overallLevel": "NORMAL",
+    "isThrottling": false
+  },
+  "director": {
+    "enabled": true,
+    "state": "RUNNING",
+    "currentScene": "Interview",
+    "currentCue": "[SHOT: MEDIUM]",
+    "currentTake": 1,
+    "totalCues": 7,
+    "executedCues": 3,
+    "sceneIndex": 1,
+    "sceneCount": 3,
+    "cueIndex": 0,
+    "cueCount": 2,
+    "sceneLabels": ["Opening", "Interview", "Outro"],
+    "stats": {
+      "totalTakes": 1,
+      "goodTakes": 1,
+      "averageScore": 7.8,
+      "sessionTime": 95,
+      "cueSuccessRate": 1.0
+    }
   }
+}
+```
+
+- `camera.exposure` is in the camera's compensation steps: `value * step` is the
+  compensation in EV. `maxZoom` and `exposure` are present while the camera
+  service is connected.
+- `thermal` is present once thermal monitoring runs (the app starts it when it
+  opens); `GET /api/thermal/status` has the detail.
+- `director` is present on builds with the AI Director. The scene and cue
+  fields count from 0 and appear while a script is loaded; `cueSuccessRate` is
+  a fraction (0-1).
+
+### GET /api/device
+
+The phone, the app version, and the address the request came from (the
+dashboard offers it as the MPEG-TS target: the computer it is open on). Like
+`/api/status`, it needs no token.
+
+**Response:**
+```json
+{
+  "clientAddress": "192.168.1.20",
+  "manufacturer": "Google",
+  "model": "Pixel 7 Pro",
+  "device": "cheetah",
+  "androidVersion": "14",
+  "sdkVersion": 34,
+  "appVersion": "0.1.0"
 }
 ```
 
@@ -156,18 +221,42 @@ Switch the active camera lens.
 **Path parameters:**
 | Parameter | Values |
 |-----------|--------|
-| `lens` | `wide`, `main`, `tele` |
+| `lens` | A lens family: `wide`, `main`, `tele` (also `ultrawide`, `telephoto`, `zoom`, `primary`), or a lens type from `GET /api/lenses` such as `ultra_wide` or `super_telephoto` |
+
+A family takes the nearest lens of it the phone has: `wide` uses the
+ultra-wide on a phone without a plain wide lens, `tele` a 5x periscope on a
+phone without a 3x.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "lens": "tele",
-  "zoom": 3.0
+  "success": true,
+  "lens": "ULTRA_WIDE"
 }
 ```
 
-Returns an error if the requested lens is not available on the device.
+`404` with `{"success": false, "error": "This phone has no tele lens"}` when the
+phone has no such lens; `400` for a name that is not a lens.
+
+### GET /api/lenses
+
+The phone's back camera lenses and the one in use. Lenses are typed the way
+phones label them: the ~24mm main camera is `MAIN`.
+
+**Response:**
+```json
+{
+  "current": "MAIN",
+  "available": [
+    { "type": "ULTRA_WIDE", "displayName": "Ultra Wide", "group": "wide", "zoomFactor": "0.5x",
+      "cameraId": "0", "focalLength": 2.23, "aperture": 2.2 },
+    { "type": "MAIN", "displayName": "Main", "group": "main", "zoomFactor": "1x",
+      "cameraId": "0", "focalLength": 6.81, "aperture": 1.85 },
+    { "type": "SUPER_TELEPHOTO", "displayName": "Super Telephoto", "group": "tele", "zoomFactor": "5x+",
+      "cameraId": "0", "focalLength": 18.9, "aperture": 3.5 }
+  ]
+}
+```
 
 ### POST /api/snapshot
 
@@ -177,47 +266,53 @@ Capture a JPEG snapshot from the current camera feed.
 
 ### GET /api/config
 
-Get the current encoder configuration.
+The running encoder's settings (empty while it is stopped) and the camera's.
 
 **Response:**
 ```json
 {
-  "codec": "H265",
-  "resolution": "1920x1080",
-  "bitrate": 6000000,
-  "bitrateMode": "VBR",
-  "fps": 30,
-  "keyframeInterval": 2,
-  "profile": "Main"
+  "encoder": {
+    "width": 1920,
+    "height": 1080,
+    "bitrate": 4000000,
+    "frameRate": 30,
+    "codec": "H264",
+    "keyframeInterval": 2
+  },
+  "camera": {
+    "resolution": "1920x1080",
+    "focusMode": "CONTINUOUS_VIDEO",
+    "whiteBalance": "AUTO",
+    "exposureCompensation": 0,
+    "zoom": 1.0
+  }
 }
 ```
 
 ### PUT /api/config
 
-Update encoder configuration. Accepts partial updates -- only include the fields you want to change.
+Change settings of the running camera and encoder. Every field is optional.
+Resolution, frame rate and codec are chosen when an output starts the encoder
+(see "Encoder settings in start requests").
 
 **Request:**
 ```json
 {
-  "codec": "H264",
-  "bitrate": 4000000,
-  "fps": 24
+  "bitrate": 6000000,
+  "zoom": 2.0,
+  "exposureCompensation": -3
 }
 ```
+
+`bitrate` is in bits per second and applies to the running encoder at once;
+`exposureCompensation` is in the camera's steps (see `camera.exposure` in the
+status).
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "config": {
-    "codec": "H264",
-    "resolution": "1920x1080",
-    "bitrate": 4000000,
-    "bitrateMode": "VBR",
-    "fps": 24,
-    "keyframeInterval": 2,
-    "profile": "High"
-  }
+  "success": true,
+  "message": "Configuration updated"
 }
 ```
 
@@ -398,20 +493,22 @@ Focus state transitions through `inactive` -> `scanning` -> `focused` or `failed
 
 ### POST /api/exposure
 
-Set exposure compensation in EV steps.
+Set exposure compensation, in the camera's compensation steps: an integer
+within `camera.exposure.min`..`max` from `GET /api/status`. One step is
+`camera.exposure.step` EV (often 1/6 or 1/3), so `-6` is -1 EV at 1/6 EV steps.
 
 **Request:**
 ```json
 {
-  "ev": -1.0
+  "ev": -6
 }
 ```
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "ev": -1.0
+  "success": true,
+  "ev": -6
 }
 ```
 
@@ -506,6 +603,12 @@ List all local recordings.
 }
 ```
 
+### GET /api/recordings/{filename}
+
+Download a recording as an MP4 file (`Content-Disposition: attachment`). Only
+files listed by `GET /api/recordings` can be fetched. The file being written
+while recording is unfinished until its segment ends.
+
 ### DELETE /api/recordings/{filename}
 
 Delete a specific recording.
@@ -518,8 +621,8 @@ Delete a specific recording.
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "Recording deleted"
+  "success": true,
+  "filename": "LensDaemon_Pixel7Pro_20261114_090000.mp4"
 }
 ```
 
@@ -686,76 +789,91 @@ Clear all pending (not in-progress) upload tasks.
 
 ### GET /api/upload/s3/config
 
-Get the current S3 configuration (credentials are masked).
+Get the saved S3 settings, without the secret key and with the access key ID masked.
 
 **Response:**
 ```json
 {
   "configured": true,
-  "backend": "AWS_S3",
-  "endpoint": "https://s3.amazonaws.com",
-  "bucket": "my-recordings",
+  "endpoint": "s3.us-east-1.amazonaws.com",
   "region": "us-east-1",
-  "prefix": "lensdaemon/",
-  "accessKey": "AKIA****XXXX"
+  "bucket": "my-recordings",
+  "accessKeyId": "AKIA****MPLE",
+  "pathPrefix": "lensdaemon/",
+  "useHttps": true,
+  "backend": "S3"
 }
 ```
 
+`{"configured": false}` when nothing is saved.
+
 ### POST /api/upload/s3/config
 
-Configure S3-compatible storage credentials.
+Save S3-compatible storage settings (the credentials are encrypted with the
+Android Keystore).
 
 **Request:**
 ```json
 {
-  "backend": "AWS_S3",
-  "endpoint": "https://s3.amazonaws.com",
-  "bucket": "my-recordings",
+  "backend": "S3",
+  "endpoint": "",
   "region": "us-east-1",
-  "prefix": "lensdaemon/",
-  "accessKey": "AKIAIOSFODNN7EXAMPLE",
-  "secretKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"
+  "bucket": "my-recordings",
+  "accessKeyId": "AKIAIOSFODNN7EXAMPLE",
+  "secretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+  "pathPrefix": "lensdaemon/"
 }
 ```
 
-Supported `backend` values: `AWS_S3`, `BACKBLAZE_B2`, `MINIO`, `CLOUDFLARE_R2`.
+- `bucket`, `accessKeyId` and `secretAccessKey` are required.
+- `backend`: `S3` (default), `BACKBLAZE_B2`, `MINIO` or `CLOUDFLARE_R2`.
+- `endpoint` is a host name (and port). Left empty, it follows from the region
+  for `S3` and `BACKBLAZE_B2`. Given as a URL, it is reduced to its host;
+  `http://` turns HTTPS off (`useHttps`, default `true`).
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "S3 configuration saved"
+  "success": true,
+  "message": "S3 configured",
+  "backend": "S3",
+  "bucket": "my-recordings",
+  "endpoint": "s3.us-east-1.amazonaws.com"
 }
 ```
 
 ### DELETE /api/upload/s3/config
 
-Remove saved S3 credentials.
+Remove the saved S3 settings.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "S3 configuration removed"
+  "success": true,
+  "message": "S3 credentials cleared"
 }
 ```
 
 ### POST /api/upload/s3/test
 
-Test the current S3 configuration by attempting a connection.
+Test a connection to the bucket. With S3 settings in the body (the fields of
+`POST /api/upload/s3/config`), those are tested without being saved; with no
+body, the saved settings are.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "S3 connection successful",
-  "bucket": "my-recordings"
+  "success": true,
+  "message": "S3 connection successful"
 }
 ```
 
+On failure: `{"success": false, "error": "S3 connection test failed: S3 connection failed: HTTP 403"}`
+(`400` when the settings are incomplete or none are saved).
+
 ### GET /api/upload/smb/config
 
-Get the current SMB configuration (password is masked).
+Get the saved SMB settings, without the password.
 
 **Response:**
 ```json
@@ -763,60 +881,69 @@ Get the current SMB configuration (password is masked).
   "configured": true,
   "server": "192.168.1.50",
   "share": "recordings",
-  "path": "lensdaemon/",
   "username": "backup",
-  "domain": "WORKGROUP"
+  "domain": "WORKGROUP",
+  "port": 445,
+  "pathPrefix": "lensdaemon/"
 }
 ```
 
 ### POST /api/upload/smb/config
 
-Configure SMB/CIFS network share credentials.
+Save SMB/CIFS network share settings.
 
 **Request:**
 ```json
 {
   "server": "192.168.1.50",
   "share": "recordings",
-  "path": "lensdaemon/",
   "username": "backup",
   "password": "secret",
-  "domain": "WORKGROUP"
+  "domain": "WORKGROUP",
+  "port": 445,
+  "pathPrefix": "lensdaemon/"
 }
 ```
+
+`server`, `share`, `username` and `password` are required; a server given as
+`smb://host` or `\\host` is reduced to the host.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "SMB configuration saved"
+  "success": true,
+  "message": "SMB configured",
+  "server": "192.168.1.50",
+  "share": "recordings"
 }
 ```
 
 ### DELETE /api/upload/smb/config
 
-Remove saved SMB credentials.
+Remove the saved SMB settings.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "SMB configuration removed"
+  "success": true,
+  "message": "SMB credentials cleared"
 }
 ```
 
 ### POST /api/upload/smb/test
 
-Test the current SMB configuration by attempting a connection.
+Test a connection to the share. With SMB settings in the body, those are
+tested without being saved; with no body, the saved settings are.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "SMB connection successful",
-  "share": "\\\\192.168.1.50\\recordings"
+  "success": true,
+  "message": "SMB connection successful"
 }
 ```
+
+On failure: `{"success": false, "error": "SMB connection test failed: ..."}`.
 
 ---
 
@@ -824,23 +951,33 @@ Test the current SMB configuration by attempting a connection.
 
 ### GET /api/thermal/status
 
-Get current temperatures and thermal levels.
+Get current temperatures, thermal levels and the throttling in effect. Monitoring
+starts when the app opens; until the first reading the temperatures are `0`.
 
 **Response:**
 ```json
 {
-  "cpu": 42.5,
-  "battery": 38.0,
-  "gpu": 40.0,
-  "level": "NORMAL",
-  "throttling": false,
-  "actions": []
+  "cpuTemperatureC": 52.0,
+  "batteryTemperatureC": 36.0,
+  "cpuLevel": "WARNING",
+  "batteryLevel": "NORMAL",
+  "overallLevel": "WARNING",
+  "statusText": "Warning - Throttling",
+  "isThrottling": true,
+  "batteryPercent": 78,
+  "isCharging": true,
+  "chargingDisabled": false,
+  "bitrateReductionPercent": 20,
+  "resolutionReduced": false,
+  "framerateReduced": false,
+  "activeActions": ["REDUCE_BITRATE"]
 }
 ```
 
-Thermal levels: `NORMAL`, `ELEVATED`, `WARNING`, `CRITICAL`, `EMERGENCY`.
-
-Possible throttle actions: `REDUCE_BITRATE`, `REDUCE_RESOLUTION`, `REDUCE_FRAMERATE`, `PAUSE_STREAMING`.
+Levels: `NORMAL`, `ELEVATED`, `WARNING`, `CRITICAL`, `EMERGENCY`. Actions:
+`REDUCE_BITRATE`, `REDUCE_RESOLUTION`, `REDUCE_FRAMERATE`, `PAUSE_STREAMING`,
+`DISABLE_CHARGING`. A bitrate reduction is a share of the bitrate the encoder
+was started with, restored when the phone cools down.
 
 ### GET /api/thermal/history
 
@@ -964,86 +1101,112 @@ Get kiosk mode state.
 {
   "state": "ENABLED",
   "isDeviceOwner": true,
-  "lockTaskActive": true,
-  "screenMode": "OFF",
-  "autoStart": true,
-  "uptime": 259200
+  "isLockTaskActive": true,
+  "isScreenLocked": false,
+  "uptimeMs": 259200000,
+  "lastRestartTime": 0,
+  "restartCount": 0,
+  "kioskEnabled": true,
+  "autoStartEnabled": true,
+  "screenMode": "OFF"
 }
 ```
 
-Kiosk states: `DISABLED`, `ENABLED`, `SETUP_REQUIRED`, `NOT_DEVICE_OWNER`.
+- `kioskEnabled`: kiosk mode is on (LensDaemon starts on boot and pins itself).
+- `isLockTaskActive`: LensDaemon is pinned to the screen right now.
+- Kiosk states: `DISABLED`, `ENABLED` (on and pinned), `SETUP_REQUIRED` (on,
+  not pinned yet: the app's screen is not open), `NOT_DEVICE_OWNER`.
 
 ### POST /api/kiosk/enable
 
-Enable kiosk mode. The device must be set as Device Owner first.
+Turn kiosk mode on. LensDaemon starts by itself after a reboot and, when it is
+the device owner, comes to the front and pins itself to the screen (lock task
+mode). Without Device Owner the screen cannot be locked: the answer says so
+with `"lockTask": false`.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "Kiosk mode enabled"
+  "success": true,
+  "lockTask": true,
+  "message": "Kiosk mode on: LensDaemon is pinned to the screen and starts on boot"
 }
 ```
 
+To leave kiosk mode at the phone, hold Volume Up + Volume Down for 5 seconds
+(then enter the exit PIN, if one is set).
+
 ### POST /api/kiosk/disable
 
-Disable kiosk mode and restore normal device operation.
+Turn kiosk mode off: LensDaemon unpins itself and no longer starts on boot.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "Kiosk mode disabled"
+  "success": true,
+  "message": "Kiosk mode off: LensDaemon is unpinned and no longer starts on boot"
 }
 ```
 
 ### GET /api/kiosk/config
 
-Get the full kiosk configuration.
+Get the full kiosk configuration (the exit PIN itself is not returned).
 
 **Response:**
 ```json
 {
+  "enabled": true,
   "autoStart": {
     "enabled": true,
-    "delaySeconds": 5,
+    "delaySeconds": 10,
     "startStreaming": true,
     "startRtsp": true,
     "startRecording": false
   },
   "screen": {
     "mode": "OFF",
-    "brightness": 0,
-    "autoOffTimeout": 30
+    "dimBrightness": 10,
+    "autoOffTimeoutSec": 30,
+    "wakeOnMotion": false,
+    "keepScreenOn": false
   },
   "security": {
-    "exitPin": "1234",
-    "gestureEnabled": true,
-    "lockStatusBar": true
+    "exitPinSet": false,
+    "allowedExitGesture": true,
+    "exitGestureTimeoutMs": 5000,
+    "lockStatusBar": true,
+    "lockNavigationBar": true,
+    "lockNotifications": true,
+    "blockScreenshots": false
   },
   "networkRecovery": {
     "autoReconnect": true,
-    "maxRetries": 10,
-    "retryInterval": 30
+    "reconnectIntervalSec": 30,
+    "maxReconnectAttempts": 0,
+    "restartStreamOnReconnect": true
   },
   "crashRecovery": {
     "autoRestart": true,
-    "maxAttempts": 10,
-    "cooldownMinutes": 5
+    "restartDelayMs": 3000,
+    "maxRestartAttempts": 10,
+    "restartWindowMinutes": 60
   }
 }
 ```
 
 ### PUT /api/kiosk/config
 
-Update kiosk configuration. Accepts partial updates.
+Update the kiosk configuration. Every field is optional; a section given
+replaces only the fields it names. `security.exitPin` sets the PIN asked for
+after the exit gesture (empty for none). `enabled` turns kiosk mode on or off
+like `/enable` and `/disable`, without bringing the app to the front.
 
 **Request:**
 ```json
 {
   "screen": {
     "mode": "DIM",
-    "brightness": 20
+    "dimBrightness": 20
   },
   "security": {
     "exitPin": "5678"
@@ -1054,32 +1217,36 @@ Update kiosk configuration. Accepts partial updates.
 **Response:**
 ```json
 {
-  "status": "ok",
-  "config": { }
+  "success": true,
+  "message": "Kiosk configuration updated"
 }
 ```
 
 ### POST /api/kiosk/preset/appliance
 
-Apply the APPLIANCE preset for 24/7 unattended operation. Sets screen OFF, enables auto-start for streaming and RTSP, locks system UI, and enables crash recovery.
+Apply the APPLIANCE preset for 24/7 unattended operation: screen off, streaming
+and RTSP auto-start, system UI locked, crash recovery and network reconnect on.
+Kiosk mode stays on or off as it was; turn it on with `/api/kiosk/enable`.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "Appliance preset applied"
+  "success": true,
+  "message": "Appliance preset applied (24/7 unattended operation)"
 }
 ```
 
 ### POST /api/kiosk/preset/interactive
 
-Apply the INTERACTIVE preset for kiosk with live preview. Keeps screen on with camera preview, enables navigation bar, and allows gesture-based exit.
+Apply the INTERACTIVE preset for a kiosk with live preview: screen on with the
+camera preview, navigation bar available, gesture exit allowed. Kiosk mode stays
+on or off as it was.
 
 **Response:**
 ```json
 {
-  "status": "ok",
-  "message": "Interactive preset applied"
+  "success": true,
+  "message": "Interactive preset applied (kiosk with preview)"
 }
 ```
 

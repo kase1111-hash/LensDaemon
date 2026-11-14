@@ -100,11 +100,21 @@ adb install lensdaemon.apk
 ```bash
 adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 ```
+This makes LensDaemon the device owner, which lets it lock the phone to its own
+screen. Kiosk mode itself is switched on later, from the setup wizard or the dashboard.
 
 ### 3. Launch and Configure
-Open LensDaemon on the device. Note the IP address displayed.
+Open LensDaemon on the device. The phone shows the dashboard's address under its
+status, for example `Dashboard: http://192.168.1.50:8080`.
 
-From any browser: `http://{device-ip}:8080`
+From any browser: `http://{device-ip}:8080`. The dashboard has the live preview,
+RTSP, MPEG-TS and recording controls, lens, zoom and exposure, the encoder
+settings, temperatures and throttling, the recordings on the phone (download,
+upload, delete), network storage, kiosk mode and the AI Director.
+
+For an unattended setup, `http://{device-ip}:8080/setup` walks through Device
+Owner, a kiosk preset, network storage, a test stream and turning kiosk mode on.
+In kiosk mode, hold **Volume Up + Volume Down** for 5 seconds on the phone to leave it.
 
 ### 4. Start the Stream
 Tap **Start Stream** on the phone, or **Start RTSP** in the web dashboard. The

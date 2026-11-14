@@ -322,26 +322,30 @@ app/src/main/java/com/lensdaemon/web/
                                  # - MJPEG frame pushing API
 
 app/src/main/assets/web/
-├── index.html                   # Dashboard HTML
-│                                # - Live preview section with MJPEG display
-│                                # - Stream and RTSP control buttons
-│                                # - Lens selection (wide/main/tele)
-│                                # - Zoom and exposure sliders
-│                                # - Encoder settings panel
-│                                # - Real-time statistics display
-├── styles.css                   # Dashboard styles
-│                                # - Dark theme with CSS variables
-│                                # - Responsive grid layout
-│                                # - Control panel styling
-│                                # - Button states and animations
-└── dashboard.js                 # Dashboard JavaScript
-                                 # - API client functions
-                                 # - Status polling (1-second interval)
-                                 # - MJPEG preview start/stop
-                                 # - Stream and RTSP control
-                                 # - Lens and camera control handlers
-                                 # - Configuration management
+├── index.html                   # Dashboard HTML (two columns, then full-width rows)
+│                                # - Left: live preview, Streaming (encoder + Stop All),
+│                                #   RTSP, MPEG-TS over UDP, Recording
+│                                # - Right: Camera (the phone's own lenses, zoom up to the
+│                                #   camera's max, exposure in EV), Encoder settings,
+│                                #   Statistics, Temperature, Kiosk mode
+│                                # - Full width: Recordings (storage space, download,
+│                                #   upload to S3/SMB, delete, clean-up), Network storage
+│                                #   (upload queue, S3 and SMB settings with Test), AI Director
+│                                # - Header link to the setup wizard (/setup)
+├── styles.css                   # Dashboard styles (dark theme, 16px gutter on phones)
+├── dashboard.js                 # Dashboard JavaScript
+│                                # - apiCall(): JSON in/out, error text from {"error"}
+│                                # - Polls /api/status (2s), thermal and upload (5s),
+│                                #   kiosk (10s), recordings (30s); stops while hidden
+│                                # - notify(): corner notices instead of alert()
+├── setup.html, setup.js         # Setup wizard: Device Owner check, preset, S3/SMB
+│                                # (tested as typed, saved on activation), RTSP test
+│                                # stream with preview and temperatures, activation that
+│                                # stops at the first failed step
 ```
+
+The pages read the fields the handlers write. When an endpoint's JSON changes,
+change the page with it; docs/API.md documents both.
 
 ## Phase 7 Files (Local Recording & Storage)
 
@@ -554,6 +558,10 @@ app/src/main/java/com/lensdaemon/kiosk/
 │                                # - PinEntryHandler for secure exit
 │                                # - Lockout after 5 failed PIN attempts
 │                                # - Key event consumption to block volume changes
+├── KioskActivityController.kt   # Applies kiosk mode to MainActivity: pins it (lock task)
+│                                # while kiosk mode is on and the app is device owner,
+│                                # unpins when it is turned off; Vol Up + Vol Down held
+│                                # leaves kiosk mode (after the exit PIN, if set)
 └── BootReceiver.kt              # Auto-start on boot
                                  # - ACTION_BOOT_COMPLETED handling
                                  # - QUICKBOOT_POWERON for some devices
@@ -589,6 +597,14 @@ adb shell dumpsys device_policy | grep "Device Owner"
 # Remove device owner (to allow normal device use)
 adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
 ```
+
+## Kiosk Mode Wiring
+
+One `KioskManager` for the app (`LensDaemonApp.kioskManager`). The web API
+(`/api/kiosk/enable|disable`, `PUT /api/kiosk/config`) changes the saved
+`enabled` setting; `MainActivity`'s `KioskActivityController` follows it while
+the activity is in the foreground. `enabled` also gates boot auto-start
+(`BootReceiver`). Presets change the settings but leave `enabled` as it was.
 
 ## Kiosk Mode Presets
 
@@ -1123,6 +1139,12 @@ app/src/main/java/com/lensdaemon/camera/
   reports per track (`RtcpSenderReport`, `RtspTrack`); MPEG-TS sends ADTS on PID
   257; recordings add an AAC track to each segment. `/api/audio` switches it.
 - RTSP PLAY and new MPEG-TS receivers request a keyframe from the encoder.
+- Lenses are typed the way phones label them (`camera/LensSelection.kt`): the
+  ~24mm main camera is MAIN. "wide"/"main"/"tele" requests (phone buttons,
+  `/api/lens/{name}`, the director) take the nearest lens of that family.
+- `MainActivity` starts `ThermalService` (binding alone does not start the
+  governor). Thermal bitrate throttling is a share of the configured bitrate.
+- The phone shows the dashboard address and temperatures (`PhoneOverlays`).
 - The capture session runs with or without the on-screen preview surface
   (`LensDaemonCameraManager.setPreviewSurface`), so streaming survives the
   screen turning off or the app going to the background.
@@ -1158,6 +1180,11 @@ app/src/main/java/com/lensdaemon/director/
 ```
 app/src/main/java/com/lensdaemon/web/
 ├── ApiRoutes.kt                 # Thin dispatcher (auth, rate limit, routing)
+├── RequestBody.kt               # Reads POST/PUT JSON bodies itself: NanoHTTPD's parseBody
+│                                # hands PUT bodies over as a temp file and decodes POST
+│                                # bodies as US-ASCII; reads exactly Content-Length bytes
+├── StatusReport.kt              # Sections of GET /api/status (camera incl. maxZoom and
+│                                # exposure range/step, thermal, director progress)
 ├── RateLimiter.kt               # Token bucket per-client rate limiter
 ├── WebServer.kt                 # NanoHTTPD HTTP server
 ├── MjpegStreamer.kt             # MJPEG live preview
