@@ -1,13 +1,42 @@
 // LensDaemon Setup Wizard
+'use strict';
 
 let currentStep = 1;
 let selectedPreset = null;
 let thermalPollInterval = null;
 let isTestStreaming = false;
+let startedTestRtsp = false;
+
+/**
+ * Fetch JSON from the API. Resolves to { ok, status, data }: ok only for a 2xx
+ * answer that doesn't report success: false. Rejects when the phone can't be reached.
+ */
+function api(url, method, body) {
+    const options = { method: method || 'GET', headers: {} };
+    if (body !== undefined && body !== null) {
+        options.headers['Content-Type'] = 'application/json; charset=utf-8';
+        options.body = JSON.stringify(body);
+    }
+    return fetch(url, options).then(function(r) {
+        return r.json().catch(function() { return {}; }).then(function(data) {
+            data = data || {};
+            return { ok: r.ok && data.success !== false, status: r.status, data: data };
+        });
+    });
+}
+
+function errorOf(result) {
+    return (result.data && (result.data.error || result.data.message)) || ('HTTP ' + result.status);
+}
 
 // ==================== Navigation ====================
 
 function goToStep(step) {
+    // Leaving the test step ends the test stream it started
+    if (currentStep === 4 && step !== 4 && isTestStreaming) {
+        stopTestStream();
+    }
+
     // Mark previous steps as done
     for (let i = 1; i < step; i++) {
         const el = document.querySelector('.step[data-step="' + i + '"]');
@@ -36,7 +65,7 @@ function goToStep(step) {
     document.querySelectorAll('.step-content').forEach(function(el) {
         el.classList.remove('active');
     });
-    var stepContent = document.getElementById('step-' + step);
+    const stepContent = document.getElementById('step-' + step);
     if (stepContent) {
         stepContent.classList.add('active');
     }
@@ -59,11 +88,11 @@ function runChecks() {
 }
 
 function setCheckStatus(id, status, detail) {
-    var icon = document.getElementById(id + '-icon');
-    var detailEl = document.getElementById(id + '-detail');
+    const icon = document.getElementById(id + '-icon');
+    const detailEl = document.getElementById(id + '-detail');
     if (icon) {
         icon.className = 'check-icon ' + status;
-        icon.textContent = status === 'pass' ? '\u2713' : status === 'fail' ? '\u2717' : status === 'warn' ? '!' : '...';
+        icon.textContent = status === 'pass' ? '✓' : status === 'fail' ? '✗' : status === 'warn' ? '!' : '...';
     }
     if (detailEl) {
         detailEl.textContent = detail;
@@ -71,11 +100,14 @@ function setCheckStatus(id, status, detail) {
 }
 
 function checkDevice() {
-    fetch('/api/device')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            var detail = data.manufacturer + ' ' + data.model + ' (Android ' + data.androidVersion + ')';
-            setCheckStatus('check-device', 'pass', detail);
+    api('/api/device')
+        .then(function(result) {
+            if (!result.ok) {
+                setCheckStatus('check-device', 'fail', 'Device API error: ' + errorOf(result));
+                return;
+            }
+            const data = result.data;
+            setCheckStatus('check-device', 'pass', data.manufacturer + ' ' + data.model + ' (Android ' + data.androidVersion + ')');
         })
         .catch(function() {
             setCheckStatus('check-device', 'fail', 'Cannot reach device API');
@@ -83,34 +115,39 @@ function checkDevice() {
 }
 
 function checkKioskStatus() {
-    fetch('/api/kiosk/status')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data.isDeviceOwner) {
+    api('/api/kiosk/status')
+        .then(function(result) {
+            if (!result.ok) {
+                // The kiosk service is not answering: that says nothing about Device Owner
+                setCheckStatus('check-kiosk', 'fail', 'Kiosk service not available: ' + errorOf(result));
+                document.getElementById('device-owner-help').style.display = 'none';
+            } else if (result.data.isDeviceOwner) {
                 setCheckStatus('check-kiosk', 'pass', 'Device Owner is set. Kiosk mode available.');
                 document.getElementById('device-owner-help').style.display = 'none';
-                enableStep1Next();
             } else {
-                setCheckStatus('check-kiosk', 'warn', 'Device Owner not set. Required for kiosk mode.');
+                setCheckStatus('check-kiosk', 'warn', 'Device Owner not set. Required to lock the phone to LensDaemon.');
                 document.getElementById('device-owner-help').style.display = 'block';
-                // Still allow proceeding - kiosk just won't fully lock
-                enableStep1Next();
             }
+            // Proceeding is still possible: without Device Owner, kiosk mode starts
+            // LensDaemon on boot but cannot lock the screen
+            enableStep1Next();
         })
         .catch(function() {
-            setCheckStatus('check-kiosk', 'fail', 'Kiosk service not available');
+            setCheckStatus('check-kiosk', 'fail', 'Cannot reach the kiosk API');
             enableStep1Next();
         });
 }
 
 function checkCamera() {
-    fetch('/api/status')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data.camera) {
-                setCheckStatus('check-camera', 'pass', 'Camera service running');
+    api('/api/status')
+        .then(function(result) {
+            const camera = result.data.camera;
+            if (!result.ok || !camera) {
+                setCheckStatus('check-camera', 'fail', 'Status API error: ' + errorOf(result));
+            } else if (camera.currentLens && camera.currentLens !== 'none') {
+                setCheckStatus('check-camera', 'pass', 'Camera open (' + camera.currentLens.toLowerCase().replace('_', ' ') + ' lens)');
             } else {
-                setCheckStatus('check-camera', 'warn', 'Camera status unknown');
+                setCheckStatus('check-camera', 'warn', 'Camera not open yet: open LensDaemon on the phone and allow the camera');
             }
         })
         .catch(function() {
@@ -119,13 +156,13 @@ function checkCamera() {
 }
 
 function checkThermalProfile() {
-    fetch('/api/thermal/profile')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            var profile = data.profile;
-            var source = data.source;
-            var detail = profile.displayName + ' (' + source + ')';
-            setCheckStatus('check-thermal', 'pass', detail);
+    api('/api/thermal/profile')
+        .then(function(result) {
+            if (!result.ok || !result.data.profile) {
+                setCheckStatus('check-thermal', 'warn', 'Thermal profile not available (using defaults)');
+                return;
+            }
+            setCheckStatus('check-thermal', 'pass', result.data.profile.displayName + ' (' + result.data.source + ')');
         })
         .catch(function() {
             setCheckStatus('check-thermal', 'warn', 'Thermal profile not available (using defaults)');
@@ -156,126 +193,139 @@ function selectPreset(preset) {
 // ==================== Step 3: Storage Config ====================
 
 function updateStorageForm() {
-    var type = document.getElementById('storage-type').value;
+    const type = document.getElementById('storage-type').value;
     document.getElementById('s3-config').style.display = type === 's3' ? 'block' : 'none';
     document.getElementById('smb-config').style.display = type === 'smb' ? 'block' : 'none';
 }
 
-function testS3() {
-    var resultEl = document.getElementById('s3-test-result');
-    resultEl.className = 'result-banner';
-    resultEl.style.display = 'block';
-    resultEl.innerHTML = '<span class="spinner"></span> Testing S3 connection...';
-
-    var config = {
-        endpoint: document.getElementById('s3-endpoint').value,
-        region: document.getElementById('s3-region').value,
-        bucket: document.getElementById('s3-bucket').value,
-        accessKey: document.getElementById('s3-access-key').value,
-        secretKey: document.getElementById('s3-secret-key').value
+// The settings in the field names the API reads
+function s3Settings() {
+    return {
+        backend: document.getElementById('s3-backend').value,
+        endpoint: document.getElementById('s3-endpoint').value.trim(),
+        region: document.getElementById('s3-region').value.trim(),
+        bucket: document.getElementById('s3-bucket').value.trim(),
+        accessKeyId: document.getElementById('s3-access-key').value.trim(),
+        secretAccessKey: document.getElementById('s3-secret-key').value
     };
+}
 
-    fetch('/api/upload/s3/test', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config)
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-        if (data.success) {
-            resultEl.className = 'result-banner success';
-            resultEl.textContent = 'S3 connection successful!';
-        } else {
-            resultEl.className = 'result-banner error';
-            resultEl.textContent = 'Connection failed: ' + (data.error || 'Unknown error');
-        }
-    })
-    .catch(function(err) {
-        resultEl.className = 'result-banner error';
-        resultEl.textContent = 'Test failed: ' + err.message;
-    });
+function smbSettings() {
+    return {
+        server: document.getElementById('smb-server').value.trim(),
+        share: document.getElementById('smb-share').value.trim(),
+        username: document.getElementById('smb-username').value.trim(),
+        password: document.getElementById('smb-password').value
+    };
+}
+
+function showBanner(el, kind, text, html) {
+    el.className = 'result-banner ' + kind;
+    el.style.display = 'block';
+    if (html) {
+        el.innerHTML = html;
+    } else {
+        el.textContent = text;
+    }
+}
+
+// Test the settings as entered: nothing is saved until activation
+function testConnection(kind, settings) {
+    const resultEl = document.getElementById(kind + '-test-result');
+    const label = kind === 's3' ? 'S3' : 'SMB';
+    showBanner(resultEl, 'pending', null, '<span class="spinner"></span> Testing ' + label + ' connection...');
+
+    api('/api/upload/' + kind + '/test', 'POST', settings)
+        .then(function(result) {
+            if (result.ok) {
+                showBanner(resultEl, 'success', label + ' connection successful!');
+            } else {
+                showBanner(resultEl, 'error', 'Connection failed: ' + errorOf(result));
+            }
+        })
+        .catch(function(err) {
+            showBanner(resultEl, 'error', 'Test failed: ' + err.message);
+        });
+}
+
+function testS3() {
+    testConnection('s3', s3Settings());
 }
 
 function testSmb() {
-    var resultEl = document.getElementById('smb-test-result');
-    resultEl.className = 'result-banner';
-    resultEl.style.display = 'block';
-    resultEl.innerHTML = '<span class="spinner"></span> Testing SMB connection...';
-
-    var config = {
-        host: document.getElementById('smb-host').value,
-        share: document.getElementById('smb-share').value,
-        username: document.getElementById('smb-username').value,
-        password: document.getElementById('smb-password').value
-    };
-
-    fetch('/api/upload/smb/test', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(config)
-    })
-    .then(function(r) { return r.json(); })
-    .then(function(data) {
-        if (data.success) {
-            resultEl.className = 'result-banner success';
-            resultEl.textContent = 'SMB connection successful!';
-        } else {
-            resultEl.className = 'result-banner error';
-            resultEl.textContent = 'Connection failed: ' + (data.error || 'Unknown error');
-        }
-    })
-    .catch(function(err) {
-        resultEl.className = 'result-banner error';
-        resultEl.textContent = 'Test failed: ' + err.message;
-    });
+    testConnection('smb', smbSettings());
 }
 
 // ==================== Step 4: Test Stream ====================
 
 function initTestStep() {
-    isTestStreaming = false;
-    document.getElementById('btn-test-stream').style.display = 'inline-block';
-    document.getElementById('btn-stop-test').style.display = 'none';
-    document.getElementById('thermal-status-area').style.display = 'none';
-    setCheckStatus('check-stream', 'pending', 'Not started');
-    setCheckStatus('check-thermal-ok', 'pending', 'Monitoring...');
+    document.getElementById('btn-test-stream').style.display = isTestStreaming ? 'none' : 'inline-block';
+    document.getElementById('btn-stop-test').style.display = isTestStreaming ? 'inline-block' : 'none';
+    if (!isTestStreaming) {
+        document.getElementById('thermal-status-area').style.display = 'none';
+        setCheckStatus('check-stream', 'pending', 'Not started');
+        setCheckStatus('check-thermal-ok', 'pending', 'Monitoring...');
+    }
 }
 
+// The test stream is the real thing: the RTSP server, at the default settings
 function startTestStream() {
     setCheckStatus('check-stream', 'pending', 'Starting stream...');
 
-    fetch('/api/stream/start', { method: 'POST' })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data.success !== false) {
-                isTestStreaming = true;
-                setCheckStatus('check-stream', 'pass', 'Stream running');
-                document.getElementById('btn-test-stream').style.display = 'none';
-                document.getElementById('btn-stop-test').style.display = 'inline-block';
-                document.getElementById('thermal-status-area').style.display = 'block';
-                startThermalPolling();
-            } else {
-                setCheckStatus('check-stream', 'fail', 'Failed to start: ' + (data.error || 'Unknown'));
-            }
+    api('/api/status')
+        .then(function(status) {
+            const alreadyRunning = status.ok && status.data.rtsp && status.data.rtsp.running;
+            return alreadyRunning ? status.data.rtsp : api('/api/rtsp/start', 'POST', {}).then(function(result) {
+                if (!result.ok) {
+                    throw new Error(errorOf(result));
+                }
+                startedTestRtsp = true;
+                return result.data;
+            });
+        })
+        .then(function(rtsp) {
+            isTestStreaming = true;
+            const detail = document.getElementById('check-stream-detail');
+            setCheckStatus('check-stream', 'pass', 'Streaming at ');
+            const link = document.createElement('a');
+            link.href = rtsp.url;
+            link.textContent = rtsp.url;
+            detail.appendChild(link);
+            detail.appendChild(document.createTextNode(': open it in VLC or OBS'));
+
+            const preview = document.getElementById('test-preview');
+            preview.src = '/mjpeg?' + Date.now();
+            preview.style.display = 'block';
+
+            document.getElementById('btn-test-stream').style.display = 'none';
+            document.getElementById('btn-stop-test').style.display = 'inline-block';
+            document.getElementById('thermal-status-area').style.display = 'block';
+            startThermalPolling();
         })
         .catch(function(err) {
-            setCheckStatus('check-stream', 'fail', 'Error: ' + err.message);
+            setCheckStatus('check-stream', 'fail', 'Failed to start: ' + err.message);
         });
 }
 
 function stopTestStream() {
-    fetch('/api/stream/stop', { method: 'POST' })
-        .then(function() {
-            isTestStreaming = false;
-            stopThermalPolling();
-            document.getElementById('btn-test-stream').style.display = 'inline-block';
-            document.getElementById('btn-stop-test').style.display = 'none';
-            setCheckStatus('check-stream', 'pass', 'Stream test completed');
+    const preview = document.getElementById('test-preview');
+    preview.removeAttribute('src');
+    preview.style.display = 'none';
+    stopThermalPolling();
+    isTestStreaming = false;
+    document.getElementById('btn-test-stream').style.display = 'inline-block';
+    document.getElementById('btn-stop-test').style.display = 'none';
+
+    // Stop only what the test started: an RTSP stream already running stays up
+    const stopping = startedTestRtsp ? api('/api/rtsp/stop', 'POST') : Promise.resolve({ ok: true });
+    startedTestRtsp = false;
+    stopping
+        .then(function(result) {
+            setCheckStatus('check-stream', result.ok ? 'pass' : 'warn',
+                result.ok ? 'Stream test completed' : 'Could not stop the test stream: ' + errorOf(result));
         })
         .catch(function() {
-            // Still mark as stopped locally
-            isTestStreaming = false;
-            stopThermalPolling();
+            setCheckStatus('check-stream', 'warn', 'Could not reach the phone to stop the test stream');
         });
 }
 
@@ -293,21 +343,29 @@ function stopThermalPolling() {
 }
 
 function pollThermal() {
-    fetch('/api/thermal/status')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            var cpuTemp = data.cpuTemperatureC || 0;
-            var batteryTemp = data.batteryTemperatureC || 0;
+    api('/api/thermal/status')
+        .then(function(result) {
+            if (!result.ok) {
+                setCheckStatus('check-thermal-ok', 'warn', 'Thermal monitoring is not running: ' + errorOf(result));
+                return;
+            }
+            const data = result.data;
+            const cpuTemp = data.cpuTemperatureC || 0;
+            const batteryTemp = data.batteryTemperatureC || 0;
+            if (cpuTemp <= 0 && batteryTemp <= 0) {
+                setCheckStatus('check-thermal-ok', 'pending', 'Waiting for the first temperature reading...');
+                return;
+            }
 
-            document.getElementById('cpu-temp').textContent = cpuTemp.toFixed(1) + '\u00B0C';
-            document.getElementById('battery-temp').textContent = batteryTemp.toFixed(1) + '\u00B0C';
+            document.getElementById('cpu-temp').textContent = cpuTemp.toFixed(1) + '°C';
+            document.getElementById('battery-temp').textContent = batteryTemp.toFixed(1) + '°C';
 
-            // Scale bars (0-80°C range)
-            var cpuPct = Math.min(100, (cpuTemp / 80) * 100);
-            var batteryPct = Math.min(100, (batteryTemp / 60) * 100);
+            // Scale bars (CPU 0-80°C, battery 0-60°C)
+            const cpuPct = Math.min(100, (cpuTemp / 80) * 100);
+            const batteryPct = Math.min(100, (batteryTemp / 60) * 100);
 
-            var cpuBar = document.getElementById('cpu-bar');
-            var batteryBar = document.getElementById('battery-bar');
+            const cpuBar = document.getElementById('cpu-bar');
+            const batteryBar = document.getElementById('battery-bar');
 
             cpuBar.style.width = cpuPct + '%';
             batteryBar.style.width = batteryPct + '%';
@@ -316,7 +374,7 @@ function pollThermal() {
             batteryBar.style.background = tempColor(batteryTemp, 42, 48);
 
             // Overall thermal check
-            var level = data.overallLevel || 'NORMAL';
+            const level = data.overallLevel || 'NORMAL';
             if (level === 'NORMAL' || level === 'ELEVATED') {
                 setCheckStatus('check-thermal-ok', 'pass', 'Thermal behavior normal (' + level + ')');
             } else if (level === 'WARNING') {
@@ -338,114 +396,98 @@ function tempColor(temp, warnThreshold, critThreshold) {
 
 // ==================== Step 5: Activate ====================
 
+const S3_PROVIDERS = { S3: 'Amazon S3', BACKBLAZE_B2: 'Backblaze B2', MINIO: 'MinIO', CLOUDFLARE_R2: 'Cloudflare R2' };
+
 function updateSummary() {
     document.getElementById('summary-preset').textContent =
         selectedPreset === 'appliance' ? 'Appliance (24/7 unattended)' :
         selectedPreset === 'interactive' ? 'Interactive (kiosk with preview)' :
         'Not selected';
 
-    var storageType = document.getElementById('storage-type').value;
-    document.getElementById('summary-storage').textContent =
-        storageType === 'none' ? 'Local only' :
-        storageType === 's3' ? 'S3-Compatible' :
-        storageType === 'smb' ? 'SMB/CIFS Network Share' : 'Local only';
+    const storageType = document.getElementById('storage-type').value;
+    let storage = 'Local only';
+    if (storageType === 's3') {
+        const s3 = s3Settings();
+        storage = (S3_PROVIDERS[s3.backend] || 'S3') + (s3.bucket ? ': ' + s3.bucket : '');
+    } else if (storageType === 'smb') {
+        const smb = smbSettings();
+        storage = 'SMB/CIFS share' + (smb.server ? ': \\\\' + smb.server + '\\' + smb.share : '');
+    }
+    document.getElementById('summary-storage').textContent = storage;
 
-    // Fetch fresh device info
-    fetch('/api/device')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            document.getElementById('summary-device').textContent =
-                data.manufacturer + ' ' + data.model;
+    api('/api/device')
+        .then(function(result) {
+            if (result.ok) {
+                document.getElementById('summary-device').textContent = result.data.manufacturer + ' ' + result.data.model;
+            }
         })
         .catch(function() {});
 
-    fetch('/api/thermal/profile')
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            document.getElementById('summary-thermal').textContent =
-                data.profile.displayName;
+    api('/api/thermal/profile')
+        .then(function(result) {
+            if (result.ok && result.data.profile) {
+                document.getElementById('summary-thermal').textContent = result.data.profile.displayName;
+            }
         })
         .catch(function() {});
+
+    document.getElementById('btn-activate').disabled = !selectedPreset;
 }
 
+// Each step must succeed before the next: a failure stops activation and says where
 function activateKiosk() {
-    var resultEl = document.getElementById('activation-result');
-    resultEl.className = 'result-banner';
-    resultEl.style.display = 'block';
-    resultEl.innerHTML = '<span class="spinner"></span> Applying preset and activating kiosk mode...';
+    const resultEl = document.getElementById('activation-result');
+    showBanner(resultEl, 'pending', null, '<span class="spinner"></span> Applying preset and activating kiosk mode...');
 
-    var activateBtn = document.getElementById('btn-activate');
+    const activateBtn = document.getElementById('btn-activate');
     activateBtn.disabled = true;
 
-    // Apply preset
-    var presetUrl = selectedPreset === 'appliance'
+    const presetUrl = selectedPreset === 'appliance'
         ? '/api/kiosk/preset/appliance'
         : '/api/kiosk/preset/interactive';
 
-    fetch(presetUrl, { method: 'POST' })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            // Save storage config if set
-            return saveStorageConfig();
+    function step(name, request) {
+        return request.then(function(result) {
+            if (!result.ok) {
+                throw new Error(name + ' failed: ' + errorOf(result));
+            }
+            return result;
+        });
+    }
+
+    step('Applying the preset', api(presetUrl, 'POST'))
+        .then(function() {
+            return saveStorageConfig(step);
         })
         .then(function() {
-            // Enable kiosk
-            return fetch('/api/kiosk/enable', { method: 'POST' });
+            return step('Turning on kiosk mode', api('/api/kiosk/enable', 'POST'));
         })
-        .then(function(r) { return r.json(); })
-        .then(function(data) {
-            if (data.success !== false) {
-                resultEl.className = 'result-banner success';
-                resultEl.innerHTML =
-                    '<strong>Kiosk mode activated!</strong><br>' +
-                    'Preset: ' + (selectedPreset === 'appliance' ? 'Appliance' : 'Interactive') + '<br>' +
-                    'The device will enter kiosk mode on next restart, or you can start it from the dashboard.';
+        .then(function(result) {
+            const lockTask = result.data.lockTask;
+            showBanner(resultEl, lockTask === false ? 'pending' : 'success', null,
+                '<strong>' + (lockTask === false ? 'Kiosk settings saved' : 'Kiosk mode activated!') + '</strong><br>');
+            resultEl.appendChild(document.createTextNode(
+                'Preset: ' + (selectedPreset === 'appliance' ? 'Appliance' : 'Interactive') + '. ' + (result.data.message || '')));
 
-                // Mark step 5 as done
-                var step5 = document.querySelector('.step[data-step="5"]');
-                if (step5) {
-                    step5.classList.remove('active');
-                    step5.classList.add('done');
-                }
-            } else {
-                resultEl.className = 'result-banner error';
-                resultEl.textContent = 'Activation failed: ' + (data.error || 'Unknown error');
-                activateBtn.disabled = false;
+            const step5 = document.querySelector('.step[data-step="5"]');
+            if (step5) {
+                step5.classList.remove('active');
+                step5.classList.add('done');
             }
         })
         .catch(function(err) {
-            resultEl.className = 'result-banner error';
-            resultEl.textContent = 'Error: ' + err.message;
+            showBanner(resultEl, 'error', err.message);
             activateBtn.disabled = false;
         });
 }
 
-function saveStorageConfig() {
-    var storageType = document.getElementById('storage-type').value;
+function saveStorageConfig(step) {
+    const storageType = document.getElementById('storage-type').value;
 
     if (storageType === 's3') {
-        return fetch('/api/upload/s3/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                endpoint: document.getElementById('s3-endpoint').value,
-                region: document.getElementById('s3-region').value,
-                bucket: document.getElementById('s3-bucket').value,
-                accessKey: document.getElementById('s3-access-key').value,
-                secretKey: document.getElementById('s3-secret-key').value
-            })
-        });
+        return step('Saving the S3 settings', api('/api/upload/s3/config', 'POST', s3Settings()));
     } else if (storageType === 'smb') {
-        return fetch('/api/upload/smb/config', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                host: document.getElementById('smb-host').value,
-                share: document.getElementById('smb-share').value,
-                username: document.getElementById('smb-username').value,
-                password: document.getElementById('smb-password').value
-            })
-        });
+        return step('Saving the SMB settings', api('/api/upload/smb/config', 'POST', smbSettings()));
     }
 
     return Promise.resolve();

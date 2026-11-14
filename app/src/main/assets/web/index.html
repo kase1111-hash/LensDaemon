@@ -10,41 +10,46 @@
     <div class="container">
         <header>
             <h1>LensDaemon</h1>
-            <div id="connection-status" class="status-indicator disconnected">Disconnected</div>
+            <div class="header-actions">
+                <a href="/setup" class="header-link">Setup wizard</a>
+                <div id="connection-status" class="status-indicator disconnected">Disconnected</div>
+            </div>
         </header>
 
-        <main>
-            <!-- Preview Section -->
-            <section class="preview-section">
-                <div class="preview-container">
-                    <img id="mjpeg-preview" src="" alt="Live Preview" class="preview-image">
-                    <div id="preview-overlay" class="preview-overlay">
-                        <span>Click to start preview</span>
-                    </div>
-                </div>
-                <div class="preview-controls">
-                    <button id="btn-preview" class="btn btn-primary">Start Preview</button>
-                    <button id="btn-snapshot" class="btn btn-secondary">Snapshot</button>
-                </div>
-            </section>
+        <div id="toast-area" class="toast-area" aria-live="polite"></div>
 
-            <!-- Controls Section -->
-            <section class="controls-section">
-                <!-- Stream Controls -->
-                <div class="control-group">
-                    <h3>Stream Control</h3>
+        <main>
+            <div class="column">
+                <!-- Preview Section -->
+                <section class="preview-section">
+                    <div class="preview-container">
+                        <img id="mjpeg-preview" src="" alt="Live Preview" class="preview-image">
+                        <div id="preview-overlay" class="preview-overlay">
+                            <span>Click to start preview</span>
+                        </div>
+                    </div>
+                    <div class="preview-controls">
+                        <button id="btn-preview" class="btn btn-primary">Start Preview</button>
+                        <button id="btn-snapshot" class="btn btn-secondary">Snapshot</button>
+                    </div>
+                </section>
+
+                <!-- Encoder shared by every output -->
+                <section class="card">
+                    <h3>Streaming</h3>
                     <div class="stream-status">
                         <span>Status: </span>
-                        <span id="stream-status" class="status-text">Stopped</span>
+                        <span id="stream-status" class="status-text stopped">Stopped</span>
                     </div>
+                    <p class="stream-hint">RTSP, MPEG-TS and recording share one encoder, started with the encoder settings by whichever starts first. Start Encoder warms it up without sending anything.</p>
                     <div class="button-group">
-                        <button id="btn-stream-start" class="btn btn-success">Start Streaming</button>
-                        <button id="btn-stream-stop" class="btn btn-danger" disabled>Stop Streaming</button>
+                        <button id="btn-stream-start" class="btn btn-success">Start Encoder</button>
+                        <button id="btn-stream-stop" class="btn btn-danger" disabled>Stop All</button>
                     </div>
-                </div>
+                </section>
 
                 <!-- RTSP Controls -->
-                <div class="control-group">
+                <section class="card">
                     <h3>RTSP Server</h3>
                     <div class="rtsp-info">
                         <span>URL: </span>
@@ -58,10 +63,10 @@
                         <button id="btn-rtsp-start" class="btn btn-success">Start RTSP</button>
                         <button id="btn-rtsp-stop" class="btn btn-danger" disabled>Stop RTSP</button>
                     </div>
-                </div>
+                </section>
 
                 <!-- MPEG-TS/UDP Controls -->
-                <div class="control-group">
+                <section class="card">
                     <h3>MPEG-TS over UDP</h3>
                     <div class="stream-target">
                         <div class="form-group">
@@ -82,98 +87,296 @@
                         <button id="btn-mpegts-start" class="btn btn-success">Start MPEG-TS</button>
                         <button id="btn-mpegts-stop" class="btn btn-danger" disabled>Stop MPEG-TS</button>
                     </div>
-                </div>
+                </section>
 
-                <!-- Lens Selection -->
-                <div class="control-group">
-                    <h3>Camera Lens</h3>
+                <!-- Local recording -->
+                <section class="card">
+                    <h3>Recording</h3>
+                    <div class="stream-status">
+                        <span>Status: </span>
+                        <span id="recording-status" class="status-text stopped">Stopped</span>
+                    </div>
+                    <div id="recording-detail" class="detail-line"></div>
+                    <div class="form-group inline-field">
+                        <label for="segment-minutes">New file every</label>
+                        <select id="segment-minutes">
+                            <option value="1">1 minute</option>
+                            <option value="5" selected>5 minutes</option>
+                            <option value="15">15 minutes</option>
+                            <option value="30">30 minutes</option>
+                            <option value="60">60 minutes</option>
+                            <option value="0">Never (one file)</option>
+                        </select>
+                    </div>
+                    <div class="button-group">
+                        <button id="btn-record-start" class="btn btn-success">Start Recording</button>
+                        <button id="btn-record-pause" class="btn btn-warning" disabled>Pause</button>
+                        <button id="btn-record-stop" class="btn btn-danger" disabled>Stop Recording</button>
+                    </div>
+                </section>
+            </div>
+
+            <div class="column">
+                <!-- Camera: lens, zoom, exposure -->
+                <section class="card">
+                    <h3>Camera</h3>
+                    <div class="field-label">Lens</div>
                     <div id="lens-buttons" class="lens-buttons">
                         <button class="btn btn-lens" data-lens="wide">Wide</button>
                         <button class="btn btn-lens active" data-lens="main">Main</button>
                         <button class="btn btn-lens" data-lens="tele">Tele</button>
                     </div>
-                </div>
-
-                <!-- Zoom Control -->
-                <div class="control-group">
-                    <h3>Zoom</h3>
+                    <label class="field-label" for="zoom-slider">Zoom</label>
                     <div class="zoom-control">
                         <input type="range" id="zoom-slider" min="1" max="10" step="0.1" value="1">
                         <span id="zoom-value">1.0x</span>
                     </div>
-                </div>
-
-                <!-- Exposure Control -->
-                <div class="control-group">
-                    <h3>Exposure</h3>
+                    <label class="field-label" for="exposure-slider">Exposure</label>
                     <div class="exposure-control">
                         <input type="range" id="exposure-slider" min="-12" max="12" step="1" value="0">
                         <span id="exposure-value">0 EV</span>
                     </div>
+                </section>
+
+                <!-- Settings Section -->
+                <section class="settings-section">
+                    <h3>Encoder Settings</h3>
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label for="resolution">Resolution</label>
+                            <select id="resolution">
+                                <option value="1280x720">720p (1280x720)</option>
+                                <option value="1920x1080" selected>1080p (1920x1080)</option>
+                                <option value="3840x2160">4K (3840x2160)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="bitrate">Bitrate (Mbps)</label>
+                            <input type="number" id="bitrate" value="4" min="0.5" max="20" step="0.5">
+                        </div>
+                        <div class="form-group">
+                            <label for="framerate">Frame Rate</label>
+                            <select id="framerate">
+                                <option value="15">15 fps</option>
+                                <option value="24">24 fps</option>
+                                <option value="30" selected>30 fps</option>
+                                <option value="60">60 fps</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="codec">Codec</label>
+                            <select id="codec">
+                                <option value="H264" selected>H.264</option>
+                                <option value="H265">H.265 (HEVC)</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label for="audio-enabled">Phone microphone</label>
+                            <label class="checkbox-row">
+                                <input type="checkbox" id="audio-enabled" checked>
+                                <span id="audio-state">On</span>
+                            </label>
+                        </div>
+                    </div>
+                    <p id="encoder-note" class="stream-hint" hidden></p>
+                </section>
+
+                <!-- Stats Section -->
+                <section class="stats-section">
+                    <h3>Statistics</h3>
+                    <div class="stats-grid">
+                        <div class="stat-item">
+                            <span class="stat-label">Frames Encoded</span>
+                            <span id="stat-frames" class="stat-value">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Current FPS</span>
+                            <span id="stat-fps" class="stat-value">0</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Bitrate</span>
+                            <span id="stat-bitrate" class="stat-value">0 kbps</span>
+                        </div>
+                        <div class="stat-item">
+                            <span class="stat-label">Encoder State</span>
+                            <span id="stat-encoder" class="stat-value">IDLE</span>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Thermal -->
+                <section class="card" id="thermal-card">
+                    <h3>Temperature</h3>
+                    <p id="thermal-unavailable" class="muted" hidden>Thermal monitoring is not running.</p>
+                    <div id="thermal-body">
+                        <div class="meter-row">
+                            <span class="meter-label">CPU</span>
+                            <div class="meter"><div id="cpu-meter" class="meter-fill"></div></div>
+                            <span id="cpu-temp" class="meter-value">--</span>
+                            <span id="cpu-level" class="level-chip">--</span>
+                        </div>
+                        <div class="meter-row">
+                            <span class="meter-label">Battery</span>
+                            <div class="meter"><div id="battery-meter" class="meter-fill"></div></div>
+                            <span id="battery-temp" class="meter-value">--</span>
+                            <span id="battery-level" class="level-chip">--</span>
+                        </div>
+                        <div id="battery-detail" class="detail-line"></div>
+                        <div id="throttle-detail" class="detail-line"></div>
+                        <div id="thermal-profile" class="detail-line muted"></div>
+                    </div>
+                </section>
+
+                <!-- Kiosk mode -->
+                <section class="card" id="kiosk-card">
+                    <h3>Kiosk Mode</h3>
+                    <p id="kiosk-unavailable" class="muted" hidden>Kiosk mode is not available.</p>
+                    <div id="kiosk-body">
+                        <div class="status-row">
+                            <span class="label">Kiosk mode</span>
+                            <span id="kiosk-enabled" class="value">--</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Pinned to the screen</span>
+                            <span id="kiosk-pinned" class="value">--</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Device owner</span>
+                            <span id="kiosk-owner" class="value">--</span>
+                        </div>
+                        <div class="status-row">
+                            <span class="label">Screen</span>
+                            <span id="kiosk-screen" class="value">--</span>
+                        </div>
+                        <p id="kiosk-hint" class="stream-hint"></p>
+                        <div class="button-group">
+                            <button id="btn-kiosk-toggle" class="btn btn-primary" disabled>Turn On</button>
+                            <a href="/setup" class="btn btn-secondary">Setup wizard</a>
+                        </div>
+                    </div>
+                </section>
+            </div>
+
+            <!-- Recordings on the phone -->
+            <section class="card wide">
+                <div class="card-header">
+                    <h3>Recordings</h3>
+                    <div class="button-group tight">
+                        <button id="btn-recordings-refresh" class="btn btn-small">Refresh</button>
+                        <button id="btn-storage-cleanup" class="btn btn-small" title="Delete recordings the retention policy no longer keeps">Clean up</button>
+                    </div>
+                </div>
+                <div class="storage-line">
+                    <div class="meter"><div id="storage-meter" class="meter-fill"></div></div>
+                    <span id="storage-text" class="detail-line">--</span>
+                </div>
+                <div id="recordings-list" class="item-list">
+                    <div class="empty-note">No recordings</div>
                 </div>
             </section>
 
-            <!-- Settings Section -->
-            <section class="settings-section">
-                <h3>Encoder Settings</h3>
-                <div class="settings-form">
-                    <div class="form-group">
-                        <label for="resolution">Resolution</label>
-                        <select id="resolution">
-                            <option value="1280x720">720p (1280x720)</option>
-                            <option value="1920x1080" selected>1080p (1920x1080)</option>
-                            <option value="3840x2160">4K (3840x2160)</option>
-                        </select>
+            <!-- Network storage -->
+            <section class="card wide" id="upload-card">
+                <h3>Network Storage</h3>
+                <p id="upload-unavailable" class="muted" hidden>The upload service is not running.</p>
+                <div id="upload-body">
+                    <div class="status-row">
+                        <span class="label">Uploads</span>
+                        <span id="upload-state" class="value">--</span>
                     </div>
-                    <div class="form-group">
-                        <label for="bitrate">Bitrate (Mbps)</label>
-                        <input type="number" id="bitrate" value="4" min="0.5" max="20" step="0.5">
+                    <div class="status-row">
+                        <span class="label">Queue</span>
+                        <span id="upload-queue" class="value">--</span>
                     </div>
-                    <div class="form-group">
-                        <label for="framerate">Frame Rate</label>
-                        <select id="framerate">
-                            <option value="15">15 fps</option>
-                            <option value="24">24 fps</option>
-                            <option value="30" selected>30 fps</option>
-                            <option value="60">60 fps</option>
-                        </select>
+                    <div id="upload-current" class="detail-line"></div>
+                    <div class="button-group wrap">
+                        <button id="btn-upload-start" class="btn btn-small">Start uploads</button>
+                        <button id="btn-upload-stop" class="btn btn-small">Pause uploads</button>
+                        <button id="btn-upload-retry" class="btn btn-small">Retry failed</button>
+                        <button id="btn-upload-clear" class="btn btn-small">Clear pending</button>
                     </div>
-                    <div class="form-group">
-                        <label for="codec">Codec</label>
-                        <select id="codec">
-                            <option value="H264" selected>H.264</option>
-                            <option value="H265">H.265 (HEVC)</option>
-                        </select>
-                    </div>
-                    <div class="form-group">
-                        <label for="audio-enabled">Phone microphone</label>
-                        <label class="checkbox-row">
-                            <input type="checkbox" id="audio-enabled" checked>
-                            <span id="audio-state">On</span>
-                        </label>
-                    </div>
-                </div>
-            </section>
 
-            <!-- Stats Section -->
-            <section class="stats-section">
-                <h3>Statistics</h3>
-                <div class="stats-grid">
-                    <div class="stat-item">
-                        <span class="stat-label">Frames Encoded</span>
-                        <span id="stat-frames" class="stat-value">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-label">Current FPS</span>
-                        <span id="stat-fps" class="stat-value">0</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-label">Bitrate</span>
-                        <span id="stat-bitrate" class="stat-value">0 kbps</span>
-                    </div>
-                    <div class="stat-item">
-                        <span class="stat-label">Encoder State</span>
-                        <span id="stat-encoder" class="stat-value">IDLE</span>
+                    <div class="config-grid">
+                    <details class="config-block" id="s3-block">
+                        <summary>S3-compatible bucket <span id="s3-summary" class="summary-state">Not set up</span></summary>
+                        <div class="settings-form">
+                            <div class="form-group">
+                                <label for="s3-backend">Provider</label>
+                                <select id="s3-backend">
+                                    <option value="S3">Amazon S3</option>
+                                    <option value="BACKBLAZE_B2">Backblaze B2</option>
+                                    <option value="MINIO">MinIO</option>
+                                    <option value="CLOUDFLARE_R2">Cloudflare R2</option>
+                                </select>
+                            </div>
+                            <div class="form-group">
+                                <label for="s3-endpoint">Endpoint</label>
+                                <input type="text" id="s3-endpoint" placeholder="empty for AWS / B2" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="s3-region">Region</label>
+                                <input type="text" id="s3-region" placeholder="us-east-1" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="s3-bucket">Bucket</label>
+                                <input type="text" id="s3-bucket" placeholder="my-recordings" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="s3-access-key">Access key ID</label>
+                                <input type="text" id="s3-access-key" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="s3-secret-key">Secret access key</label>
+                                <input type="password" id="s3-secret-key" autocomplete="new-password">
+                            </div>
+                            <div class="form-group">
+                                <label for="s3-prefix">Folder in the bucket</label>
+                                <input type="text" id="s3-prefix" placeholder="optional" autocomplete="off">
+                            </div>
+                        </div>
+                        <div class="button-group">
+                            <button id="btn-s3-save" class="btn btn-primary btn-sm">Save</button>
+                            <button id="btn-s3-test" class="btn btn-secondary btn-sm">Test</button>
+                            <button id="btn-s3-remove" class="btn btn-danger btn-sm">Remove</button>
+                        </div>
+                        <div id="s3-result" class="result-line"></div>
+                    </details>
+
+                    <details class="config-block" id="smb-block">
+                        <summary>SMB network share <span id="smb-summary" class="summary-state">Not set up</span></summary>
+                        <div class="settings-form">
+                            <div class="form-group">
+                                <label for="smb-server">Server</label>
+                                <input type="text" id="smb-server" placeholder="192.168.1.100" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="smb-share">Share</label>
+                                <input type="text" id="smb-share" placeholder="recordings" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="smb-username">Username</label>
+                                <input type="text" id="smb-username" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="smb-password">Password</label>
+                                <input type="password" id="smb-password" autocomplete="new-password">
+                            </div>
+                            <div class="form-group">
+                                <label for="smb-domain">Domain</label>
+                                <input type="text" id="smb-domain" placeholder="optional" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="smb-prefix">Folder on the share</label>
+                                <input type="text" id="smb-prefix" placeholder="optional" autocomplete="off">
+                            </div>
+                        </div>
+                        <div class="button-group">
+                            <button id="btn-smb-save" class="btn btn-primary btn-sm">Save</button>
+                            <button id="btn-smb-test" class="btn btn-secondary btn-sm">Test</button>
+                            <button id="btn-smb-remove" class="btn btn-danger btn-sm">Remove</button>
+                        </div>
+                        <div id="smb-result" class="result-line"></div>
+                    </details>
                     </div>
                 </div>
             </section>
@@ -182,8 +385,8 @@
             <section class="director-section">
                 <div class="director-header">
                     <h3>AI Director</h3>
-                    <label class="toggle-switch">
-                        <input type="checkbox" id="director-enabled">
+                    <label class="toggle-switch" title="Enable the AI Director">
+                        <input type="checkbox" id="director-enabled" aria-label="Enable the AI Director">
                         <span class="toggle-slider"></span>
                     </label>
                 </div>
@@ -205,7 +408,7 @@
                         </div>
                         <div class="status-row">
                             <span class="label">Take:</span>
-                            <span id="director-take" class="value">#0</span>
+                            <span id="director-take" class="value">-</span>
                         </div>
                     </div>
 
@@ -219,7 +422,7 @@
                             <div class="no-scripts">No saved scripts</div>
                         </div>
                         <div class="browser-actions">
-                            <input type="text" id="script-filename" placeholder="filename" class="input-small">
+                            <input type="text" id="script-filename" placeholder="filename" class="input-small" aria-label="Script file name">
                             <button id="btn-save-script" class="btn btn-small btn-primary">Save As</button>
                         </div>
                     </div>
@@ -250,9 +453,17 @@ Return to wide shot."></textarea>
                     </div>
 
                     <!-- Scene Progress -->
-                    <div class="status-row">
-                        <span class="label">Progress:</span>
-                        <span id="scene-progress" class="value">-</span>
+                    <div class="director-progress">
+                        <div class="status-row">
+                            <span class="label">Progress:</span>
+                            <span id="scene-progress" class="value">-</span>
+                        </div>
+                        <div class="scene-jump">
+                            <label for="scene-select" class="label">Go to scene</label>
+                            <select id="scene-select" disabled>
+                                <option value="">No script loaded</option>
+                            </select>
+                        </div>
                     </div>
 
                     <!-- Director Controls -->
@@ -297,7 +508,7 @@ Return to wide shot."></textarea>
                             <span id="dir-stat-quality" class="value">-</span>
                         </div>
                         <div class="stat-mini">
-                            <span class="label">Best Takes</span>
+                            <span class="label">Good Takes</span>
                             <span id="dir-stat-best" class="value">0</span>
                         </div>
                         <div class="stat-mini">
@@ -311,7 +522,7 @@ Return to wide shot."></textarea>
         </main>
 
         <footer>
-            <p>LensDaemon v1.0 | <span id="device-info">Loading...</span></p>
+            <p>LensDaemon | <span id="device-info">Loading...</span></p>
         </footer>
     </div>
 

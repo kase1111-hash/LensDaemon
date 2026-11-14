@@ -1,98 +1,239 @@
 /**
  * LensDaemon Dashboard JavaScript
+ *
+ * Talks to the phone's REST API (docs/API.md). Every panel reads the fields the
+ * API actually returns; the status, thermal, upload and kiosk panels poll while
+ * the page is visible and stop while it is hidden, to spare the phone.
  */
+'use strict';
 
 // API base URL
 const API_BASE = '';
+
+// Polling intervals
+const STATUS_POLL_MS = 2000;
+const SLOW_POLL_MS = 5000;
+const KIOSK_POLL_MS = 10000;
+const LIBRARY_POLL_MS = 30000;
 
 // State
 let isStreaming = false;
 let isRtspRunning = false;
 let isMpegTsRunning = false;
 let isPreviewActive = false;
-let statusInterval = null;
+let pollTimers = [];
+let connected = false;
+let deviceInfoLoaded = false;
+
+// Encoder settings form: follows the running encoder until edited
+let encoderFormEdited = false;
+
+// Camera controls
+let zoomDragging = false;
+let exposureDragging = false;
+let exposureStep = 0;
+let availableLenses = [];
+
+// Recording
+let recordingActive = false;
+let recordingPaused = false;
+let currentRecordingFile = '';
+let recordingsCache = [];
+
+// Network storage
+const uploadConfigured = { S3: false, SMB: false };
+
+// Kiosk
+let kioskEnabled = false;
+
+// Thermal thresholds (replaced by the active profile's)
+const thermalLimits = { cpuWarn: 50, cpuEmergency: 60, batteryWarn: 42, batteryEmergency: 48 };
 
 // Director state
 let directorEnabled = false;
 let directorState = 'DISABLED';
 let directorEventSource = null;
+let directorReconnectTimer = null;
+let directorDataLoaded = false;
 let loadedScriptFileName = null;
+let sceneOptionsKey = '';
+
+const $ = id => document.getElementById(id);
 
 // DOM Elements
 const elements = {
-    connectionStatus: document.getElementById('connection-status'),
-    previewImage: document.getElementById('mjpeg-preview'),
-    previewOverlay: document.getElementById('preview-overlay'),
-    btnPreview: document.getElementById('btn-preview'),
-    btnSnapshot: document.getElementById('btn-snapshot'),
-    btnStreamStart: document.getElementById('btn-stream-start'),
-    btnStreamStop: document.getElementById('btn-stream-stop'),
-    btnRtspStart: document.getElementById('btn-rtsp-start'),
-    btnRtspStop: document.getElementById('btn-rtsp-stop'),
-    streamStatus: document.getElementById('stream-status'),
-    rtspUrl: document.getElementById('rtsp-url'),
-    rtspClients: document.getElementById('rtsp-clients'),
-    mpegtsHost: document.getElementById('mpegts-host'),
-    mpegtsPort: document.getElementById('mpegts-port'),
-    mpegtsStatus: document.getElementById('mpegts-status'),
-    mpegtsObsInput: document.getElementById('mpegts-obs-input'),
-    btnMpegtsStart: document.getElementById('btn-mpegts-start'),
-    btnMpegtsStop: document.getElementById('btn-mpegts-stop'),
-    lensButtons: document.querySelectorAll('.btn-lens'),
-    zoomSlider: document.getElementById('zoom-slider'),
-    zoomValue: document.getElementById('zoom-value'),
-    exposureSlider: document.getElementById('exposure-slider'),
-    exposureValue: document.getElementById('exposure-value'),
-    resolution: document.getElementById('resolution'),
-    bitrate: document.getElementById('bitrate'),
-    framerate: document.getElementById('framerate'),
-    codec: document.getElementById('codec'),
-    audioEnabled: document.getElementById('audio-enabled'),
-    audioState: document.getElementById('audio-state'),
-    statFrames: document.getElementById('stat-frames'),
-    statFps: document.getElementById('stat-fps'),
-    statBitrate: document.getElementById('stat-bitrate'),
-    statEncoder: document.getElementById('stat-encoder'),
-    deviceInfo: document.getElementById('device-info'),
+    connectionStatus: $('connection-status'),
+    toastArea: $('toast-area'),
+    previewImage: $('mjpeg-preview'),
+    previewOverlay: $('preview-overlay'),
+    btnPreview: $('btn-preview'),
+    btnSnapshot: $('btn-snapshot'),
+    btnStreamStart: $('btn-stream-start'),
+    btnStreamStop: $('btn-stream-stop'),
+    btnRtspStart: $('btn-rtsp-start'),
+    btnRtspStop: $('btn-rtsp-stop'),
+    streamStatus: $('stream-status'),
+    rtspUrl: $('rtsp-url'),
+    rtspClients: $('rtsp-clients'),
+    mpegtsHost: $('mpegts-host'),
+    mpegtsPort: $('mpegts-port'),
+    mpegtsStatus: $('mpegts-status'),
+    mpegtsObsInput: $('mpegts-obs-input'),
+    btnMpegtsStart: $('btn-mpegts-start'),
+    btnMpegtsStop: $('btn-mpegts-stop'),
+    lensButtons: $('lens-buttons'),
+    zoomSlider: $('zoom-slider'),
+    zoomValue: $('zoom-value'),
+    exposureSlider: $('exposure-slider'),
+    exposureValue: $('exposure-value'),
+    resolution: $('resolution'),
+    bitrate: $('bitrate'),
+    framerate: $('framerate'),
+    codec: $('codec'),
+    audioEnabled: $('audio-enabled'),
+    audioState: $('audio-state'),
+    encoderNote: $('encoder-note'),
+    statFrames: $('stat-frames'),
+    statFps: $('stat-fps'),
+    statBitrate: $('stat-bitrate'),
+    statEncoder: $('stat-encoder'),
+    deviceInfo: $('device-info'),
+
+    // Recording
+    recordingStatus: $('recording-status'),
+    recordingDetail: $('recording-detail'),
+    segmentMinutes: $('segment-minutes'),
+    btnRecordStart: $('btn-record-start'),
+    btnRecordPause: $('btn-record-pause'),
+    btnRecordStop: $('btn-record-stop'),
+    recordingsList: $('recordings-list'),
+    btnRecordingsRefresh: $('btn-recordings-refresh'),
+    btnStorageCleanup: $('btn-storage-cleanup'),
+    storageMeter: $('storage-meter'),
+    storageText: $('storage-text'),
+
+    // Thermal
+    thermalUnavailable: $('thermal-unavailable'),
+    thermalBody: $('thermal-body'),
+    cpuMeter: $('cpu-meter'),
+    cpuTemp: $('cpu-temp'),
+    cpuLevel: $('cpu-level'),
+    batteryMeter: $('battery-meter'),
+    batteryTemp: $('battery-temp'),
+    batteryLevel: $('battery-level'),
+    batteryDetail: $('battery-detail'),
+    throttleDetail: $('throttle-detail'),
+    thermalProfile: $('thermal-profile'),
+
+    // Network storage
+    uploadUnavailable: $('upload-unavailable'),
+    uploadBody: $('upload-body'),
+    uploadState: $('upload-state'),
+    uploadQueue: $('upload-queue'),
+    uploadCurrent: $('upload-current'),
+    btnUploadStart: $('btn-upload-start'),
+    btnUploadStop: $('btn-upload-stop'),
+    btnUploadRetry: $('btn-upload-retry'),
+    btnUploadClear: $('btn-upload-clear'),
+    s3Summary: $('s3-summary'),
+    s3Backend: $('s3-backend'),
+    s3Endpoint: $('s3-endpoint'),
+    s3Region: $('s3-region'),
+    s3Bucket: $('s3-bucket'),
+    s3AccessKey: $('s3-access-key'),
+    s3SecretKey: $('s3-secret-key'),
+    s3Prefix: $('s3-prefix'),
+    s3Result: $('s3-result'),
+    smbSummary: $('smb-summary'),
+    smbServer: $('smb-server'),
+    smbShare: $('smb-share'),
+    smbUsername: $('smb-username'),
+    smbPassword: $('smb-password'),
+    smbDomain: $('smb-domain'),
+    smbPrefix: $('smb-prefix'),
+    smbResult: $('smb-result'),
+
+    // Kiosk
+    kioskUnavailable: $('kiosk-unavailable'),
+    kioskBody: $('kiosk-body'),
+    kioskEnabled: $('kiosk-enabled'),
+    kioskPinned: $('kiosk-pinned'),
+    kioskOwner: $('kiosk-owner'),
+    kioskScreen: $('kiosk-screen'),
+    kioskHint: $('kiosk-hint'),
+    btnKioskToggle: $('btn-kiosk-toggle'),
 
     // Director elements
-    directorEnabled: document.getElementById('director-enabled'),
-    directorPanel: document.getElementById('director-panel'),
-    directorState: document.getElementById('director-state'),
-    directorScene: document.getElementById('director-scene'),
-    directorCue: document.getElementById('director-cue'),
-    directorTake: document.getElementById('director-take'),
-    scriptTextarea: document.getElementById('script-textarea'),
-    btnLoadScript: document.getElementById('btn-load-script'),
-    btnClearScript: document.getElementById('btn-clear-script'),
-    btnDirectorStart: document.getElementById('btn-director-start'),
-    btnDirectorPause: document.getElementById('btn-director-pause'),
-    btnDirectorStop: document.getElementById('btn-director-stop'),
-    btnDirectorAdvance: document.getElementById('btn-director-advance'),
+    directorSection: document.querySelector('.director-section'),
+    directorEnabled: $('director-enabled'),
+    directorPanel: $('director-panel'),
+    directorState: $('director-state'),
+    directorScene: $('director-scene'),
+    directorCue: $('director-cue'),
+    directorTake: $('director-take'),
+    scriptTextarea: $('script-textarea'),
+    btnLoadScript: $('btn-load-script'),
+    btnClearScript: $('btn-clear-script'),
+    btnDirectorStart: $('btn-director-start'),
+    btnDirectorPause: $('btn-director-pause'),
+    btnDirectorStop: $('btn-director-stop'),
+    btnDirectorAdvance: $('btn-director-advance'),
     cueButtons: document.querySelectorAll('.btn-cue'),
-    takesList: document.getElementById('takes-list'),
-    btnRefreshTakes: document.getElementById('btn-refresh-takes'),
-    statTotalTakes: document.getElementById('dir-stat-takes'),
-    statAvgQuality: document.getElementById('dir-stat-quality'),
-    statBestTakes: document.getElementById('dir-stat-best'),
-    statCueSuccess: document.getElementById('dir-stat-success'),
+    takesList: $('takes-list'),
+    btnRefreshTakes: $('btn-refresh-takes'),
+    statTotalTakes: $('dir-stat-takes'),
+    statAvgQuality: $('dir-stat-quality'),
+    statBestTakes: $('dir-stat-best'),
+    statCueSuccess: $('dir-stat-success'),
+    sceneProgress: $('scene-progress'),
+    sceneSelect: $('scene-select'),
 
     // Script browser elements
-    btnRefreshScripts: document.getElementById('btn-refresh-scripts'),
-    scriptFilesList: document.getElementById('script-files-list'),
-    scriptFilename: document.getElementById('script-filename'),
-    btnSaveScript: document.getElementById('btn-save-script'),
-
-    // Scene progress (text-only)
-    sceneProgress: document.getElementById('scene-progress')
+    btnRefreshScripts: $('btn-refresh-scripts'),
+    scriptFilesList: $('script-files-list'),
+    scriptFilename: $('script-filename'),
+    btnSaveScript: $('btn-save-script')
 };
 
 // Initialize
 document.addEventListener('DOMContentLoaded', () => {
     setupEventListeners();
     fetchDeviceInfo();
-    startStatusPolling();
+    fetchLenses();
+    fetchThermalProfile();
+    fetchStorageConfig();
+    refreshLibrary();
+    startPolling();
 });
+
+// Poll only while the page is visible: every request costs the phone a little
+document.addEventListener('visibilitychange', () => {
+    if (document.hidden) {
+        stopPolling();
+    } else {
+        startPolling();
+    }
+});
+
+function startPolling() {
+    stopPolling();
+    fetchStatus();
+    fetchThermal();
+    fetchUploadStatus();
+    fetchKioskStatus();
+    pollTimers = [
+        setInterval(fetchStatus, STATUS_POLL_MS),
+        setInterval(fetchThermal, SLOW_POLL_MS),
+        setInterval(fetchUploadStatus, SLOW_POLL_MS),
+        setInterval(fetchKioskStatus, KIOSK_POLL_MS),
+        setInterval(refreshLibrary, LIBRARY_POLL_MS)
+    ];
+}
+
+function stopPolling() {
+    pollTimers.forEach(clearInterval);
+    pollTimers = [];
+}
 
 // Setup event listeners
 function setupEventListeners() {
@@ -101,198 +242,266 @@ function setupEventListeners() {
     elements.previewOverlay.addEventListener('click', togglePreview);
     elements.btnSnapshot.addEventListener('click', captureSnapshot);
 
-    // Stream control
+    // Encoder and outputs
     elements.btnStreamStart.addEventListener('click', startStream);
     elements.btnStreamStop.addEventListener('click', stopStream);
-
-    // RTSP control
     elements.btnRtspStart.addEventListener('click', startRtsp);
     elements.btnRtspStop.addEventListener('click', stopRtsp);
-
-    // Phone microphone
-    elements.audioEnabled.addEventListener('change', setAudioEnabled);
-
-    // MPEG-TS/UDP control
     elements.btnMpegtsStart.addEventListener('click', startMpegTs);
     elements.btnMpegtsStop.addEventListener('click', stopMpegTs);
     elements.mpegtsPort.addEventListener('input', () => {
         elements.mpegtsObsInput.textContent = `udp://@:${elements.mpegtsPort.value || 9000}`;
     });
 
-    // Lens selection
-    elements.lensButtons.forEach(btn => {
+    // Phone microphone
+    elements.audioEnabled.addEventListener('change', setAudioEnabled);
+
+    // Settings edited by hand stop following the running encoder
+    [elements.resolution, elements.bitrate, elements.framerate, elements.codec].forEach(el => {
+        el.addEventListener('change', () => {
+            encoderFormEdited = true;
+            updateEncoderNote();
+        });
+    });
+
+    // Lens selection (the default buttons; replaced by the phone's own lenses once known)
+    elements.lensButtons.querySelectorAll('.btn-lens').forEach(btn => {
         btn.addEventListener('click', () => switchLens(btn.dataset.lens));
     });
 
     // Zoom control
     elements.zoomSlider.addEventListener('input', (e) => {
-        const zoom = parseFloat(e.target.value);
-        elements.zoomValue.textContent = `${zoom.toFixed(1)}x`;
+        zoomDragging = true;
+        elements.zoomValue.textContent = `${parseFloat(e.target.value).toFixed(1)}x`;
     });
     elements.zoomSlider.addEventListener('change', (e) => {
+        zoomDragging = false;
         setZoom(parseFloat(e.target.value));
     });
 
     // Exposure control
     elements.exposureSlider.addEventListener('input', (e) => {
-        const ev = parseInt(e.target.value);
-        elements.exposureValue.textContent = `${ev} EV`;
+        exposureDragging = true;
+        elements.exposureValue.textContent = formatExposure(parseInt(e.target.value, 10));
     });
     elements.exposureSlider.addEventListener('change', (e) => {
-        setExposure(parseInt(e.target.value));
+        exposureDragging = false;
+        setExposure(parseInt(e.target.value, 10));
     });
 
+    // Recording
+    elements.btnRecordStart.addEventListener('click', startRecording);
+    elements.btnRecordPause.addEventListener('click', toggleRecordingPause);
+    elements.btnRecordStop.addEventListener('click', stopRecording);
+    elements.btnRecordingsRefresh.addEventListener('click', refreshLibrary);
+    elements.btnStorageCleanup.addEventListener('click', cleanUpStorage);
+
+    // Network storage
+    elements.btnUploadStart.addEventListener('click', () => uploadAction('/api/upload/start'));
+    elements.btnUploadStop.addEventListener('click', () => uploadAction('/api/upload/stop'));
+    elements.btnUploadRetry.addEventListener('click', () => uploadAction('/api/upload/retry'));
+    elements.btnUploadClear.addEventListener('click', () => uploadAction('/api/upload/clear'));
+    $('btn-s3-save').addEventListener('click', saveS3);
+    $('btn-s3-test').addEventListener('click', testS3);
+    $('btn-s3-remove').addEventListener('click', () => removeStorage('s3'));
+    $('btn-smb-save').addEventListener('click', saveSmb);
+    $('btn-smb-test').addEventListener('click', testSmb);
+    $('btn-smb-remove').addEventListener('click', () => removeStorage('smb'));
+
+    // Kiosk
+    elements.btnKioskToggle.addEventListener('click', toggleKiosk);
+
     // Director controls
-    if (elements.directorEnabled) {
-        elements.directorEnabled.addEventListener('change', toggleDirector);
-    }
-    if (elements.btnLoadScript) {
-        elements.btnLoadScript.addEventListener('click', loadScript);
-    }
-    if (elements.btnClearScript) {
-        elements.btnClearScript.addEventListener('click', clearScript);
-    }
-    if (elements.btnDirectorStart) {
-        elements.btnDirectorStart.addEventListener('click', startDirector);
-    }
-    if (elements.btnDirectorPause) {
-        elements.btnDirectorPause.addEventListener('click', pauseDirector);
-    }
-    if (elements.btnDirectorStop) {
-        elements.btnDirectorStop.addEventListener('click', stopDirector);
-    }
-    if (elements.btnDirectorAdvance) {
-        elements.btnDirectorAdvance.addEventListener('click', advanceDirector);
-    }
-
-    // Quick cue buttons
-    if (elements.cueButtons) {
-        elements.cueButtons.forEach(btn => {
-            btn.addEventListener('click', () => executeQuickCue(btn.dataset.cue));
-        });
-    }
-
-    // Refresh takes button
-    if (elements.btnRefreshTakes) {
-        elements.btnRefreshTakes.addEventListener('click', fetchTakesList);
-    }
-
-    // Script browser
-    if (elements.btnRefreshScripts) {
-        elements.btnRefreshScripts.addEventListener('click', fetchScriptFiles);
-    }
-    if (elements.btnSaveScript) {
-        elements.btnSaveScript.addEventListener('click', saveScriptFile);
-    }
-
+    elements.directorEnabled.addEventListener('change', toggleDirector);
+    elements.btnLoadScript.addEventListener('click', loadScript);
+    elements.btnClearScript.addEventListener('click', clearScript);
+    elements.btnDirectorStart.addEventListener('click', startDirector);
+    elements.btnDirectorPause.addEventListener('click', pauseDirector);
+    elements.btnDirectorStop.addEventListener('click', stopDirector);
+    elements.btnDirectorAdvance.addEventListener('click', advanceDirector);
+    elements.sceneSelect.addEventListener('change', jumpToScene);
+    elements.cueButtons.forEach(btn => {
+        btn.addEventListener('click', () => executeQuickCue(btn.dataset.cue));
+    });
+    elements.btnRefreshTakes.addEventListener('click', fetchTakesList);
+    elements.btnRefreshScripts.addEventListener('click', fetchScriptFiles);
+    elements.btnSaveScript.addEventListener('click', saveScriptFile);
 }
 
-// API calls
+// ==================== API ====================
+
+/**
+ * Call the API. Returns the parsed JSON (with an `error` when the request
+ * failed and the server said nothing), or null when the phone can't be reached.
+ */
 async function apiCall(endpoint, method = 'GET', body = null) {
     try {
-        const options = {
-            method,
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        };
-
-        if (body) {
+        const options = { method, headers: {} };
+        if (body !== null && body !== undefined) {
+            options.headers['Content-Type'] = 'application/json; charset=utf-8';
             options.body = JSON.stringify(body);
         }
-
         const response = await fetch(`${API_BASE}${endpoint}`, options);
-        return await response.json();
+        let data = {};
+        try {
+            data = await response.json();
+        } catch (e) {
+            data = {};
+        }
+        if (data === null || typeof data !== 'object') {
+            data = {};
+        }
+        if (!response.ok && !data.error) {
+            data.error = `HTTP ${response.status}`;
+        }
+        Object.defineProperty(data, 'httpStatus', { value: response.status, enumerable: false });
+        return data;
     } catch (error) {
-        console.error('API call failed:', error);
+        console.warn('API call failed:', endpoint, error);
         return null;
     }
 }
 
-// Fetch device info
-async function fetchDeviceInfo() {
-    const info = await apiCall('/api/device');
-    if (info) {
-        elements.deviceInfo.textContent = `${info.manufacturer} ${info.model} | Android ${info.androidVersion}`;
-        // Default the MPEG-TS target to the computer this dashboard is open on
-        if (info.clientAddress && !elements.mpegtsHost.value) {
-            elements.mpegtsHost.value = info.clientAddress;
-        }
-    }
+/** Whether an API answer reports success. */
+function succeeded(result) {
+    return !!result && result.httpStatus < 400 && result.success !== false && !result.error;
 }
 
-// Status polling
-function startStatusPolling() {
-    fetchStatus();
-    statusInterval = setInterval(fetchStatus, 2000);
+function errorText(result) {
+    if (!result) return 'the phone did not answer';
+    return result.error || result.message || 'unknown error';
+}
+
+const MAX_TOASTS = 4;
+
+/** A short notice in the corner, instead of a blocking alert. */
+function notify(message, kind = 'info') {
+    while (elements.toastArea.childElementCount >= MAX_TOASTS) {
+        elements.toastArea.firstElementChild.remove();
+    }
+    const toast = document.createElement('div');
+    toast.className = `toast ${kind}`;
+    toast.textContent = message;
+    elements.toastArea.appendChild(toast);
+    setTimeout(() => toast.remove(), kind === 'error' ? 8000 : 4000);
+}
+
+function setConnected(isConnected) {
+    connected = isConnected;
+    elements.connectionStatus.textContent = isConnected ? 'Connected' : 'Disconnected';
+    elements.connectionStatus.className = `status-indicator ${isConnected ? 'connected' : 'disconnected'}`;
+}
+
+// ==================== Device and status ====================
+
+async function fetchDeviceInfo() {
+    const info = await apiCall('/api/device');
+    if (!info || info.error) return;
+    deviceInfoLoaded = true;
+    const version = info.appVersion ? `${info.appVersion} | ` : '';
+    elements.deviceInfo.textContent = `${version}${info.manufacturer} ${info.model} | Android ${info.androidVersion}`;
+    // Default the MPEG-TS target to the computer this dashboard is open on
+    if (info.clientAddress && !elements.mpegtsHost.value) {
+        elements.mpegtsHost.value = info.clientAddress;
+    }
 }
 
 async function fetchStatus() {
     const status = await apiCall('/api/status');
 
-    if (status && status.status === 'ok') {
-        // Connected
-        elements.connectionStatus.textContent = 'Connected';
-        elements.connectionStatus.className = 'status-indicator connected';
+    if (!status || status.status !== 'ok') {
+        setConnected(false);
+        return;
+    }
 
-        // Camera status
-        updateStreamStatus(status.camera?.streamingActive || false);
+    const reconnected = !connected;
+    setConnected(true);
+    if (reconnected && !deviceInfoLoaded) {
+        fetchDeviceInfo();
+    }
 
-        // Encoder stats
-        if (status.encoder) {
-            elements.statFrames.textContent = formatNumber(status.encoder.framesEncoded || 0);
-            elements.statFps.textContent = (status.encoder.currentFps || 0).toFixed(1);
-            elements.statBitrate.textContent = formatBitrate(status.encoder.currentBitrate || 0);
-            const enc = status.encoder;
-            elements.statEncoder.textContent = enc.width
-                ? `${enc.state} ${enc.width}x${enc.height}@${enc.frameRate} ${enc.codec}`
-                : (enc.state || 'IDLE');
-        }
+    updateStreamStatus(status);
+    updateEncoderStats(status.encoder);
+    syncEncoderForm(status.encoder);
+    updateRtspStatus(status.rtsp);
+    updateMpegTsStatus(status.mpegts);
+    updateAudioStatus(status.audio);
+    updateCameraControls(status.camera);
+    updateRecordingStatus(status.recording);
 
-        // RTSP status
-        updateRtspStatus(status.rtsp);
-
-        // MPEG-TS status
-        updateMpegTsStatus(status.mpegts);
-
-        // Microphone
-        updateAudioStatus(status.audio);
-
-        // Zoom
-        if (status.camera?.zoom) {
-            elements.zoomSlider.value = status.camera.zoom;
-            elements.zoomValue.textContent = `${status.camera.zoom.toFixed(1)}x`;
-        }
-
-        // Director status — hide section entirely if backend has no director
-        var directorSection = document.querySelector('.director-section');
-        if (status.director) {
-            if (directorSection) directorSection.style.display = '';
-            updateDirectorStatus(status.director);
-        } else {
-            if (directorSection) directorSection.style.display = 'none';
-        }
-
+    // Director: the section only exists on builds with the director
+    if (status.director) {
+        elements.directorSection.style.display = '';
+        updateDirectorStatus(status.director);
     } else {
-        // Disconnected
-        elements.connectionStatus.textContent = 'Disconnected';
-        elements.connectionStatus.className = 'status-indicator disconnected';
+        elements.directorSection.style.display = 'none';
     }
 }
 
-// Update stream status UI
-function updateStreamStatus(streaming) {
-    isStreaming = streaming;
-    elements.streamStatus.textContent = streaming ? 'Streaming' : 'Stopped';
-    elements.streamStatus.className = streaming ? 'status-text running' : 'status-text stopped';
-    elements.btnStreamStart.disabled = streaming;
-    elements.btnStreamStop.disabled = !streaming;
+// Overall streaming status: the shared encoder and the outputs using it
+function updateStreamStatus(status) {
+    const encoderOn = !!status.camera?.streamingActive;
+    const outputs = [];
+    if (status.rtsp?.running) outputs.push(`RTSP (${status.rtsp.playing || 0} watching)`);
+    if (status.mpegts?.running) outputs.push('MPEG-TS');
+    if (status.recording?.active) outputs.push(status.recording.paused ? 'recording (paused)' : 'recording');
 
-    if (streaming) {
-        document.body.classList.add('streaming');
-    } else {
-        document.body.classList.remove('streaming');
+    isStreaming = encoderOn || outputs.length > 0;
+    let text = 'Stopped';
+    if (outputs.length > 0) {
+        text = `Live: ${outputs.join(', ')}`;
+    } else if (encoderOn) {
+        text = 'Encoder running, no outputs';
     }
+    elements.streamStatus.textContent = text;
+    elements.streamStatus.className = `status-text ${isStreaming ? 'running' : 'stopped'}`;
+    elements.btnStreamStart.disabled = encoderOn;
+    elements.btnStreamStop.disabled = !isStreaming;
+    document.body.classList.toggle('streaming', isStreaming);
+}
+
+function updateEncoderStats(enc) {
+    if (!enc) return;
+    elements.statFrames.textContent = formatNumber(enc.framesEncoded || 0);
+    elements.statFps.textContent = (enc.currentFps || 0).toFixed(1);
+    elements.statBitrate.textContent = formatBitrate(enc.currentBitrate || 0);
+    elements.statEncoder.textContent = enc.width
+        ? `${enc.state} ${enc.width}x${enc.height}@${enc.frameRate} ${enc.codec}`
+        : (enc.state || 'IDLE');
+}
+
+// The settings form shows what the running encoder uses, until edited
+let runningEncoder = null;
+function syncEncoderForm(enc) {
+    runningEncoder = enc && enc.width ? enc : null;
+    if (runningEncoder && !encoderFormEdited) {
+        setSelectValue(elements.resolution, `${enc.width}x${enc.height}`, `${enc.width}x${enc.height}`);
+        elements.bitrate.value = +(enc.bitrate / 1000000).toFixed(1);
+        setSelectValue(elements.framerate, String(enc.frameRate), `${enc.frameRate} fps`);
+        setSelectValue(elements.codec, enc.codec, enc.codec);
+    }
+    updateEncoderNote();
+}
+
+function updateEncoderNote() {
+    const settings = encoderSettings();
+    const differs = runningEncoder && (
+        settings.width !== runningEncoder.width || settings.height !== runningEncoder.height ||
+        settings.frameRate !== runningEncoder.frameRate || settings.codec !== runningEncoder.codec ||
+        Math.abs(settings.bitrate - runningEncoder.bitrate) >= 50000);
+    elements.encoderNote.hidden = !differs;
+    if (differs) {
+        elements.encoderNote.textContent = `The encoder is running at ${runningEncoder.width}x${runningEncoder.height} ` +
+            `${runningEncoder.frameRate} fps ${runningEncoder.codec}, ${formatBitrate(runningEncoder.bitrate)}. ` +
+            'These settings apply when it next starts: use Stop All first to change them now.';
+    }
+}
+
+function setSelectValue(select, value, label) {
+    if (![...select.options].some(o => o.value === value)) {
+        select.add(new Option(label, value));
+    }
+    select.value = value;
 }
 
 // Update RTSP status UI
@@ -354,8 +563,10 @@ function updateAudioStatus(audio) {
 
 async function setAudioEnabled() {
     const result = await apiCall('/api/audio', 'POST', { enabled: elements.audioEnabled.checked });
-    if (result) {
+    if (succeeded(result)) {
         updateAudioStatus(result);
+    } else {
+        notify('Could not switch the microphone: ' + errorText(result), 'error');
     }
 }
 
@@ -363,19 +574,16 @@ async function setAudioEnabled() {
 function encoderSettings() {
     const resolution = elements.resolution.value.split('x');
     return {
-        width: parseInt(resolution[0]),
-        height: parseInt(resolution[1]),
-        bitrate: parseFloat(elements.bitrate.value) * 1000000,
-        frameRate: parseInt(elements.framerate.value),
+        width: parseInt(resolution[0], 10),
+        height: parseInt(resolution[1], 10),
+        bitrate: Math.round(parseFloat(elements.bitrate.value) * 1000000),
+        frameRate: parseInt(elements.framerate.value, 10),
         codec: elements.codec.value
     };
 }
 
-function errorText(result) {
-    return result?.message || result?.error || 'Unknown error';
-}
+// ==================== Preview and snapshot ====================
 
-// Preview control
 function togglePreview() {
     if (isPreviewActive) {
         stopPreview();
@@ -385,64 +593,94 @@ function togglePreview() {
 }
 
 function startPreview() {
+    elements.previewImage.onerror = () => {
+        if (isPreviewActive) {
+            notify('The preview stopped', 'error');
+        }
+        stopPreview();
+    };
     elements.previewImage.src = '/mjpeg?' + Date.now();
     elements.previewImage.classList.add('active');
     elements.previewOverlay.classList.add('hidden');
     elements.btnPreview.textContent = 'Stop Preview';
     isPreviewActive = true;
-
-    elements.previewImage.onerror = () => {
-        console.log('MJPEG stream error');
-        stopPreview();
-    };
 }
 
 function stopPreview() {
-    elements.previewImage.src = '';
+    isPreviewActive = false;
+    elements.previewImage.onerror = null;
+    elements.previewImage.removeAttribute('src');
     elements.previewImage.classList.remove('active');
     elements.previewOverlay.classList.remove('hidden');
     elements.btnPreview.textContent = 'Start Preview';
-    isPreviewActive = false;
 }
 
-// Stream control
-// Starting the encoder applies the settings panel; outputs started later
-// share the running encoder. Stop Streaming stops every output.
+async function captureSnapshot() {
+    try {
+        const response = await fetch('/api/snapshot');
+        if (!response.ok) {
+            const data = await response.json().catch(() => ({}));
+            notify('Snapshot failed: ' + (data.error || `HTTP ${response.status}`), 'error');
+            return;
+        }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `snapshot_${new Date().toISOString().replace(/[:.]/g, '-')}.jpg`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        // Revoking at once can cancel the download in some browsers
+        setTimeout(() => URL.revokeObjectURL(url), 10000);
+    } catch (error) {
+        console.error('Snapshot error:', error);
+        notify('Snapshot failed: the phone did not answer', 'error');
+    }
+}
+
+// ==================== Encoder and outputs ====================
+
+// Start Encoder applies the settings panel; outputs started later share the
+// running encoder. Stop All stops every output and the encoder.
 async function startStream() {
     const result = await apiCall('/api/stream/start', 'POST', encoderSettings());
-    if (result?.success) {
-        updateStreamStatus(true);
+    if (succeeded(result)) {
+        encoderFormEdited = false;
+        notify('Encoder started: start RTSP, MPEG-TS or a recording to send it somewhere', 'success');
     } else {
-        alert('Failed to start streaming: ' + errorText(result));
+        notify('Failed to start the encoder: ' + errorText(result), 'error');
     }
     fetchStatus();
 }
 
 async function stopStream() {
     const result = await apiCall('/api/stream/stop', 'POST');
-    if (result?.success) {
-        updateStreamStatus(false);
+    if (!succeeded(result)) {
+        notify('Failed to stop: ' + errorText(result), 'error');
     }
     fetchStatus();
+    refreshLibrary();
 }
 
-// RTSP control
 async function startRtsp() {
     const config = { ...encoderSettings(), port: 8554 };
-
     const result = await apiCall('/api/rtsp/start', 'POST', config);
-    if (result?.success) {
+    if (succeeded(result)) {
+        encoderFormEdited = false;
         updateRtspStatus({ running: true, url: result.url, playing: 0 });
     } else {
-        alert('Failed to start RTSP: ' + errorText(result));
+        notify('Failed to start RTSP: ' + errorText(result), 'error');
     }
     fetchStatus();
 }
 
 async function stopRtsp() {
     const result = await apiCall('/api/rtsp/stop', 'POST');
-    if (result?.success) {
+    if (succeeded(result)) {
         updateRtspStatus({ running: false, url: '', playing: 0 });
+    } else {
+        notify('Failed to stop RTSP: ' + errorText(result), 'error');
     }
     fetchStatus();
 }
@@ -451,72 +689,634 @@ async function stopRtsp() {
 async function startMpegTs() {
     const targetHost = elements.mpegtsHost.value.trim();
     if (!targetHost) {
-        alert('Enter the address of the machine running OBS');
+        notify('Enter the address of the machine running OBS', 'error');
+        elements.mpegtsHost.focus();
         return;
     }
     const config = {
         ...encoderSettings(),
         mode: 'caller',
         targetHost,
-        targetPort: parseInt(elements.mpegtsPort.value) || 9000
+        targetPort: parseInt(elements.mpegtsPort.value, 10) || 9000
     };
 
     const result = await apiCall('/api/mpegts/start', 'POST', config);
-    if (!result?.success) {
-        alert('Failed to start MPEG-TS: ' + errorText(result));
+    if (succeeded(result)) {
+        encoderFormEdited = false;
+    } else {
+        notify('Failed to start MPEG-TS: ' + errorText(result), 'error');
     }
     fetchStatus();
 }
 
 async function stopMpegTs() {
-    await apiCall('/api/mpegts/stop', 'POST');
+    const result = await apiCall('/api/mpegts/stop', 'POST');
+    if (!succeeded(result)) {
+        notify('Failed to stop MPEG-TS: ' + errorText(result), 'error');
+    }
     fetchStatus();
 }
 
-// Lens control
+// ==================== Camera ====================
+
+const LENS_FAMILY = {
+    ULTRA_WIDE: 'wide', WIDE: 'wide', MAIN: 'main', TELEPHOTO: 'tele', SUPER_TELEPHOTO: 'tele'
+};
+
+// The phone's own lenses replace the default Wide / Main / Tele buttons
+async function fetchLenses() {
+    const result = await apiCall('/api/lenses');
+    if (!result || result.error || !Array.isArray(result.available) || result.available.length === 0) return;
+
+    const seen = new Set();
+    availableLenses = result.available.filter(lens => {
+        if (seen.has(lens.type)) return false;
+        seen.add(lens.type);
+        return true;
+    });
+    elements.lensButtons.innerHTML = '';
+    availableLenses.forEach(lens => {
+        const btn = document.createElement('button');
+        btn.className = 'btn btn-lens';
+        btn.dataset.lens = lens.type.toLowerCase();
+        btn.dataset.type = lens.type;
+        btn.title = lens.focalLength ? `${lens.displayName}, ${lens.focalLength.toFixed(1)} mm` : lens.displayName;
+        btn.textContent = lens.type === 'MAIN' ? 'Main' : lens.displayName;
+        if (lens.zoomFactor) {
+            const factor = document.createElement('span');
+            factor.className = 'lens-factor';
+            factor.textContent = lens.zoomFactor;
+            btn.appendChild(factor);
+        }
+        btn.addEventListener('click', () => switchLens(btn.dataset.lens));
+        elements.lensButtons.appendChild(btn);
+    });
+    markActiveLens(result.current);
+}
+
+function markActiveLens(type) {
+    if (!type || type === 'none') return;
+    elements.lensButtons.querySelectorAll('.btn-lens').forEach(btn => {
+        const active = btn.dataset.type
+            ? btn.dataset.type === type
+            : btn.dataset.lens === LENS_FAMILY[type];
+        btn.classList.toggle('active', active);
+    });
+}
+
 async function switchLens(lens) {
-    const result = await apiCall(`/api/lens/${lens}`, 'POST');
-    if (result?.success) {
-        elements.lensButtons.forEach(btn => {
-            btn.classList.toggle('active', btn.dataset.lens === lens);
-        });
+    const result = await apiCall(`/api/lens/${encodeURIComponent(lens)}`, 'POST');
+    if (succeeded(result)) {
+        markActiveLens(result.lens);
+    } else {
+        notify('Could not switch lens: ' + errorText(result), 'error');
     }
 }
 
-// Camera controls
+function updateCameraControls(camera) {
+    if (!camera) return;
+
+    markActiveLens(camera.currentLens);
+    // A lens this page hasn't listed: the camera's lenses changed
+    if (availableLenses.length > 0 && camera.currentLens !== 'none' &&
+        !availableLenses.some(lens => lens.type === camera.currentLens)) {
+        fetchLenses();
+    }
+
+    if (camera.maxZoom && camera.maxZoom >= 1) {
+        elements.zoomSlider.max = camera.maxZoom;
+    }
+    if (!zoomDragging && typeof camera.zoom === 'number') {
+        elements.zoomSlider.value = camera.zoom;
+        elements.zoomValue.textContent = `${camera.zoom.toFixed(1)}x`;
+    }
+
+    const exposure = camera.exposure;
+    if (exposure && exposure.max > exposure.min) {
+        exposureStep = exposure.step || 0;
+        elements.exposureSlider.min = exposure.min;
+        elements.exposureSlider.max = exposure.max;
+        if (!exposureDragging) {
+            elements.exposureSlider.value = exposure.value;
+            elements.exposureValue.textContent = formatExposure(exposure.value);
+        }
+    }
+}
+
+// Exposure compensation is set in the camera's own steps (often 1/6 or 1/3 EV)
+function formatExposure(steps) {
+    if (!exposureStep) return `${steps} EV`;
+    const ev = steps * exposureStep;
+    const text = Math.abs(ev) < 0.05 ? '0' : `${ev > 0 ? '+' : ''}${ev.toFixed(1)}`;
+    return `${text} EV`;
+}
+
 async function setZoom(zoom) {
-    await apiCall('/api/zoom', 'POST', { zoom });
+    const result = await apiCall('/api/zoom', 'POST', { zoom });
+    if (!succeeded(result)) {
+        notify('Could not set zoom: ' + errorText(result), 'error');
+    }
 }
 
 async function setExposure(ev) {
-    await apiCall('/api/exposure', 'POST', { ev });
-}
-
-// Snapshot
-async function captureSnapshot() {
-    try {
-        const response = await fetch('/api/snapshot');
-        if (response.ok) {
-            const blob = await response.blob();
-            const url = URL.createObjectURL(blob);
-
-            // Download the image
-            const a = document.createElement('a');
-            a.href = url;
-            a.download = `snapshot_${Date.now()}.jpg`;
-            a.click();
-
-            URL.revokeObjectURL(url);
-        } else {
-            alert('Failed to capture snapshot');
-        }
-    } catch (error) {
-        console.error('Snapshot error:', error);
-        alert('Failed to capture snapshot');
+    const result = await apiCall('/api/exposure', 'POST', { ev });
+    if (!succeeded(result)) {
+        notify('Could not set exposure: ' + errorText(result), 'error');
     }
 }
 
-// Utility functions
+// ==================== Recording ====================
+
+function updateRecordingStatus(recording) {
+    if (!recording) return;
+    const wasActive = recordingActive;
+    recordingActive = !!recording.active;
+    recordingPaused = !!recording.paused;
+
+    if (recordingActive) {
+        elements.recordingStatus.textContent = recordingPaused ? 'Paused' : 'Recording';
+        elements.recordingStatus.className = `status-text ${recordingPaused ? 'paused' : 'running'}`;
+        fetchRecordingDetail();
+    } else {
+        elements.recordingStatus.textContent = 'Stopped';
+        elements.recordingStatus.className = 'status-text stopped';
+        elements.recordingDetail.textContent = '';
+        currentRecordingFile = '';
+    }
+    elements.btnRecordStart.disabled = recordingActive;
+    elements.btnRecordPause.disabled = !recordingActive;
+    elements.btnRecordPause.textContent = recordingPaused ? 'Resume' : 'Pause';
+    elements.btnRecordStop.disabled = !recordingActive;
+
+    // A recording that just ended has left new files
+    if (wasActive && !recordingActive) {
+        refreshLibrary();
+    }
+}
+
+async function fetchRecordingDetail() {
+    const r = await apiCall('/api/recording/status');
+    if (!r || r.error || !r.recording) return;
+    const previousFile = currentRecordingFile;
+    currentRecordingFile = baseName(r.currentFile || '');
+    const parts = [formatDuration(r.durationSec || 0), `file ${(r.segmentIndex || 0) + 1}`, formatFileSize(r.totalBytes || 0)];
+    if (r.avgBitrateKbps) parts.push(formatBitrate(r.avgBitrateKbps * 1000));
+    elements.recordingDetail.textContent = parts.join(' · ');
+    if (currentRecordingFile !== previousFile) {
+        // A new segment file: show it in the list
+        fetchRecordings();
+    }
+}
+
+async function startRecording() {
+    const body = { ...encoderSettings(), segmentMinutes: parseInt(elements.segmentMinutes.value, 10) };
+    const result = await apiCall('/api/recording/start', 'POST', body);
+    if (succeeded(result)) {
+        encoderFormEdited = false;
+        notify(`Recording (new file every ${result.segmentDuration || 'segment'})`, 'success');
+    } else {
+        notify('Failed to start recording: ' + errorText(result), 'error');
+    }
+    fetchStatus();
+}
+
+async function toggleRecordingPause() {
+    const endpoint = recordingPaused ? '/api/recording/resume' : '/api/recording/pause';
+    const result = await apiCall(endpoint, 'POST');
+    if (!succeeded(result)) {
+        notify(errorText(result), 'error');
+    }
+    fetchStatus();
+}
+
+async function stopRecording() {
+    const result = await apiCall('/api/recording/stop', 'POST');
+    if (succeeded(result)) {
+        const count = result.segmentCount || 0;
+        notify(`Recording saved: ${count} file${count === 1 ? '' : 's'}`, 'success');
+    } else {
+        notify('Failed to stop recording: ' + errorText(result), 'error');
+    }
+    fetchStatus();
+    refreshLibrary();
+}
+
+// ==================== Recordings and storage ====================
+
+function refreshLibrary() {
+    fetchRecordings();
+    fetchStorageStatus();
+}
+
+async function fetchRecordings() {
+    const result = await apiCall('/api/recordings');
+    if (!result || result.error) {
+        elements.recordingsList.innerHTML = '';
+        elements.recordingsList.appendChild(emptyNote(`Recordings unavailable: ${errorText(result)}`));
+        return;
+    }
+    recordingsCache = (result.recordings || []).slice().sort((a, b) => b.lastModified - a.lastModified);
+    renderRecordings();
+}
+
+function renderRecordings() {
+    const list = elements.recordingsList;
+    list.innerHTML = '';
+    if (recordingsCache.length === 0) {
+        list.appendChild(emptyNote('No recordings yet'));
+        return;
+    }
+    recordingsCache.forEach(rec => {
+        const live = recordingActive && rec.name === currentRecordingFile;
+        const item = document.createElement('div');
+        item.className = 'list-item';
+
+        const main = document.createElement('div');
+        main.className = 'list-item-main';
+        const name = document.createElement('div');
+        name.className = 'list-item-name';
+        // Long names may wrap after an underscore rather than mid-word
+        rec.name.split('_').forEach((part, i, parts) => {
+            name.append(i < parts.length - 1 ? `${part}_` : part);
+            if (i < parts.length - 1) name.appendChild(document.createElement('wbr'));
+        });
+        const meta = document.createElement('div');
+        meta.className = 'list-item-meta';
+        meta.textContent = `${formatDate(rec.lastModified)} · ${formatFileSize(rec.sizeBytes || 0)}`;
+        if (live) {
+            const badge = document.createElement('span');
+            badge.className = 'live-badge';
+            badge.textContent = ' · ● recording';
+            meta.appendChild(badge);
+        }
+        main.append(name, meta);
+
+        const actions = document.createElement('div');
+        actions.className = 'list-item-actions';
+        if (!live) {
+            const download = document.createElement('a');
+            download.className = 'btn btn-small';
+            download.href = `/api/recordings/${encodeURIComponent(rec.name)}`;
+            download.setAttribute('download', rec.name);
+            download.textContent = 'Download';
+            actions.appendChild(download);
+
+            ['S3', 'SMB'].filter(dest => uploadConfigured[dest]).forEach(dest => {
+                actions.appendChild(actionButton(`Upload to ${dest}`, 'btn btn-small', () => uploadRecording(rec, dest)));
+            });
+            actions.appendChild(actionButton('Delete', 'btn btn-small btn-danger-outline', () => deleteRecording(rec)));
+        }
+
+        item.append(main, actions);
+        list.appendChild(item);
+    });
+}
+
+async function deleteRecording(rec) {
+    if (!confirm(`Delete ${rec.name} from the phone?`)) return;
+    const result = await apiCall(`/api/recordings/${encodeURIComponent(rec.name)}`, 'DELETE');
+    if (succeeded(result)) {
+        notify(`Deleted ${rec.name}`, 'success');
+    } else {
+        notify('Delete failed: ' + errorText(result), 'error');
+    }
+    refreshLibrary();
+}
+
+async function uploadRecording(rec, destination) {
+    const result = await apiCall('/api/upload/enqueue', 'POST', { filePath: rec.path, destination });
+    if (succeeded(result)) {
+        notify(`${rec.name} queued for upload to ${destination}`, 'success');
+    } else {
+        notify('Upload failed: ' + errorText(result), 'error');
+    }
+    fetchUploadStatus();
+}
+
+async function cleanUpStorage() {
+    if (!confirm('Delete the recordings the retention policy no longer keeps?')) return;
+    const result = await apiCall('/api/storage/cleanup', 'POST');
+    if (succeeded(result)) {
+        notify(result.message || 'Clean-up started', 'success');
+        setTimeout(refreshLibrary, 2000);
+    } else {
+        notify('Clean-up failed: ' + errorText(result), 'error');
+    }
+}
+
+async function fetchStorageStatus() {
+    const r = await apiCall('/api/storage/status');
+    if (!r || r.error || !r.storage) {
+        elements.storageText.textContent = `Storage status unavailable: ${errorText(r)}`;
+        elements.storageMeter.style.width = '0';
+        return;
+    }
+    const st = r.storage;
+    const percent = Math.max(0, Math.min(100, st.usagePercent || 0));
+    elements.storageMeter.style.width = `${percent}%`;
+    elements.storageMeter.className = `meter-fill${st.isCriticallyLowSpace ? ' critical' : st.isLowSpace ? ' warning' : ''}`;
+    const count = r.totalRecordings || 0;
+    elements.storageText.textContent = `${formatGb(st.availableGB)} free of ${formatGb(st.totalGB)} · ` +
+        `${count} recording${count === 1 ? '' : 's'}, ${formatFileSize(r.totalRecordingsSizeBytes || 0)}` +
+        (st.isLowSpace ? ' · running low on space' : '');
+}
+
+// ==================== Thermal ====================
+
+async function fetchThermalProfile() {
+    const r = await apiCall('/api/thermal/profile');
+    if (!r || r.error || !r.profile) return;
+    const p = r.profile;
+    thermalLimits.cpuWarn = p.cpuWarnC;
+    thermalLimits.cpuEmergency = p.cpuEmergencyC;
+    thermalLimits.batteryWarn = p.batteryWarnC;
+    thermalLimits.batteryEmergency = p.batteryEmergencyC;
+    elements.thermalProfile.textContent = `Profile: ${p.displayName} (${r.source}). ` +
+        `Throttling starts at ${p.cpuWarnC}°C CPU or ${p.batteryWarnC}°C battery.`;
+}
+
+const LEVEL_CLASS = { NORMAL: 'normal', ELEVATED: 'normal', WARNING: 'warning', CRITICAL: 'critical', EMERGENCY: 'critical' };
+const THROTTLE_LABELS = {
+    REDUCE_RESOLUTION: 'lower resolution',
+    REDUCE_FRAMERATE: 'lower frame rate',
+    PAUSE_STREAMING: 'streaming paused',
+    DISABLE_CHARGING: 'charging paused',
+    ALERT_USER: 'alert'
+};
+
+async function fetchThermal() {
+    const r = await apiCall('/api/thermal/status');
+    const available = !!r && !r.error;
+    elements.thermalUnavailable.hidden = available;
+    elements.thermalBody.hidden = !available;
+    if (!available) {
+        elements.thermalUnavailable.textContent = r
+            ? `Thermal monitoring is not running (${errorText(r)}).`
+            : 'Thermal monitoring is unavailable: the phone did not answer.';
+        return;
+    }
+    if (r.cpuTemperatureC <= 0 && r.batteryTemperatureC <= 0) {
+        elements.throttleDetail.textContent = 'Waiting for the first reading…';
+        return;
+    }
+
+    showTemperature(elements.cpuMeter, elements.cpuTemp, elements.cpuLevel, r.cpuTemperatureC, r.cpuLevel, thermalLimits.cpuEmergency);
+    showTemperature(elements.batteryMeter, elements.batteryTemp, elements.batteryLevel,
+        r.batteryTemperatureC, r.batteryLevel, thermalLimits.batteryEmergency);
+
+    const battery = [`Battery ${r.batteryPercent}%`, r.isCharging ? 'charging' : 'not charging'];
+    if (r.chargingDisabled) battery.push('charging held back to keep it cool');
+    elements.batteryDetail.textContent = battery.join(' · ');
+
+    const actions = (r.activeActions || []).filter(a => a !== 'NONE').map(action =>
+        action === 'REDUCE_BITRATE' ? `bitrate −${r.bitrateReductionPercent}%` : (THROTTLE_LABELS[action] || action.toLowerCase()));
+    elements.throttleDetail.textContent = actions.length > 0
+        ? `Throttling: ${actions.join(', ')}`
+        : (r.isThrottling ? `Throttling (${r.statusText})` : 'Not throttling');
+}
+
+function showTemperature(meter, valueEl, chip, tempC, level, emergencyC) {
+    const floor = 20;
+    const percent = Math.max(0, Math.min(100, ((tempC - floor) / Math.max(1, emergencyC - floor)) * 100));
+    const cls = LEVEL_CLASS[level] || 'normal';
+    meter.style.width = `${percent}%`;
+    meter.className = `meter-fill${cls === 'normal' ? '' : ' ' + cls}`;
+    valueEl.textContent = `${tempC.toFixed(1)}°C`;
+    chip.textContent = (level || '--').toLowerCase();
+    chip.className = `level-chip ${cls}`;
+}
+
+// ==================== Network storage ====================
+
+const UPLOAD_STATES = { IDLE: 'Idle', UPLOADING: 'Uploading', PAUSED: 'Paused', ERROR: 'Error' };
+
+async function fetchUploadStatus() {
+    const r = await apiCall('/api/upload/status');
+    const available = !!r && !r.error;
+    elements.uploadUnavailable.hidden = available;
+    elements.uploadBody.hidden = !available;
+    if (!available) {
+        elements.uploadUnavailable.textContent = r
+            ? `The upload service is not running (${errorText(r)}).`
+            : 'The upload service is unavailable: the phone did not answer.';
+        return;
+    }
+
+    const configuredBefore = `${uploadConfigured.S3}/${uploadConfigured.SMB}`;
+    uploadConfigured.S3 = !!r.isS3Configured;
+    uploadConfigured.SMB = !!r.isSmbConfigured;
+    if (`${uploadConfigured.S3}/${uploadConfigured.SMB}` !== configuredBefore) {
+        renderRecordings();
+    }
+
+    const q = r.queue || {};
+    elements.uploadState.textContent = UPLOAD_STATES[r.state] || r.state;
+    elements.uploadQueue.textContent = `${q.pendingCount || 0} waiting · ${q.uploadingCount || 0} uploading · ` +
+        `${q.completedCount || 0} done · ${q.failedCount || 0} failed`;
+    elements.uploadCurrent.textContent = r.currentFile ? `Uploading ${r.currentFile} (${r.currentProgress || 0}%)` : '';
+    elements.btnUploadStart.disabled = r.state === 'UPLOADING';
+    elements.btnUploadStop.disabled = r.state !== 'UPLOADING';
+    elements.btnUploadRetry.disabled = !q.failedCount;
+    elements.btnUploadClear.disabled = !q.pendingCount;
+}
+
+async function uploadAction(endpoint) {
+    const result = await apiCall(endpoint, 'POST');
+    if (succeeded(result)) {
+        notify(result.message || 'Done', 'success');
+    } else {
+        notify(errorText(result), 'error');
+    }
+    fetchUploadStatus();
+}
+
+// Saved settings are shown without their secrets: enter them again to change anything
+async function fetchStorageConfig() {
+    const [s3, smb] = await Promise.all([apiCall('/api/upload/s3/config'), apiCall('/api/upload/smb/config')]);
+    if (s3 && !s3.error) {
+        if (s3.configured) {
+            elements.s3Backend.value = s3.backend || 'S3';
+            elements.s3Endpoint.value = s3.endpoint || '';
+            elements.s3Region.value = s3.region || '';
+            elements.s3Bucket.value = s3.bucket || '';
+            elements.s3Prefix.value = s3.pathPrefix || '';
+            elements.s3AccessKey.placeholder = `saved: ${s3.accessKeyId}`;
+            elements.s3SecretKey.placeholder = 'saved: enter again to change';
+        }
+        setSummary(elements.s3Summary, s3.configured ? `${s3.bucket} on ${s3.endpoint}` : 'Not set up', s3.configured);
+    }
+    if (smb && !smb.error) {
+        if (smb.configured) {
+            elements.smbServer.value = smb.server || '';
+            elements.smbShare.value = smb.share || '';
+            elements.smbUsername.value = smb.username || '';
+            elements.smbDomain.value = smb.domain || '';
+            elements.smbPrefix.value = smb.pathPrefix || '';
+            elements.smbPassword.placeholder = 'saved: enter again to change';
+        }
+        setSummary(elements.smbSummary, smb.configured ? `\\\\${smb.server}\\${smb.share}` : 'Not set up', smb.configured);
+    }
+}
+
+function setSummary(el, text, configured) {
+    el.textContent = text;
+    el.classList.toggle('configured', !!configured);
+}
+
+function s3FormValues() {
+    return {
+        backend: elements.s3Backend.value,
+        endpoint: elements.s3Endpoint.value.trim(),
+        region: elements.s3Region.value.trim(),
+        bucket: elements.s3Bucket.value.trim(),
+        accessKeyId: elements.s3AccessKey.value.trim(),
+        secretAccessKey: elements.s3SecretKey.value,
+        pathPrefix: elements.s3Prefix.value.trim()
+    };
+}
+
+function smbFormValues() {
+    return {
+        server: elements.smbServer.value.trim(),
+        share: elements.smbShare.value.trim(),
+        username: elements.smbUsername.value.trim(),
+        password: elements.smbPassword.value,
+        domain: elements.smbDomain.value.trim(),
+        pathPrefix: elements.smbPrefix.value.trim()
+    };
+}
+
+/** ok: true, false, or null while waiting for an answer. */
+function showResult(el, ok, text) {
+    el.textContent = text;
+    el.className = ok === null ? 'result-line' : `result-line ${ok ? 'success' : 'error'}`;
+}
+
+async function saveS3() {
+    const values = s3FormValues();
+    if (!values.bucket || !values.accessKeyId || !values.secretAccessKey) {
+        showResult(elements.s3Result, false, 'Enter the bucket, access key ID and secret access key');
+        return;
+    }
+    const result = await apiCall('/api/upload/s3/config', 'POST', values);
+    if (succeeded(result)) {
+        showResult(elements.s3Result, true, `Saved: ${result.bucket}${result.endpoint ? ' on ' + result.endpoint : ''}`);
+        elements.s3AccessKey.value = '';
+        elements.s3SecretKey.value = '';
+        fetchStorageConfig();
+        fetchUploadStatus();
+    } else {
+        showResult(elements.s3Result, false, 'Not saved: ' + errorText(result));
+    }
+}
+
+async function testS3() {
+    const values = s3FormValues();
+    // Test what is in the form when the keys are typed in, else the saved settings
+    const body = values.secretAccessKey ? values : null;
+    showResult(elements.s3Result, null, 'Testing…');
+    const result = await apiCall('/api/upload/s3/test', 'POST', body);
+    showResult(elements.s3Result, succeeded(result), succeeded(result) ? (result.message || 'Connection works') : errorText(result));
+}
+
+async function saveSmb() {
+    const values = smbFormValues();
+    if (!values.server || !values.share || !values.username || !values.password) {
+        showResult(elements.smbResult, false, 'Enter the server, share, username and password');
+        return;
+    }
+    const result = await apiCall('/api/upload/smb/config', 'POST', values);
+    if (succeeded(result)) {
+        showResult(elements.smbResult, true, `Saved: \\\\${result.server}\\${result.share}`);
+        elements.smbPassword.value = '';
+        fetchStorageConfig();
+        fetchUploadStatus();
+    } else {
+        showResult(elements.smbResult, false, 'Not saved: ' + errorText(result));
+    }
+}
+
+async function testSmb() {
+    const values = smbFormValues();
+    const body = values.password ? values : null;
+    showResult(elements.smbResult, null, 'Testing…');
+    const result = await apiCall('/api/upload/smb/test', 'POST', body);
+    showResult(elements.smbResult, succeeded(result), succeeded(result) ? (result.message || 'Connection works') : errorText(result));
+}
+
+async function removeStorage(kind) {
+    const label = kind === 's3' ? 'S3' : 'SMB';
+    if (!confirm(`Remove the saved ${label} settings?`)) return;
+    const result = await apiCall(`/api/upload/${kind}/config`, 'DELETE');
+    const resultEl = kind === 's3' ? elements.s3Result : elements.smbResult;
+    showResult(resultEl, succeeded(result), succeeded(result) ? `${label} settings removed` : errorText(result));
+    if (kind === 's3') {
+        elements.s3AccessKey.placeholder = '';
+        elements.s3SecretKey.placeholder = '';
+    } else {
+        elements.smbPassword.placeholder = '';
+    }
+    fetchStorageConfig();
+    fetchUploadStatus();
+}
+
+// ==================== Kiosk ====================
+
+const SCREEN_MODES = { PREVIEW: 'Camera preview', OFF: 'Off', DIM: 'Dimmed', BLACK: 'Black' };
+
+async function fetchKioskStatus() {
+    const r = await apiCall('/api/kiosk/status');
+    const available = !!r && !r.error;
+    elements.kioskUnavailable.hidden = available;
+    elements.kioskBody.hidden = !available;
+    if (!available) {
+        elements.kioskUnavailable.textContent = r
+            ? `Kiosk mode is not available (${errorText(r)}).`
+            : 'Kiosk mode is unavailable: the phone did not answer.';
+        return;
+    }
+
+    kioskEnabled = !!r.kioskEnabled;
+    elements.kioskEnabled.textContent = kioskEnabled ? 'On' : 'Off';
+    elements.kioskPinned.textContent = r.isLockTaskActive ? 'Yes' : 'No';
+    elements.kioskOwner.textContent = r.isDeviceOwner ? 'Yes' : 'No';
+    elements.kioskScreen.textContent = SCREEN_MODES[r.screenMode] || r.screenMode || '--';
+
+    let hint = '';
+    if (!r.isDeviceOwner) {
+        hint = 'LensDaemon can only lock the phone to its screen as device owner: ' +
+            'adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver (see the setup wizard).';
+    } else if (kioskEnabled && !r.isLockTaskActive) {
+        hint = 'Kiosk mode is on: LensDaemon pins itself as soon as its screen is open on the phone.';
+    } else if (kioskEnabled) {
+        hint = 'To leave kiosk mode at the phone, hold Volume Up + Volume Down for 5 seconds.';
+    }
+    if (kioskEnabled && r.autoStartEnabled) {
+        hint += (hint ? ' ' : '') + 'LensDaemon starts by itself after a reboot.';
+    }
+    elements.kioskHint.textContent = hint;
+    elements.btnKioskToggle.textContent = kioskEnabled ? 'Turn Off' : 'Turn On';
+    elements.btnKioskToggle.className = `btn ${kioskEnabled ? 'btn-danger' : 'btn-primary'}`;
+    elements.btnKioskToggle.disabled = false;
+}
+
+async function toggleKiosk() {
+    const enable = !kioskEnabled;
+    const question = enable
+        ? 'Turn on kiosk mode? LensDaemon will start on boot and, as device owner, lock the phone to its screen.'
+        : 'Turn off kiosk mode? LensDaemon will unpin itself and no longer start on boot.';
+    if (!confirm(question)) return;
+    const result = await apiCall(enable ? '/api/kiosk/enable' : '/api/kiosk/disable', 'POST');
+    if (succeeded(result)) {
+        notify(result.message || (enable ? 'Kiosk mode on' : 'Kiosk mode off'), 'success');
+    } else {
+        notify('Kiosk mode not changed: ' + errorText(result), 'error');
+    }
+    fetchKioskStatus();
+}
+
+// ==================== Utility functions ====================
+
 function formatNumber(num) {
     if (num >= 1000000) {
         return (num / 1000000).toFixed(1) + 'M';
@@ -545,235 +1345,300 @@ function formatDuration(seconds) {
     return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 
+function formatFileSize(bytes) {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+}
+
+function formatGb(gb) {
+    return typeof gb === 'number' ? `${gb.toFixed(1)} GB` : '--';
+}
+
+function formatDate(timestamp) {
+    const date = new Date(timestamp);
+    return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function baseName(path) {
+    return path.split('/').pop();
+}
+
+function emptyNote(text) {
+    const note = document.createElement('div');
+    note.className = 'empty-note';
+    note.textContent = text;
+    return note;
+}
+
+function actionButton(label, className, onClick) {
+    const btn = document.createElement('button');
+    btn.className = className;
+    btn.textContent = label;
+    btn.addEventListener('click', onClick);
+    return btn;
+}
+
 // ==================== AI Director Functions ====================
 
 // Toggle director enabled state
 async function toggleDirector() {
     const enabled = elements.directorEnabled.checked;
+    const result = await apiCall(enabled ? '/api/director/enable' : '/api/director/disable', 'POST');
 
-    // Use separate enable/disable endpoints
-    const endpoint = enabled ? '/api/director/enable' : '/api/director/disable';
-    const result = await apiCall(endpoint, 'POST');
-
-    if (result?.success) {
-        directorEnabled = enabled;
-        updateDirectorPanelState(enabled);
-
-        if (enabled) {
-            // Start SSE connection for real-time updates
-            startDirectorEventStream();
-            // Fetch takes list and script files
-            fetchTakesList();
-            fetchScriptFiles();
-        } else {
-            // Stop SSE connection
-            stopDirectorEventStream();
-        }
+    if (succeeded(result)) {
+        fetchStatus();
     } else {
-        // Revert checkbox
         elements.directorEnabled.checked = !enabled;
-        alert('Failed to toggle director: ' + (result?.message || 'Unknown error'));
+        notify('Failed to toggle the director: ' + errorText(result), 'error');
     }
 }
 
 // Update director panel enabled/disabled state
 function updateDirectorPanelState(enabled) {
-    if (elements.directorPanel) {
-        if (enabled) {
-            elements.directorPanel.classList.remove('disabled');
-        } else {
-            elements.directorPanel.classList.add('disabled');
-        }
-    }
+    elements.directorPanel.classList.toggle('disabled', !enabled);
 }
 
-// Update director status from API response
+// Update director status from the /api/status director block
 function updateDirectorStatus(director) {
-    directorEnabled = director.enabled;
-    directorState = director.state;
+    const wasEnabled = directorEnabled;
+    directorEnabled = !!director.enabled;
+    directorState = director.state || 'DISABLED';
 
-    // Update checkbox
-    if (elements.directorEnabled) {
-        elements.directorEnabled.checked = director.enabled;
+    elements.directorEnabled.checked = directorEnabled;
+    updateDirectorPanelState(directorEnabled);
+
+    // Live updates and lists, however the director came to be enabled
+    if (directorEnabled && (!wasEnabled || !directorDataLoaded)) {
+        directorDataLoaded = true;
+        startDirectorEventStream();
+        fetchTakesList();
+        fetchScriptFiles();
+    } else if (!directorEnabled && wasEnabled) {
+        directorDataLoaded = false;
+        stopDirectorEventStream();
     }
 
-    // Update panel state
-    updateDirectorPanelState(director.enabled);
+    elements.directorState.textContent = directorState;
+    elements.directorState.className = 'value state-' + directorState.toLowerCase().replace(/_/g, '-');
+    elements.directorScene.textContent = director.currentScene || '-';
+    elements.directorCue.textContent = director.currentCue || '-';
+    elements.directorTake.textContent = director.currentTake > 0 ? `#${director.currentTake}` : '-';
 
-    // Update state display
-    if (elements.directorState) {
-        elements.directorState.textContent = director.state;
-        elements.directorState.className = 'value state-' + director.state.toLowerCase().replace('_', '-');
-    }
-
-    // Update scene/cue/take info
-    if (elements.directorScene) {
-        elements.directorScene.textContent = director.currentScene || '-';
-    }
-    if (elements.directorCue) {
-        elements.directorCue.textContent = director.currentCue || '-';
-    }
-    if (elements.directorTake) {
-        elements.directorTake.textContent = director.currentTake || '-';
-    }
-
-    // Update control button states
-    updateDirectorControls(director.state);
-
-    // Update session stats
+    updateDirectorControls(directorState);
     if (director.stats) {
         updateDirectorStats(director.stats);
     }
+    updateSceneProgress(director);
+}
 
-    // Update text-based scene progress
-    if (elements.sceneProgress) {
-        if (director.currentScene && director.state === 'RUNNING') {
-            const cueInfo = director.cueIndex !== undefined ? ` (cue ${(director.cueIndex || 0) + 1})` : '';
-            elements.sceneProgress.textContent = `${director.currentScene}${cueInfo}`;
+// "Scene 2/5 · Cue 3/12" (counted from 1), and the scenes to jump to
+function updateSceneProgress(director) {
+    const hasScript = typeof director.sceneCount === 'number' && director.sceneCount > 0;
+    if (hasScript) {
+        const scene = `Scene ${director.sceneIndex + 1}/${director.sceneCount}`;
+        const cue = director.cueCount > 0 ? ` · Cue ${Math.min(director.cueIndex + 1, director.cueCount)}/${director.cueCount}` : '';
+        const total = director.totalCues ? ` (${director.executedCues || 0} of ${director.totalCues} cues done)` : '';
+        elements.sceneProgress.textContent = `${scene}${cue}${total}`;
+    } else {
+        elements.sceneProgress.textContent = director.currentScene && directorState === 'RUNNING' ? director.currentScene : '-';
+    }
+
+    const labels = hasScript && Array.isArray(director.sceneLabels) ? director.sceneLabels : [];
+    const key = labels.join('\u0000');
+    if (key !== sceneOptionsKey) {
+        sceneOptionsKey = key;
+        elements.sceneSelect.innerHTML = '';
+        if (labels.length === 0) {
+            elements.sceneSelect.add(new Option('No script loaded', ''));
         } else {
-            elements.sceneProgress.textContent = '-';
+            labels.forEach((label, i) => elements.sceneSelect.add(new Option(`${i + 1}. ${label}`, String(i))));
         }
     }
+    if (labels.length > 0 && document.activeElement !== elements.sceneSelect) {
+        elements.sceneSelect.value = String(director.sceneIndex);
+    }
+    elements.sceneSelect.disabled = labels.length === 0 || !directorEnabled;
 }
 
 // Update director control button states based on state
 function updateDirectorControls(state) {
-    const canStart = state === 'IDLE' || state === 'READY';
+    const canStart = state === 'READY' || state === 'PAUSED';
     const canPause = state === 'RUNNING';
-    const canStop = state === 'RUNNING' || state === 'PAUSED';
+    const canStop = state === 'RUNNING' || state === 'PAUSED' || state === 'THERMAL_HOLD';
     const canAdvance = state === 'RUNNING' || state === 'PAUSED';
 
-    if (elements.btnDirectorStart) {
-        elements.btnDirectorStart.disabled = !canStart;
-        elements.btnDirectorStart.textContent = state === 'PAUSED' ? 'Resume' : 'Start';
-    }
-    if (elements.btnDirectorPause) {
-        elements.btnDirectorPause.disabled = !canPause;
-    }
-    if (elements.btnDirectorStop) {
-        elements.btnDirectorStop.disabled = !canStop;
-    }
-    if (elements.btnDirectorAdvance) {
-        elements.btnDirectorAdvance.disabled = !canAdvance;
-    }
+    elements.btnDirectorStart.disabled = !canStart;
+    elements.btnDirectorStart.textContent = state === 'PAUSED' ? 'Resume' : 'Start';
+    elements.btnDirectorPause.disabled = !canPause;
+    elements.btnDirectorStop.disabled = !canStop;
+    elements.btnDirectorAdvance.disabled = !canAdvance;
 }
 
 // Update director stats display
 function updateDirectorStats(stats) {
-    if (elements.statTotalTakes) {
-        elements.statTotalTakes.textContent = stats.totalTakes || 0;
-    }
-    if (elements.statAvgQuality) {
-        const score = stats.averageScore || stats.avgQualityScore || 0;
-        elements.statAvgQuality.textContent = score > 0 ? score.toFixed(1) : '-';
-    }
-    if (elements.statBestTakes) {
-        elements.statBestTakes.textContent = stats.goodTakes || stats.bestTakeCount || 0;
-    }
-    if (elements.statCueSuccess) {
-        const rate = stats.cueSuccessRate || 0;
-        elements.statCueSuccess.textContent = rate > 0 ? `${(rate * 100).toFixed(0)}%` : '-';
-    }
+    elements.statTotalTakes.textContent = stats.totalTakes || 0;
+    const score = stats.averageScore || stats.avgQualityScore || 0;
+    elements.statAvgQuality.textContent = score > 0 ? score.toFixed(1) : '-';
+    elements.statBestTakes.textContent = stats.goodTakes || stats.bestTakeCount || 0;
+    const rate = stats.cueSuccessRate || 0;
+    elements.statCueSuccess.textContent = rate > 0 ? `${(rate * 100).toFixed(0)}%` : '-';
 }
 
 // Load script into director
 async function loadScript() {
     const script = elements.scriptTextarea.value.trim();
     if (!script) {
-        alert('Please enter a script');
+        notify('Enter a script first', 'error');
         return;
     }
 
     const result = await apiCall('/api/director/script', 'POST', { script });
-    if (result?.success) {
-        elements.btnDirectorStart.disabled = false;
-        alert('Script loaded: ' + (result.cueCount || 0) + ' cues parsed');
+    if (succeeded(result)) {
+        notify(`Script loaded: ${result.scenes} scene${result.scenes === 1 ? '' : 's'}, ${result.totalCues} cues` +
+            (result.estimatedDuration ? `, about ${result.estimatedDuration}` : ''), 'success');
+        (result.errors || []).forEach(problem => notify(`Script: ${problem}`, 'error'));
     } else {
-        alert('Failed to load script: ' + (result?.message || 'Unknown error'));
+        notify('Failed to load script: ' + errorText(result), 'error');
     }
+    fetchStatus();
 }
 
 // Clear script
-function clearScript() {
+async function clearScript() {
     elements.scriptTextarea.value = '';
     loadedScriptFileName = null;
-    apiCall('/api/director/script/clear', 'POST');
-}
-
-// Start director playback
-async function startDirector() {
-    const result = await apiCall('/api/director/start', 'POST');
-    if (!result?.success) {
-        alert('Failed to start director: ' + (result?.message || 'Unknown error'));
+    elements.scriptFilesList.querySelectorAll('.script-file-item').forEach(item => item.classList.remove('active'));
+    const result = await apiCall('/api/director/script/clear', 'POST');
+    if (!succeeded(result)) {
+        notify('Failed to clear the script: ' + errorText(result), 'error');
     }
+    fetchStatus();
 }
 
-// Pause director playback
+// Start, or resume when paused
+async function startDirector() {
+    const resuming = directorState === 'PAUSED';
+    const result = await apiCall(resuming ? '/api/director/resume' : '/api/director/start', 'POST');
+    if (!succeeded(result)) {
+        notify(`Failed to ${resuming ? 'resume' : 'start'} the director: ` + errorText(result), 'error');
+    }
+    fetchStatus();
+}
+
 async function pauseDirector() {
     const result = await apiCall('/api/director/pause', 'POST');
-    if (!result?.success) {
-        alert('Failed to pause director: ' + (result?.message || 'Unknown error'));
+    if (!succeeded(result)) {
+        notify('Failed to pause the director: ' + errorText(result), 'error');
     }
+    fetchStatus();
 }
 
-// Stop director playback
 async function stopDirector() {
     const result = await apiCall('/api/director/stop', 'POST');
-    if (!result?.success) {
-        alert('Failed to stop director: ' + (result?.message || 'Unknown error'));
+    if (!succeeded(result)) {
+        notify('Failed to stop the director: ' + errorText(result), 'error');
     }
+    fetchStatus();
+    fetchTakesList();
 }
 
-// Advance to next cue
 async function advanceDirector() {
     const result = await apiCall('/api/director/advance', 'POST');
-    if (!result?.success) {
-        alert('Failed to advance: ' + (result?.message || 'Unknown error'));
+    if (!succeeded(result)) {
+        notify(result?.message === 'No more cues' ? 'That was the last cue' : 'Failed to advance: ' + errorText(result), 'error');
     }
+    fetchStatus();
 }
 
-// Execute quick cue
+async function jumpToScene() {
+    const sceneIndex = parseInt(elements.sceneSelect.value, 10);
+    if (Number.isNaN(sceneIndex)) return;
+    const result = await apiCall('/api/director/scene', 'POST', { sceneIndex });
+    if (!succeeded(result)) {
+        notify('Could not go to that scene: ' + errorText(result), 'error');
+    }
+    elements.sceneSelect.blur();
+    fetchStatus();
+}
+
 async function executeQuickCue(cue) {
     const result = await apiCall('/api/director/cue', 'POST', { cue });
-    if (!result?.success) {
-        console.error('Failed to execute cue:', result?.message);
+    if (!succeeded(result)) {
+        notify(`Cue ${cue} failed: ` + errorText(result), 'error');
     }
 }
 
 // Fetch takes list
 async function fetchTakesList() {
     const result = await apiCall('/api/director/takes');
-    if (result?.success && result.takes) {
+    if (result && Array.isArray(result.takes)) {
         renderTakesList(result.takes);
     }
 }
 
-// Render takes list
-function renderTakesList(takes) {
-    if (!elements.takesList) return;
+const TAKE_MARKS = ['UNMARKED', 'GOOD', 'BAD', 'CIRCLE', 'HOLD'];
 
+// Render takes list, newest first
+function renderTakesList(takes) {
+    const list = elements.takesList;
+    list.innerHTML = '';
     if (!takes || takes.length === 0) {
-        elements.takesList.innerHTML = '<div class="no-takes">No takes recorded yet</div>';
+        const none = document.createElement('div');
+        none.className = 'no-takes';
+        none.textContent = 'No takes recorded yet';
+        list.appendChild(none);
         return;
     }
 
-    elements.takesList.innerHTML = takes.map((take, index) => {
-        const qualityClass = getQualityClass(take.qualityScore);
-        const marks = take.marks || [];
-        const marksHtml = marks.map(m => `<span class="mark mark-${m.toLowerCase()}">${m}</span>`).join('');
+    takes.slice().reverse().forEach(take => {
+        const item = document.createElement('div');
+        item.className = `take-item${take.suggested ? ' best' : ''}`;
 
-        return `
-            <div class="take-item ${take.best ? 'best' : ''}">
-                <div class="take-number">#${index + 1}</div>
-                <div class="take-info">
-                    <div class="take-scene">${take.scene || 'Scene'}</div>
-                    <div class="take-duration">${formatDuration(take.duration || 0)}</div>
-                </div>
-                <div class="take-marks">${marksHtml}</div>
-                <div class="quality-score ${qualityClass}">${(take.qualityScore || 0).toFixed(1)}</div>
-            </div>
-        `;
-    }).join('');
+        const number = document.createElement('div');
+        number.className = 'take-number';
+        number.textContent = `#${take.takeNumber}`;
+
+        const info = document.createElement('div');
+        info.className = 'take-info';
+        const scene = document.createElement('div');
+        scene.className = 'take-scene';
+        scene.textContent = take.sceneLabel || take.sceneId || 'Scene';
+        const detail = document.createElement('div');
+        detail.className = 'take-scene';
+        detail.textContent = `${take.durationFormatted || formatDuration((take.durationMs || 0) / 1000)} · ` +
+            `${take.cuesExecuted || 0} cues${take.cuesFailed ? `, ${take.cuesFailed} failed` : ''}`;
+        info.append(scene, detail);
+        if (take.suggested) {
+            const suggested = document.createElement('span');
+            suggested.className = 'take-suggested';
+            suggested.textContent = 'Suggested';
+            info.appendChild(suggested);
+        }
+
+        const mark = document.createElement('select');
+        mark.title = 'Mark this take';
+        mark.setAttribute('aria-label', `Mark take ${take.takeNumber}`);
+        TAKE_MARKS.forEach(m => mark.add(new Option(m === 'UNMARKED' ? 'Unmarked' : m.charAt(0) + m.slice(1).toLowerCase(), m)));
+        mark.value = TAKE_MARKS.includes(take.manualMark) ? take.manualMark : 'UNMARKED';
+        mark.addEventListener('change', () => markTake(take.takeNumber, mark.value));
+
+        const score = document.createElement('div');
+        score.className = `quality-score ${getQualityClass(take.qualityScore || 0)}`;
+        score.textContent = (take.qualityScore || 0).toFixed(1);
+
+        item.append(number, info, mark, score);
+        list.appendChild(item);
+    });
+}
+
+async function markTake(takeNumber, quality) {
+    const result = await apiCall('/api/director/takes/mark', 'POST', { takeNumber, quality });
+    if (!succeeded(result)) {
+        notify('Could not mark the take: ' + errorText(result), 'error');
+    }
+    fetchTakesList();
 }
 
 // Get quality class based on score
@@ -784,208 +1649,187 @@ function getQualityClass(score) {
     return 'poor';
 }
 
-// Start Server-Sent Events for director updates
+// Server-Sent Events for director updates
 function startDirectorEventStream() {
-    if (directorEventSource) {
-        directorEventSource.close();
-    }
-
+    stopDirectorEventStream();
     try {
         directorEventSource = new EventSource('/api/director/events');
-
         directorEventSource.onmessage = (event) => {
             try {
-                const data = JSON.parse(event.data);
-                handleDirectorEvent(data);
+                handleDirectorEvent(JSON.parse(event.data));
             } catch (e) {
                 console.error('Failed to parse director event:', e);
             }
         };
-
-        directorEventSource.onerror = (error) => {
-            console.error('Director event stream error:', error);
-            // Reconnect after delay
-            setTimeout(() => {
-                if (directorEnabled) {
+        directorEventSource.onerror = () => {
+            // Reconnect after a pause while the director stays enabled
+            stopDirectorEventStream();
+            directorReconnectTimer = setTimeout(() => {
+                directorReconnectTimer = null;
+                if (directorEnabled && !document.hidden) {
                     startDirectorEventStream();
+                } else {
+                    // Picked up again by the next status poll that finds the director enabled
+                    directorDataLoaded = false;
                 }
             }, 5000);
         };
-
-        directorEventSource.addEventListener('state', (event) => {
-            const data = JSON.parse(event.data);
-            updateDirectorStatus(data);
-        });
-
-        directorEventSource.addEventListener('cue', (event) => {
-            const data = JSON.parse(event.data);
-            if (elements.directorCue) {
-                elements.directorCue.textContent = data.cue || '-';
-            }
-        });
-
-        directorEventSource.addEventListener('take', (event) => {
-            const data = JSON.parse(event.data);
-            // Refresh takes list when a new take is recorded
-            fetchTakesList();
-        });
-
     } catch (e) {
         console.error('Failed to start director event stream:', e);
     }
 }
 
-// Stop Server-Sent Events
 function stopDirectorEventStream() {
+    if (directorReconnectTimer) {
+        clearTimeout(directorReconnectTimer);
+        directorReconnectTimer = null;
+    }
     if (directorEventSource) {
         directorEventSource.close();
         directorEventSource = null;
     }
 }
 
-// Handle director events
+// Director events, as DirectorApiHandler sends them
 function handleDirectorEvent(data) {
     switch (data.type) {
         case 'state':
-            updateDirectorStatus(data);
+        case 'state_changed':
+        case 'script_loaded':
+        case 'take_started':
+            fetchStatus();
             break;
-        case 'cue':
-            if (elements.directorCue) {
-                elements.directorCue.textContent = data.cue || '-';
+        case 'cue_executed':
+            elements.directorCue.textContent = data.cueText || '-';
+            if (data.success === false) {
+                notify(`Cue failed: ${data.cueText}`, 'error');
             }
             break;
-        case 'take':
+        case 'take_ended':
             fetchTakesList();
+            fetchStatus();
             break;
-        case 'scene':
-            if (elements.directorScene) {
-                elements.directorScene.textContent = data.scene || '-';
-            }
+        case 'error':
+            notify(`Director: ${data.message}`, 'error');
+            break;
+        case 'thermal_warning':
+            notify(`Director: ${data.action} (${data.temperature}°C)`, 'error');
+            fetchStatus();
+            break;
+        default:
             break;
     }
 }
 
 // ==================== Script File Browser Functions ====================
 
-// Fetch list of saved script files
 async function fetchScriptFiles() {
     const result = await apiCall('/api/director/scripts');
-    if (result?.success && result.scripts) {
+    if (result && Array.isArray(result.scripts)) {
         renderScriptFiles(result.scripts);
     }
 }
 
-// Render script files list
 function renderScriptFiles(scripts) {
-    if (!elements.scriptFilesList) return;
-
+    const list = elements.scriptFilesList;
+    list.innerHTML = '';
     if (!scripts || scripts.length === 0) {
-        elements.scriptFilesList.innerHTML = '<div class="no-scripts">No saved scripts</div>';
+        const none = document.createElement('div');
+        none.className = 'no-scripts';
+        none.textContent = 'No saved scripts';
+        list.appendChild(none);
         return;
     }
 
-    elements.scriptFilesList.innerHTML = scripts.map(script => {
-        const isActive = loadedScriptFileName === script.fileName;
-        const size = formatFileSize(script.size || 0);
-        const date = script.lastModified ? formatDate(script.lastModified) : '';
+    scripts.forEach(script => {
+        const item = document.createElement('div');
+        item.className = `script-file-item${loadedScriptFileName === script.fileName ? ' active' : ''}`;
+        item.dataset.filename = script.fileName;
 
-        return `
-            <div class="script-file-item ${isActive ? 'active' : ''}" data-filename="${escapeHtml(script.fileName)}">
-                <div class="script-file-name">${escapeHtml(script.fileName)}</div>
-                <div class="script-file-meta">
-                    <span class="script-file-size">${size}</span>
-                    <span class="script-file-date">${date}</span>
-                    <button class="btn-delete-script" onclick="event.stopPropagation(); deleteScriptFile('${escapeHtml(script.fileName)}')" title="Delete">X</button>
-                </div>
-            </div>
-        `;
-    }).join('');
+        const name = document.createElement('div');
+        name.className = 'script-file-name';
+        name.textContent = script.fileName;
 
-    // Add click handlers to load scripts
-    elements.scriptFilesList.querySelectorAll('.script-file-item').forEach(item => {
-        item.addEventListener('click', () => {
-            const fileName = item.dataset.filename;
-            loadScriptFromFile(fileName);
+        const meta = document.createElement('div');
+        meta.className = 'script-file-meta';
+        const size = document.createElement('span');
+        size.className = 'script-file-size';
+        size.textContent = formatFileSize(script.sizeBytes || 0);
+        const date = document.createElement('span');
+        date.className = 'script-file-date';
+        date.textContent = script.lastModified ? formatDate(script.lastModified) : '';
+        const del = document.createElement('button');
+        del.className = 'btn-delete-script';
+        del.title = 'Delete';
+        del.textContent = 'X';
+        del.addEventListener('click', (event) => {
+            event.stopPropagation();
+            deleteScriptFile(script.fileName);
         });
+        meta.append(size, date, del);
+
+        item.append(name, meta);
+        item.addEventListener('click', () => loadScriptFromFile(script.fileName));
+        list.appendChild(item);
     });
 }
 
-// Load script from saved file
+// Open a saved script: it goes into the editor and is loaded into the director
 async function loadScriptFromFile(fileName) {
     const result = await apiCall(`/api/director/scripts/${encodeURIComponent(fileName)}`);
-    if (result?.success) {
-        elements.scriptTextarea.value = result.script || '';
+    if (succeeded(result)) {
+        elements.scriptTextarea.value = result.content || '';
         loadedScriptFileName = fileName;
         elements.scriptFilename.value = fileName.replace(/\.[^.]+$/, '');
-
-        // Update active state in file list
         elements.scriptFilesList.querySelectorAll('.script-file-item').forEach(item => {
             item.classList.toggle('active', item.dataset.filename === fileName);
         });
+        notify(result.loaded
+            ? `Loaded ${fileName}: ${result.scenes} scenes, ${result.totalCues} cues`
+            : `Opened ${fileName}`, 'success');
+        fetchStatus();
     } else {
-        alert('Failed to load script: ' + (result?.message || 'Unknown error'));
+        notify('Failed to open the script: ' + errorText(result), 'error');
     }
 }
 
-// Save current script to file
 async function saveScriptFile() {
     const script = elements.scriptTextarea.value.trim();
     if (!script) {
-        alert('No script to save');
+        notify('There is no script to save', 'error');
         return;
     }
 
     let fileName = elements.scriptFilename.value.trim();
     if (!fileName) {
-        alert('Please enter a filename');
+        notify('Enter a file name', 'error');
+        elements.scriptFilename.focus();
         return;
     }
-
-    // Ensure .txt extension
     if (!fileName.endsWith('.txt')) {
         fileName += '.txt';
     }
 
     const result = await apiCall('/api/director/scripts/save', 'POST', { fileName, script });
-    if (result?.success) {
-        loadedScriptFileName = fileName;
+    if (succeeded(result)) {
+        loadedScriptFileName = result.fileName || fileName;
+        notify(`Saved ${loadedScriptFileName}`, 'success');
         fetchScriptFiles();
     } else {
-        alert('Failed to save script: ' + (result?.message || 'Unknown error'));
+        notify('Failed to save the script: ' + errorText(result), 'error');
     }
 }
 
-// Delete a saved script file
 async function deleteScriptFile(fileName) {
     if (!confirm(`Delete script "${fileName}"?`)) return;
 
     const result = await apiCall(`/api/director/scripts/${encodeURIComponent(fileName)}`, 'DELETE');
-    if (result?.success) {
+    if (succeeded(result)) {
         if (loadedScriptFileName === fileName) {
             loadedScriptFileName = null;
         }
         fetchScriptFiles();
     } else {
-        alert('Failed to delete script: ' + (result?.message || 'Unknown error'));
+        notify('Failed to delete the script: ' + errorText(result), 'error');
     }
-}
-
-// ==================== Utility Functions ====================
-
-function formatFileSize(bytes) {
-    if (bytes < 1024) return bytes + ' B';
-    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
-    return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
-}
-
-function formatDate(timestamp) {
-    const date = new Date(timestamp);
-    return date.toLocaleDateString() + ' ' + date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-}
-
-function escapeHtml(str) {
-    if (!str) return '';
-    const div = document.createElement('div');
-    div.textContent = str;
-    return div.innerHTML;
 }

@@ -318,6 +318,30 @@
             display: block;
         }
 
+        .result-banner.pending {
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--border-color);
+            display: block;
+        }
+
+        .test-preview {
+            width: 100%;
+            max-height: 320px;
+            object-fit: contain;
+            background: #000;
+            border-radius: 6px;
+            margin: 12px 0;
+        }
+
+        .check-text .detail a { color: var(--primary-color); word-break: break-all; }
+
+        @media (max-width: 600px) {
+            .container { padding: 12px 16px; }
+            .form-row { grid-template-columns: 1fr; gap: 0; }
+            .step-label { font-size: 0.65rem; }
+            .step-content { padding: 18px; }
+        }
+
         /* Loading spinner */
         .spinner {
             display: inline-block;
@@ -482,8 +506,13 @@
             <div id="s3-config" style="display:none;">
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="s3-endpoint">Endpoint URL</label>
-                        <input type="text" id="s3-endpoint" placeholder="https://s3.amazonaws.com">
+                        <label for="s3-backend">Provider</label>
+                        <select id="s3-backend">
+                            <option value="S3">Amazon S3</option>
+                            <option value="BACKBLAZE_B2">Backblaze B2</option>
+                            <option value="MINIO">MinIO</option>
+                            <option value="CLOUDFLARE_R2">Cloudflare R2</option>
+                        </select>
                     </div>
                     <div class="form-group">
                         <label for="s3-region">Region</label>
@@ -491,17 +520,22 @@
                     </div>
                 </div>
                 <div class="form-group">
+                    <label for="s3-endpoint">Endpoint</label>
+                    <input type="text" id="s3-endpoint" placeholder="minio.local:9000 or &lt;account&gt;.r2.cloudflarestorage.com">
+                    <div class="form-hint">Leave empty for Amazon S3 and Backblaze B2: it follows from the region.</div>
+                </div>
+                <div class="form-group">
                     <label for="s3-bucket">Bucket Name</label>
                     <input type="text" id="s3-bucket" placeholder="my-recordings">
                 </div>
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="s3-access-key">Access Key</label>
-                        <input type="text" id="s3-access-key" placeholder="AKIAIOSFODNN7EXAMPLE">
+                        <label for="s3-access-key">Access Key ID</label>
+                        <input type="text" id="s3-access-key" placeholder="AKIAIOSFODNN7EXAMPLE" autocomplete="off">
                     </div>
                     <div class="form-group">
-                        <label for="s3-secret-key">Secret Key</label>
-                        <input type="password" id="s3-secret-key" placeholder="Secret key">
+                        <label for="s3-secret-key">Secret Access Key</label>
+                        <input type="password" id="s3-secret-key" placeholder="Secret key" autocomplete="new-password">
                     </div>
                 </div>
                 <button class="btn btn-secondary" onclick="testS3()">Test Connection</button>
@@ -510,8 +544,8 @@
 
             <div id="smb-config" style="display:none;">
                 <div class="form-group">
-                    <label for="smb-host">Server Address</label>
-                    <input type="text" id="smb-host" placeholder="192.168.1.100">
+                    <label for="smb-server">Server Address</label>
+                    <input type="text" id="smb-server" placeholder="192.168.1.100">
                 </div>
                 <div class="form-group">
                     <label for="smb-share">Share Name</label>
@@ -520,11 +554,11 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label for="smb-username">Username</label>
-                        <input type="text" id="smb-username" placeholder="user">
+                        <input type="text" id="smb-username" placeholder="user" autocomplete="off">
                     </div>
                     <div class="form-group">
                         <label for="smb-password">Password</label>
-                        <input type="password" id="smb-password" placeholder="Password">
+                        <input type="password" id="smb-password" placeholder="Password" autocomplete="new-password">
                     </div>
                 </div>
                 <button class="btn btn-secondary" onclick="testSmb()">Test Connection</button>
@@ -540,7 +574,7 @@
         <!-- Step 4: Test Stream -->
         <div class="step-content" id="step-4">
             <h2>Step 4: Test Stream &amp; Thermal Check</h2>
-            <p>Start a test stream to verify the camera and check thermal behavior.</p>
+            <p>Start a test stream to verify the camera and check thermal behavior. Open the stream address in VLC or OBS to see what viewers will get.</p>
 
             <div class="check-item">
                 <div class="check-icon pending" id="check-stream-icon">...</div>
@@ -549,6 +583,8 @@
                     <span class="detail" id="check-stream-detail">Not started</span>
                 </div>
             </div>
+
+            <img id="test-preview" class="test-preview" alt="Live camera preview" style="display:none;">
 
             <div style="margin: 16px 0;">
                 <button class="btn btn-success" id="btn-test-stream" onclick="startTestStream()">Start Test Stream</button>
@@ -602,8 +638,8 @@
 
             <div style="margin: 16px 0; padding: 12px; background: rgba(255,152,0,0.1); border: 1px solid var(--warning-color); border-radius: 6px;">
                 <strong style="color: var(--warning-color);">Warning:</strong>
-                Once kiosk mode is activated, the device will be locked to LensDaemon.
-                You can exit via the web dashboard or by holding Vol Up + Vol Down for 5 seconds.
+                Once kiosk mode is activated, the device will be locked to LensDaemon and start it after every reboot.
+                You can turn it off in the dashboard's Kiosk Mode panel, or at the phone by holding Vol Up + Vol Down for 5 seconds.
             </div>
 
             <div class="nav-buttons">
