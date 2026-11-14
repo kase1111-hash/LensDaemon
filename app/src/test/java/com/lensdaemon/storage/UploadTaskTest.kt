@@ -297,6 +297,29 @@ class UploadTaskTest {
         assertFalse("canRetry should return false when status is CANCELLED", task.canRetry())
     }
 
+    @Test
+    fun `a failing upload is tried 3 times, 2 s and then 4 s apart`() {
+        val task = UploadTask(
+            localPath = "/tmp/video.mp4",
+            remotePath = "uploads/video.mp4",
+            destination = UploadDestination.S3,
+            fileSize = 1024L
+        )
+        val delays = mutableListOf<Long>()
+
+        // What UploadQueue does after each failed attempt: mark the task
+        // FAILED, count the attempt, and wait and try again while it may
+        do {
+            task.status = UploadStatus.FAILED
+            task.retryCount++
+            val retry = task.canRetry()
+            if (retry) delays.add(task.getRetryDelayMs())
+        } while (retry)
+
+        assertEquals("attempts", 3, task.retryCount)
+        assertEquals(listOf(2000L, 4000L), delays)
+    }
+
     // -----------------------------------------------------------------------
     // 5. getRetryDelayMs()
     // -----------------------------------------------------------------------

@@ -6,6 +6,7 @@ import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.SegmentDuration
 import com.lensdaemon.output.MpegTsUdpConfig
 import com.lensdaemon.output.MpegTsMode
+import com.lensdaemon.storage.RecordingFile
 import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
@@ -88,6 +89,10 @@ class StreamApiHandler {
 
     // ==================== Stream Control ====================
 
+    /**
+     * POST /api/stream/start: start the encoder (no output). RTSP, MPEG-TS and
+     * recording are started by their own endpoints, and share this encoder.
+     */
     private fun startStream(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
@@ -95,7 +100,12 @@ class StreamApiHandler {
 
         val json = JSONObject().apply {
             put("success", success)
-            put("message", if (success) "Streaming started" else "Failed to start the encoder")
+            if (success) {
+                put("message", "Encoder started")
+            } else {
+                put("message", "Failed to start the encoder")
+                put("error", "Failed to start the encoder")
+            }
             camera.getEncoderConfig()?.let { put("config", encoderConfigJson(it)) }
         }
 
@@ -158,6 +168,7 @@ class StreamApiHandler {
                 camera.getEncoderConfig()?.let { put("config", encoderConfigJson(it)) }
             } else {
                 put("message", "Failed to start RTSP streaming")
+                put("error", "Failed to start RTSP streaming")
             }
         }
 
@@ -247,6 +258,7 @@ class StreamApiHandler {
                 camera.getEncoderConfig()?.let { put("config", encoderConfigJson(it)) }
             } else {
                 put("message", "Failed to start MPEG-TS/UDP streaming")
+                put("error", "Failed to start MPEG-TS/UDP streaming")
             }
         }
 
@@ -319,8 +331,14 @@ class StreamApiHandler {
 
     // ==================== Recording Control ====================
 
+    /**
+     * POST /api/recording/start. While a recording is open (running or
+     * paused) it is left as it is and the reply says so, so a double click or
+     * a retry does no harm.
+     */
     private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
+        if (camera.isRecording() || camera.isRecordingPaused()) return alreadyRecording(camera)
 
         val segmentMinutes = body?.optInt("segmentMinutes", 5) ?: 5
 
@@ -344,6 +362,7 @@ class StreamApiHandler {
                 put("outputPath", camera.getRecordingsPath())
             } else {
                 put("message", "Failed to start recording")
+                put("error", "Failed to start recording")
             }
         }
 
@@ -351,6 +370,19 @@ class StreamApiHandler {
             if (success) Status.OK else Status.INTERNAL_ERROR,
             WebServer.MIME_JSON, json.toString()
         )
+    }
+
+    /** The reply to a start while a recording is open: success, with what to do instead when paused. */
+    private fun alreadyRecording(camera: CameraService): NanoHTTPD.Response {
+        val paused = camera.isRecordingPaused()
+        val message = if (paused) "Recording is paused: resume it with POST /api/recording/resume" else "Already recording"
+        val json = JSONObject()
+            .put("success", true)
+            .put("alreadyRecording", true)
+            .put("paused", paused)
+            .put("message", message)
+            .put("outputPath", camera.getRecordingsPath())
+        return ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
     }
 
     private fun stopRecording(): NanoHTTPD.Response {
@@ -375,11 +407,10 @@ class StreamApiHandler {
 
         val success = camera.pauseRecording()
 
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Recording paused" else "Not recording"}"}"""
-        )
+        val message = if (success) "Recording paused" else "Not recording"
+        val json = JSONObject().put("success", success).put("message", message)
+        if (!success) json.put("error", message)
+        return ApiHandlerUtils.jsonResponse(if (success) Status.OK else Status.BAD_REQUEST, json.toString())
     }
 
     private fun resumeRecording(): NanoHTTPD.Response {
@@ -387,20 +418,20 @@ class StreamApiHandler {
 
         val success = camera.resumeRecording()
 
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Recording resumed" else "Not paused"}"}"""
-        )
+        val message = if (success) "Recording resumed" else "Not paused"
+        val json = JSONObject().put("success", success).put("message", message)
+        if (!success) json.put("error", message)
+        return ApiHandlerUtils.jsonResponse(if (success) Status.OK else Status.BAD_REQUEST, json.toString())
     }
 
+    /** GET /api/recording/status: "recording" is true while a recording is open, running or paused. */
     private fun getRecordingStatus(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
         val stats = camera.getRecordingStats()
 
         val json = JSONObject().apply {
-            put("recording", camera.isRecording())
+            put("recording", camera.isRecording() || camera.isRecordingPaused())
             put("paused", camera.isRecordingPaused())
             put("state", stats.state.name)
             put("currentFile", stats.currentFilePath ?: "")
@@ -447,22 +478,26 @@ class StreamApiHandler {
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /**
+     * DELETE /api/recordings/{name}: any plain name the recordings list holds
+     * (so recordings named with characters such as '(' stay reachable), but
+     * not the file being recorded.
+     */
     private fun deleteRecording(uri: String): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val rawFilename = uri.substringAfterLast("/")
-        val filename = ApiHandlerUtils.sanitizeFileName(rawFilename)
-            ?: return ApiHandlerUtils.errorJson(
-                Status.BAD_REQUEST,
-                "Invalid filename"
-            )
+        val filename = uri.substringAfterLast("/")
+        if (!RecordingRequests.isPlainFileName(filename)) {
+            return ApiHandlerUtils.errorJson(Status.BAD_REQUEST, "Invalid filename")
+        }
 
-        val recordings = camera.listRecordings()
-        val recording = recordings.find { it.name == filename }
+        // Only files the recordings list knows, so nothing outside the recordings folder
+        val recording = RecordingRequests.find(camera.listRecordings(), null, filename)
             ?: return ApiHandlerUtils.errorJson(
                 Status.NOT_FOUND,
                 "Recording not found"
             )
+        liveFileConflict(camera, recording)?.let { return it }
 
         val success = camera.deleteRecording(recording)
 
@@ -478,25 +513,42 @@ class StreamApiHandler {
         )
     }
 
-    /** Download a recording as an MP4 file: GET /api/recordings/{name}. */
+    /**
+     * Download a recording as an MP4 file: GET /api/recordings/{name}, for the
+     * same names as delete. The file being recorded is refused: it can't be
+     * played until its segment closes.
+     */
     private fun downloadRecording(uri: String): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val filename = ApiHandlerUtils.sanitizeFileName(uri.substringAfterLast("/"))
-            ?: return ApiHandlerUtils.errorJson(Status.BAD_REQUEST, "Invalid filename")
+        val filename = uri.substringAfterLast("/")
+        if (!RecordingRequests.isPlainFileName(filename)) {
+            return ApiHandlerUtils.errorJson(Status.BAD_REQUEST, "Invalid filename")
+        }
         // Only files the recordings list knows, so nothing outside the recordings folder
-        val recording = camera.listRecordings().find { it.name == filename }
+        val recording = RecordingRequests.find(camera.listRecordings(), null, filename)
             ?: return ApiHandlerUtils.errorJson(Status.NOT_FOUND, "Recording not found")
+        liveFileConflict(camera, recording)?.let { return it }
         val file = File(recording.path)
 
         return try {
             NanoHTTPD.newFixedLengthResponse(Status.OK, MIME_MP4, FileInputStream(file), file.length()).apply {
-                addHeader("Content-Disposition", "attachment; filename=\"$filename\"")
+                addHeader("Content-Disposition", RecordingRequests.contentDisposition(recording.name))
             }
         } catch (e: FileNotFoundException) {
             Timber.w(e, "Recording $filename is gone")
             ApiHandlerUtils.errorJson(Status.NOT_FOUND, "Recording not found")
         }
+    }
+
+    /** 409 when [recording] is the file being recorded (running or paused), else null. */
+    private fun liveFileConflict(camera: CameraService, recording: RecordingFile): NanoHTTPD.Response? {
+        val open = camera.isRecording() || camera.isRecordingPaused()
+        if (!open || !RecordingRequests.isSameFile(recording.path, camera.getRecordingStats().currentFilePath)) return null
+        val json = JSONObject()
+            .put("success", false)
+            .put("error", "This file is being recorded: stop the recording or wait for the next file")
+        return ApiHandlerUtils.jsonResponse(Status.CONFLICT, json.toString())
     }
 
     // ==================== Storage ====================
@@ -527,15 +579,28 @@ class StreamApiHandler {
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /**
+     * POST /api/storage/cleanup: apply the retention policy (7 days, 10 GB,
+     * keep 1 GB free; never the file being recorded) and answer once it has
+     * finished, with what it removed.
+     */
     private fun enforceRetention(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
+        // Runs the clean-up here, on the request thread
         camera.enforceRetention()
+        val result = camera.getStorageStatus().lastRetentionResult
 
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Retention enforcement started"}"""
-        )
+        val json = JSONObject().apply {
+            put("success", true)
+            put("filesDeleted", result?.filesDeleted ?: 0)
+            put("bytesFreed", result?.bytesFreed ?: 0L)
+            put("failed", JSONArray().apply {
+                result?.failedFiles?.forEach { put(it) }
+            })
+        }
+
+        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
     // ==================== Helpers ====================

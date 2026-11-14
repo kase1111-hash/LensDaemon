@@ -117,6 +117,19 @@ class StorageManager(
     private var retentionJob: Job? = null
     private var videoFormat: MediaFormat? = null
 
+    /** Segment length for the next recording; [updateSegmentDuration] changes it. */
+    @Volatile
+    private var segmentDuration: SegmentDuration = config.segmentDuration
+
+    /**
+     * Stops the recording when the disk is still critically full after
+     * retention ran. Set by the owner so that the stop goes through it and
+     * releases what it holds for the recording (the encoder); when null the
+     * recording is stopped here. Invoked on an IO thread.
+     */
+    @Volatile
+    var onStorageFull: (() -> Unit)? = null
+
     /** AAC track format recorded from the next segment on, or null for video only. */
     var audioFormat: MediaFormat? = null
         set(value) {
@@ -162,12 +175,21 @@ class StorageManager(
     }
 
     /**
-     * Start recording
+     * Start recording. Refused while a recording is open, running or paused:
+     * the open file is never abandoned for a new one.
      */
     fun startRecording(): Boolean {
-        if (_state.value == StorageManagerState.RECORDING) {
+        if (_state.value == StorageManagerState.RECORDING || _state.value == StorageManagerState.PAUSED) {
             Timber.tag(TAG).w("Already recording")
             return false
+        }
+
+        // A writer left behind in ERROR (a segment that failed to open) is
+        // released here, so a new recording can start
+        fileWriter?.let { stale ->
+            stale.removeListener(this)
+            stale.release()
+            fileWriter = null
         }
 
         val format = videoFormat
@@ -176,24 +198,23 @@ class StorageManager(
             return false
         }
 
+        // Enforce retention first: it may free the space this recording needs
+        if (config.autoEnforceRetention) {
+            enforceRetentionSync()
+        }
+
         // Check available space
-        val storageInfo = localStorage.getStorageSpace()
-        if (storageInfo.isCriticallyLowSpace) {
+        if (localStorage.getStorageSpace().isCriticallyLowSpace) {
             Timber.tag(TAG).e("Cannot start recording: critically low storage space")
             onRecordingEvent(RecordingEvent.Error("Critically low storage space"))
             return false
-        }
-
-        // Enforce retention before starting if needed
-        if (config.autoEnforceRetention) {
-            enforceRetentionSync()
         }
 
         // Create file writer
         val writerConfig = FileWriterConfig(
             outputDirectory = localStorage.getRecordingsDirectory(),
             encoderConfig = config.encoderConfig,
-            segmentDuration = config.segmentDuration,
+            segmentDuration = segmentDuration,
             rotationDegrees = config.rotationDegrees
         )
 
@@ -332,20 +353,28 @@ class StorageManager(
     }
 
     /**
-     * Manually enforce retention policy
+     * Manually enforce retention policy. The segment being written is never
+     * deleted, nor counted towards the limits.
      */
     fun enforceRetention(): RetentionResult {
-        val result = retentionPolicy.enforce(localStorage.getRecordingsDirectory())
+        val result = retentionPolicy.enforce(
+            localStorage.getRecordingsDirectory(),
+            setOfNotNull(fileWriter?.getStats()?.currentFilePath)
+        )
         updateStatus()
         return result
     }
 
     /**
-     * Synchronous retention enforcement (for use before recording)
+     * Synchronous retention enforcement (for use before recording); like
+     * [enforceRetention], it leaves an open segment alone.
      */
     private fun enforceRetentionSync() {
         try {
-            val result = retentionPolicy.enforce(localStorage.getRecordingsDirectory())
+            val result = retentionPolicy.enforce(
+                localStorage.getRecordingsDirectory(),
+                setOfNotNull(fileWriter?.getStats()?.currentFilePath)
+            )
             if (result.hasDeleted) {
                 Timber.tag(TAG).i(
                     "Retention enforced: ${result.filesDeleted} files deleted, " +
@@ -358,10 +387,13 @@ class StorageManager(
     }
 
     /**
-     * Preview what would be deleted by retention policy
+     * Preview what would be deleted by retention policy (never the open segment)
      */
     fun previewRetention(): List<File> {
-        return retentionPolicy.preview(localStorage.getRecordingsDirectory())
+        return retentionPolicy.preview(
+            localStorage.getRecordingsDirectory(),
+            setOfNotNull(fileWriter?.getStats()?.currentFilePath)
+        )
     }
 
     /**
@@ -398,9 +430,11 @@ class StorageManager(
     }
 
     /**
-     * Update segment duration (for new recordings)
+     * Update segment duration: applies from the next recording, a running
+     * one keeps its segment length.
      */
     fun updateSegmentDuration(duration: SegmentDuration) {
+        segmentDuration = duration
         Timber.tag(TAG).d("Segment duration updated: ${duration.displayName}")
     }
 
@@ -453,12 +487,13 @@ class StorageManager(
                 // If critically low during recording, enforce retention
                 if (isRecording() && config.autoEnforceRetention) {
                     scope.launch {
-                        val result = enforceRetention()
-                        if (result.bytesFreed < 500L * 1024 * 1024) {
-                            // Still not enough space, stop recording
+                        enforceRetention()
+                        if (localStorage.getStorageSpace().isCriticallyLowSpace) {
+                            // Still not enough space: stop, through the owner when it asked to
                             Timber.tag(TAG).e("Storage critically low, stopping recording")
-                            stopRecording()
                             onRecordingEvent(RecordingEvent.Error("Storage full - recording stopped"))
+                            val stop = onStorageFull
+                            if (stop != null) stop() else stopRecording()
                         }
                     }
                 }

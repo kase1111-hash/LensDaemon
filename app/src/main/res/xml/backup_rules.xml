@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Auto Backup rules for Android 11 and lower (android:fullBackupContent).
+    The S3/SMB settings are encrypted with a key that never leaves this phone's keystore,
+    so a restored copy can't be decrypted. The upload queue lists recordings that a
+    restore doesn't bring back. Keep both out of backups.
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="lensdaemon_credentials.xml" />
+    <exclude domain="sharedpref" path="upload_queue.xml" />
+</full-backup-content>

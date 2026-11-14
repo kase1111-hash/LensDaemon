@@ -28,6 +28,9 @@ class VideoEncoder(
         private const val TAG = "VideoEncoder"
         private const val TIMEOUT_US = 10_000L // 10ms timeout for dequeue operations
 
+        /** Span of the frame rate and bitrate measurements, and how long without frames reads as stopped. */
+        private const val STATS_WINDOW_MS = 2_000L
+
         /**
          * Find best encoder for given codec
          */
@@ -142,13 +145,28 @@ class VideoEncoder(
     // Callback for encoded frames
     private var frameCallback: ((EncodedFrame) -> Unit)? = null
 
+    /**
+     * Called on the encoder thread when the codec fails for good while
+     * encoding. Transient errors, which the codec gets over by itself, are
+     * not reported. The encoder is in [EncoderState.ERROR] by then and
+     * produces nothing more: it has to be released and built anew.
+     */
+    @Volatile
+    var onError: ((MediaCodec.CodecException) -> Unit)? = null
+
     // Statistics tracking
     private val framesEncoded = AtomicLong(0)
     private val framesDropped = AtomicLong(0)
     private val totalBytes = AtomicLong(0)
     private var encodingStartTime = 0L
     private var lastStatsUpdate = 0L
-    private var recentFrameTimes = mutableListOf<Long>()
+
+    /** Arrival time (ms) and size (bytes) of each frame in the last [STATS_WINDOW_MS]; encoder thread only. */
+    private val recentFrames = ArrayDeque<LongArray>()
+
+    /** When the last frame was delivered (0 = none yet); read from any thread by [currentStats]. */
+    @Volatile
+    private var lastFrameAtMs = 0L
 
     // Control flags
     private val isRunning = AtomicBoolean(false)
@@ -298,7 +316,8 @@ class VideoEncoder(
             totalBytes.set(0)
             encodingStartTime = System.currentTimeMillis()
             lastStatsUpdate = encodingStartTime
-            recentFrameTimes.clear()
+            recentFrames.clear()
+            lastFrameAtMs = 0L
 
             mediaCodec?.start()
 
@@ -512,8 +531,16 @@ class VideoEncoder(
         }
 
         override fun onError(codec: MediaCodec, e: MediaCodec.CodecException) {
+            if (e.isTransient) {
+                // The codec gets over it by itself (e.g. resources briefly unavailable)
+                Timber.w(e, "$TAG: Transient codec error: ${e.diagnosticInfo}")
+                return
+            }
             Timber.e(e, "$TAG: Codec error: ${e.diagnosticInfo}")
+            val wasRunning = isRunning.getAndSet(false)
             _state.value = EncoderState.ERROR
+            // Only a failure while encoding is news: after stop() or release() nobody waits on this encoder
+            if (wasRunning) this@VideoEncoder.onError?.invoke(e)
         }
 
         override fun onOutputFormatChanged(codec: MediaCodec, format: MediaFormat) {
@@ -549,15 +576,16 @@ class VideoEncoder(
         )
 
         // Update statistics
-        val frameCount = framesEncoded.incrementAndGet()
+        framesEncoded.incrementAndGet()
         totalBytes.addAndGet(info.size.toLong())
 
         val frameEndTime = System.nanoTime()
         val encodingTimeMs = (frameEndTime - frameStartTime) / 1_000_000f
-        recentFrameTimes.add(System.currentTimeMillis())
+        val now = System.currentTimeMillis()
+        recentFrames.addLast(longArrayOf(now, info.size.toLong()))
+        lastFrameAtMs = now
 
         // Update stats periodically (every 500ms)
-        val now = System.currentTimeMillis()
         if (now - lastStatsUpdate > 500) {
             updateStats(encodingTimeMs)
             lastStatsUpdate = now
@@ -576,29 +604,37 @@ class VideoEncoder(
     }
 
     /**
-     * Update encoder statistics
+     * Update encoder statistics: frame rate and bitrate over the last
+     * [STATS_WINDOW_MS] (or since the start, if more recent), so a bitrate
+     * change shows within seconds rather than being averaged over the session.
      */
     private fun updateStats(lastEncodingTimeMs: Float) {
-        // Calculate FPS from recent frames
         val now = System.currentTimeMillis()
-        val oneSecondAgo = now - 1000
-        recentFrameTimes.removeAll { it < oneSecondAgo }
-        val currentFps = recentFrameTimes.size.toFloat()
-
-        // Calculate average bitrate
-        val durationSec = (now - encodingStartTime) / 1000f
-        val avgBitrate = if (durationSec > 0) {
-            (totalBytes.get() * 8 / durationSec).toLong()
-        } else 0L
+        while (recentFrames.isNotEmpty() && recentFrames.first()[0] < now - STATS_WINDOW_MS) {
+            recentFrames.removeFirst()
+        }
+        val windowMs = (now - encodingStartTime).coerceIn(1L, STATS_WINDOW_MS)
+        val windowBytes = recentFrames.sumOf { it[1] }
 
         _stats.value = EncoderStats(
             framesEncoded = framesEncoded.get(),
             framesDropped = framesDropped.get(),
-            currentBitrateBps = avgBitrate,
+            currentBitrateBps = windowBytes * 8 * 1000 / windowMs,
             avgEncodingTimeMs = lastEncodingTimeMs,
             totalBytesEncoded = totalBytes.get(),
             startTimeMs = encodingStartTime,
-            currentFps = currentFps
+            currentFps = recentFrames.size * 1000f / windowMs
         )
+    }
+
+    /**
+     * Statistics as of now. Frame rate and bitrate cover the last
+     * [STATS_WINDOW_MS], and read 0 once no frame has come for that long (a
+     * stalled, paused or failed encoder) instead of the last values measured.
+     */
+    fun currentStats(): EncoderStats {
+        val stats = _stats.value
+        val stalled = System.currentTimeMillis() - lastFrameAtMs > STATS_WINDOW_MS
+        return if (stalled) stats.copy(currentFps = 0f, currentBitrateBps = 0L) else stats
     }
 }

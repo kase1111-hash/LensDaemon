@@ -27,11 +27,16 @@ import java.io.File
  * - Disable charging when battery temperature is high
  * - Resume charging when level drops below threshold
  *
- * Note: Full charge control requires root or kernel-level access on most devices.
- * This implementation provides:
- * - Monitoring and recommendations
- * - Sysfs-based control on supported devices (root required)
- * - Kernel-level charging control path detection
+ * Charging can only be switched off on phones whose kernel exposes a charging switch
+ * (a sysfs node) that the app itself may write; there is no root/su path. Most phones
+ * have none: the bypass then runs software-only and gives advice ([getStatus]'s
+ * recommendation, such as unplugging the charger) instead of stopping the charge.
+ *
+ * Two holds can block charging at once: a manual hold ([disableCharging], from the API)
+ * and the governor's thermal hold ([disableChargingForThermal]). Each is lifted only by
+ * its own release, so a cool-down never ends a manual hold and a manual enable never
+ * ends a thermal hold. All state changes are synchronized: the HTTP threads, the main
+ * thread and the bypass loop all call in.
  */
 class BatteryBypass(
     private val context: Context,
@@ -82,8 +87,9 @@ class BatteryBypass(
     private var currentTempC: Float = 0f
     private var isCharging: Boolean = false
 
-    // Manual override
+    // Manual override (API) and the governor's thermal hold
     private var manualDisable: Boolean = false
+    private var thermalHold: Boolean = false
 
     // Listeners
     private val listeners = mutableListOf<BatteryBypassListener>()
@@ -193,8 +199,9 @@ class BatteryBypass(
     }
 
     /**
-     * Stop battery bypass management
+     * Stop battery bypass management. Charging is switched back on, whatever held it.
      */
+    @Synchronized
     fun stop() {
         Timber.tag(TAG).i("Stopping battery bypass manager")
 
@@ -208,7 +215,9 @@ class BatteryBypass(
         }
 
         // Ensure charging is enabled when stopping
-        enableCharging()
+        manualDisable = false
+        thermalHold = false
+        setChargingEnabled(true)
 
         _bypassState.value = BypassState.DISABLED
         updateStatus("Bypass manager stopped")
@@ -240,8 +249,9 @@ class BatteryBypass(
     }
 
     /**
-     * Manually disable charging
+     * Manually disable charging (manual hold, kept until [enableCharging])
      */
+    @Synchronized
     fun disableCharging() {
         manualDisable = true
         setChargingEnabled(false)
@@ -250,10 +260,17 @@ class BatteryBypass(
     }
 
     /**
-     * Manually enable charging
+     * Manually enable charging: ends the manual hold. Charging stays off while the
+     * governor's thermal hold lasts.
      */
+    @Synchronized
     fun enableCharging() {
         manualDisable = false
+        if (thermalHold) {
+            _bypassState.value = BypassState.THERMAL_HOLD
+            updateStatus("Manual hold released; charging stays off until the battery cools")
+            return
+        }
         setChargingEnabled(true)
         if (_bypassState.value == BypassState.MANUAL_HOLD) {
             _bypassState.value = BypassState.DISABLED
@@ -262,12 +279,32 @@ class BatteryBypass(
     }
 
     /**
-     * Disable charging due to thermal condition
+     * Disable charging due to thermal condition (the governor's thermal hold, kept until
+     * [releaseThermalHold])
      */
+    @Synchronized
     fun disableChargingForThermal() {
+        thermalHold = true
         setChargingEnabled(false)
         _bypassState.value = BypassState.THERMAL_HOLD
         updateStatus("Charging disabled (thermal)")
+    }
+
+    /**
+     * End the governor's thermal hold. A manual hold set through the API stays in force.
+     */
+    @Synchronized
+    fun releaseThermalHold() {
+        if (!thermalHold) return
+        thermalHold = false
+        if (manualDisable) {
+            _bypassState.value = BypassState.MANUAL_HOLD
+            updateStatus("Thermal hold released; manual hold stays")
+            return
+        }
+        setChargingEnabled(true)
+        _bypassState.value = BypassState.DISABLED
+        updateStatus("Thermal hold released")
     }
 
     /**
@@ -289,6 +326,7 @@ class BatteryBypass(
     /**
      * Update battery state from intent
      */
+    @Synchronized
     private fun updateBatteryState(intent: Intent) {
         // Temperature
         val tempTenths = intent.getIntExtra(BatteryManager.EXTRA_TEMPERATURE, 0)
@@ -308,9 +346,10 @@ class BatteryBypass(
     /**
      * Evaluate bypass state and take action
      */
+    @Synchronized
     private fun evaluateBypassState() {
-        if (manualDisable) {
-            return // Don't override manual disable
+        if (manualDisable || thermalHold) {
+            return // Don't override a manual or thermal hold
         }
 
         val state = _bypassState.value
@@ -430,9 +469,20 @@ class BatteryBypass(
     }
 
     /**
-     * Get current status
+     * Current status, with the battery readings and the recommendation worked out now
+     * (the stored status changes only with the bypass state)
      */
-    fun getStatus(): BatteryBypassStatus = _status.value
+    @Synchronized
+    fun getStatus(): BatteryBypassStatus = _status.value.copy(
+        state = _bypassState.value,
+        batteryPercent = currentPercent,
+        batteryTempC = currentTempC,
+        targetPercent = config.targetChargePercent,
+        resumePercent = config.resumeChargePercent,
+        isCharging = isCharging,
+        chargingBlocked = !_chargingEnabled.value,
+        recommendation = generateRecommendation()
+    )
 
     /**
      * Update configuration (applied immediately on next evaluation cycle)

@@ -47,14 +47,22 @@ enum class SegmentDuration(val minutes: Int, val displayName: String) {
 }
 
 /**
+ * The phone model as it appears in recording file names: every character
+ * other than a letter, digit, '.', '_' or '-' becomes '_' (so "moto g(7) power"
+ * gives "moto_g_7__power"), and "phone" when the model is unknown. Names made
+ * this way are safe in URLs, download headers and S3 keys.
+ */
+fun safeDeviceName(model: String?): String = (model ?: "phone").replace(Regex("[^A-Za-z0-9._-]"), "_")
+
+/**
  * File writer configuration
  */
 data class FileWriterConfig(
     /** Base directory for recordings */
     val outputDirectory: File,
 
-    /** Device name for filename */
-    val deviceName: String = Build.MODEL.replace(" ", "_"),
+    /** Device name for filename, made of characters that are safe in names (see [safeDeviceName]) */
+    val deviceName: String = safeDeviceName(Build.MODEL),
 
     /** Segment duration */
     val segmentDuration: SegmentDuration = SegmentDuration.CONTINUOUS,
@@ -499,12 +507,12 @@ class FileWriter(
     }
 
     /**
-     * Generate filename for a segment
+     * Generate filename for a segment, with ASCII digits whatever the phone's locale
      */
     private fun generateFilename(): String {
         val timestamp = DATE_FORMAT.format(Date())
         val segmentSuffix = if (config.segmentDuration != SegmentDuration.CONTINUOUS) {
-            "_seg${String.format("%03d", segmentIndex)}"
+            "_seg${String.format(Locale.US, "%03d", segmentIndex)}"
         } else ""
 
         return "${FILENAME_PREFIX}_${config.deviceName}_${timestamp}${segmentSuffix}.${config.fileExtension}"
@@ -662,7 +670,9 @@ class FileWriter(
             )
         } else {
             Timber.tag(TAG).e("Failed to finalize segment: $filePath")
-            // Try to delete incomplete file
+            // A muxer that could not stop (e.g. no keyframe ever opened the
+            // segment) still holds the file: release it, then delete the file
+            muxer.release()
             try {
                 File(filePath).delete()
             } catch (_: Exception) {}

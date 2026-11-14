@@ -6,6 +6,7 @@ import com.hierynomus.msfscc.FileAttributes
 import com.hierynomus.mssmb2.SMB2CreateDisposition
 import com.hierynomus.mssmb2.SMB2CreateOptions
 import com.hierynomus.mssmb2.SMB2ShareAccess
+import com.hierynomus.mssmb2.SMBApiException
 import com.hierynomus.smbj.SMBClient
 import com.hierynomus.smbj.SmbConfig
 import com.hierynomus.smbj.auth.AuthenticationContext
@@ -15,8 +16,21 @@ import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.File
 import java.io.FileInputStream
+import java.io.IOException
 import java.util.EnumSet
 import java.util.concurrent.TimeUnit
+
+/**
+ * The path on the share for [remotePath] under the folder [prefix]. Both '/' and '\'
+ * separate folders; empty components (leading, trailing or doubled separators) are
+ * dropped and the rest joined with '\'. ("lensdaemon/", "a.mp4") gives "lensdaemon\a.mp4",
+ * ("", "/a.mp4") gives "a.mp4" and ("lensdaemon", "") the folder itself.
+ */
+internal fun smbPath(prefix: String, remotePath: String): String =
+    (smbPathComponents(prefix) + smbPathComponents(remotePath)).joinToString("\\")
+
+private fun smbPathComponents(path: String): List<String> =
+    path.replace('/', '\\').split('\\').filter { it.isNotEmpty() }
 
 /**
  * SMB upload result
@@ -44,6 +58,10 @@ enum class SmbConnectionState {
  * Uses the smbj library for full SMB2/3 protocol support with proper
  * NTLM/NTLMv2 authentication, replacing the previous hand-rolled
  * implementation that had broken NTLM (zeroed DES response, MD5-for-MD4).
+ *
+ * Uploads create missing folders under the path prefix. A failed upload drops the
+ * connection and is tried once more on a fresh one, so a session the server dropped
+ * (restart, Wi-Fi change, idle timeout) doesn't break every later upload.
  */
 class SmbClient(
     private val credentials: SmbCredentials
@@ -71,16 +89,21 @@ class SmbClient(
     private var share: DiskShare? = null
 
     /**
-     * Test connection to SMB share
+     * Test connection to SMB share: connect, then check the upload folder (the path
+     * prefix) and create it when missing, so a wrong path or a read-only share fails here
+     * rather than on the first upload. The failure's message says why.
      */
     suspend fun testConnection(): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
             connect()
-            disconnect()
+            val diskShare = share ?: throw IOException("Not connected")
+            ensureFolders(diskShare, smbPath(credentials.pathPrefix, ""))
             Result.success(true)
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "SMB connection test failed")
             Result.failure(e)
+        } finally {
+            disconnect()
         }
     }
 
@@ -125,7 +148,8 @@ class SmbClient(
     }
 
     /**
-     * Upload a file to SMB share
+     * Upload a file to SMB share. Missing folders are created first. When the attempt
+     * fails, the connection is dropped and the upload tried once more on a new one.
      */
     suspend fun uploadFile(
         localFile: File,
@@ -136,71 +160,84 @@ class SmbClient(
             return@withContext Result.failure(Exception("File not found: ${localFile.absolutePath}"))
         }
 
+        val fullPath = smbPath(credentials.pathPrefix, remotePath)
         try {
-            if (state != SmbConnectionState.AUTHENTICATED) {
-                connect()
-            }
-
-            val diskShare = share ?: return@withContext Result.failure(Exception("Not connected"))
-            val fullPath = buildPath(remotePath)
-            val fileSize = localFile.length()
-
-            Timber.tag(TAG).d("Uploading ${localFile.name} ($fileSize bytes) to $fullPath")
-
-            val remoteFile = diskShare.openFile(
-                fullPath,
-                EnumSet.of(AccessMask.GENERIC_WRITE),
-                EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
-                SMB2ShareAccess.ALL,
-                SMB2CreateDisposition.FILE_OVERWRITE_IF,
-                EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE)
-            )
-
-            var bytesWritten = 0L
-            remoteFile.use { rf ->
-                val outputStream = rf.outputStream
-                FileInputStream(localFile).use { input ->
-                    val buffer = ByteArray(BUFFER_SIZE)
-                    while (true) {
-                        val read = input.read(buffer)
-                        if (read == -1) break
-                        outputStream.write(buffer, 0, read)
-                        bytesWritten += read
-                        progressCallback?.invoke(bytesWritten, fileSize)
-                    }
-                    outputStream.flush()
-                }
-            }
-
-            Timber.tag(TAG).i("Upload completed: $fullPath ($bytesWritten bytes)")
-            Result.success(SmbUploadResult(true, bytesWritten))
-
+            Result.success(uploadOnce(localFile, fullPath, progressCallback))
         } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "SMB upload failed")
-            Result.failure(e)
+            Timber.tag(TAG).w(e, "SMB upload failed; retrying on a new connection")
+            disconnect()
+            try {
+                Result.success(uploadOnce(localFile, fullPath, progressCallback))
+            } catch (retryError: Exception) {
+                Timber.tag(TAG).e(retryError, "SMB upload failed")
+                disconnect()
+                Result.failure(retryError)
+            }
         }
     }
 
     /**
-     * Create directory on SMB share
+     * One upload attempt: connect when needed, create the missing folders, write the file.
      */
-    suspend fun createDirectory(remotePath: String): Result<Boolean> = withContext(Dispatchers.IO) {
-        try {
-            if (state != SmbConnectionState.AUTHENTICATED) {
-                connect()
+    private fun uploadOnce(localFile: File, fullPath: String, progressCallback: ProgressCallback?): SmbUploadResult {
+        if (state != SmbConnectionState.AUTHENTICATED) {
+            connect()
+        }
+
+        val diskShare = share ?: throw IOException("Not connected")
+        val fileSize = localFile.length()
+        ensureFolders(diskShare, fullPath.substringBeforeLast('\\', ""))
+
+        Timber.tag(TAG).d("Uploading ${localFile.name} ($fileSize bytes) to $fullPath")
+
+        val remoteFile = diskShare.openFile(
+            fullPath,
+            EnumSet.of(AccessMask.GENERIC_WRITE),
+            EnumSet.of(FileAttributes.FILE_ATTRIBUTE_NORMAL),
+            SMB2ShareAccess.ALL,
+            SMB2CreateDisposition.FILE_OVERWRITE_IF,
+            EnumSet.of(SMB2CreateOptions.FILE_NON_DIRECTORY_FILE)
+        )
+
+        var bytesWritten = 0L
+        remoteFile.use { rf ->
+            val outputStream = rf.outputStream
+            FileInputStream(localFile).use { input ->
+                val buffer = ByteArray(BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read == -1) break
+                    outputStream.write(buffer, 0, read)
+                    bytesWritten += read
+                    progressCallback?.invoke(bytesWritten, fileSize)
+                }
+                outputStream.flush()
             }
+        }
 
-            val diskShare = share ?: return@withContext Result.failure(Exception("Not connected"))
-            val fullPath = buildPath(remotePath)
-            diskShare.mkdir(fullPath)
+        Timber.tag(TAG).i("Upload completed: $fullPath ($bytesWritten bytes)")
+        return SmbUploadResult(true, bytesWritten)
+    }
 
-            Timber.tag(TAG).d("Directory created: $fullPath")
-            Result.success(true)
-        } catch (e: Exception) {
-            if (e.message?.contains("exists", ignoreCase = true) == true) {
-                Result.success(true)
-            } else {
-                Result.failure(e)
+    /**
+     * Create each missing folder of [dir] (a path from [smbPath]), parent first.
+     *
+     * @throws IOException when a folder can't be checked or created (for example
+     *   STATUS_ACCESS_DENIED), naming the folder
+     */
+    private fun ensureFolders(diskShare: DiskShare, dir: String) {
+        var path = ""
+        for (component in dir.split('\\').filter { it.isNotEmpty() }) {
+            path = if (path.isEmpty()) component else "$path\\$component"
+            try {
+                if (!diskShare.folderExists(path)) {
+                    diskShare.mkdir(path)
+                }
+            } catch (e: SMBApiException) {
+                // A collision means another upload created it in the meantime
+                if (e.status != NtStatus.STATUS_OBJECT_NAME_COLLISION) {
+                    throw IOException("Cannot create folder '$path' on the share: ${e.message}", e)
+                }
             }
         }
     }
@@ -215,7 +252,7 @@ class SmbClient(
             }
 
             val diskShare = share ?: return@withContext Result.failure(Exception("Not connected"))
-            val fullPath = buildPath(remotePath)
+            val fullPath = smbPath(credentials.pathPrefix, remotePath)
             diskShare.rm(fullPath)
 
             Timber.tag(TAG).d("File deleted: $fullPath")
@@ -235,25 +272,13 @@ class SmbClient(
             }
 
             val diskShare = share ?: return@withContext Result.failure(Exception("Not connected"))
-            val fullPath = buildPath(remotePath)
+            val fullPath = smbPath(credentials.pathPrefix, remotePath)
             val entries = diskShare.list(fullPath)
             val names = entries.map { it.fileName }.filter { it != "." && it != ".." }
 
             Result.success(names)
         } catch (e: Exception) {
             Result.failure(e)
-        }
-    }
-
-    /**
-     * Build full path with prefix
-     */
-    private fun buildPath(remotePath: String): String {
-        val cleanPath = remotePath.replace('/', '\\').trimStart('\\')
-        return if (credentials.pathPrefix.isNotEmpty()) {
-            "${credentials.pathPrefix.trimEnd('\\')}\\$cleanPath"
-        } else {
-            cleanPath
         }
     }
 }

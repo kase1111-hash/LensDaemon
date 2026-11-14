@@ -1,5 +1,6 @@
 package com.lensdaemon.web.handlers
 
+import com.lensdaemon.storage.RecordingFile
 import com.lensdaemon.storage.S3Credentials
 import com.lensdaemon.storage.SmbCredentials
 import com.lensdaemon.storage.StorageBackend
@@ -23,6 +24,17 @@ import timber.log.Timber
 class UploadApiHandler {
 
     var uploadService: UploadService? = null
+
+    /**
+     * The recordings that may be uploaded: what GET /api/recordings lists.
+     * Set by ApiRoutes from the camera service; until then nothing can be enqueued.
+     */
+    @Volatile
+    var recordings: () -> List<RecordingFile> = { emptyList() }
+
+    /** The file being recorded, or null; set by ApiRoutes. It is not uploaded until it closes. */
+    @Volatile
+    var liveRecordingPath: () -> String? = { null }
 
     /**
      * Handle an upload API request.
@@ -82,6 +94,7 @@ class UploadApiHandler {
         val upload = uploadService ?: return ApiHandlerUtils.serviceUnavailable("Upload service")
         val pending = upload.getPendingTasks()
         val completed = upload.getCompletedTasks()
+        val failed = upload.getFailedTasks()
         val json = JSONObject().apply {
             put("pending", JSONArray().apply {
                 pending.forEach { task ->
@@ -111,6 +124,19 @@ class UploadApiHandler {
                     })
                 }
             })
+            // Uploads that used up their attempts, until retried or cancelled
+            put("failed", JSONArray().apply {
+                failed.forEach { task ->
+                    put(JSONObject().apply {
+                        put("id", task.id)
+                        put("fileName", task.fileName)
+                        put("destination", task.destination.name)
+                        put("error", task.lastError ?: "")
+                        put("retryCount", task.retryCount)
+                        put("fileSize", task.fileSize)
+                    })
+                }
+            })
         }
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
@@ -127,24 +153,32 @@ class UploadApiHandler {
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Upload processing stopped"}""")
     }
 
+    /**
+     * POST /api/upload/enqueue: upload one recording, named by "filePath" (the
+     * path GET /api/recordings lists) or "file" (its name). Anything else is
+     * refused with 400, so no other app file can be copied off the phone or
+     * deleted after upload; the file being recorded gets 409 until it closes.
+     */
     private fun enqueueUpload(body: JSONObject?): NanoHTTPD.Response {
         val upload = uploadService ?: return ApiHandlerUtils.serviceUnavailable("Upload service")
         body ?: return ApiHandlerUtils.bodyRequired()
-        val filePath = body.optString("filePath", "")
-        val remotePath = body.optString("remotePath", "")
         val destinationStr = body.optString("destination", "S3")
+        val destination = UploadDestination.entries.find { it.name.equals(destinationStr, ignoreCase = true) }
+            ?: return failure(Status.BAD_REQUEST, "Invalid destination: $destinationStr. Use S3 or SMB")
+        val recording = RecordingRequests.find(
+            recordings(),
+            body.optString("filePath", "").ifEmpty { null },
+            body.optString("file", "").ifEmpty { null }
+        ) ?: return failure(Status.BAD_REQUEST, "Only recordings listed by GET /api/recordings can be uploaded")
+        if (RecordingRequests.isSameFile(recording.path, liveRecordingPath())) {
+            return failure(Status.CONFLICT, "Recording in progress: wait for the file to close")
+        }
+        val remotePath = body.optString("remotePath", "").ifEmpty { recording.name }
         val deleteAfter = body.optBoolean("deleteAfterUpload", false)
-        if (filePath.isEmpty()) {
-            return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "filePath is required"}""")
-        }
-        val destination = try {
-            UploadDestination.valueOf(destinationStr.uppercase())
-        } catch (e: Exception) {
-            return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid destination: $destinationStr. Use S3 or SMB"}""")
-        }
-        val effectiveRemotePath = if (remotePath.isEmpty()) { filePath.substringAfterLast("/") } else { remotePath }
-        val task = upload.enqueueFile(filePath, effectiveRemotePath, destination, deleteAfter)
-        return if (task != null) {
+        val task = upload.enqueueFile(recording.path, remotePath, destination, deleteAfter)
+        return if (task == null) {
+            failure(Status.BAD_REQUEST, "Failed to enqueue the recording: it no longer exists")
+        } else {
             val json = JSONObject().apply {
                 put("success", true)
                 put("taskId", task.id)
@@ -153,11 +187,10 @@ class UploadApiHandler {
                 put("message", "File enqueued for upload")
             }
             NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } else {
-            NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Failed to enqueue file. Check if file exists."}""")
         }
     }
 
+    /** DELETE /api/upload/task/{id}: cancel a pending upload or drop a failed one. */
     private fun cancelUploadTask(uri: String): NanoHTTPD.Response {
         val upload = uploadService ?: return ApiHandlerUtils.serviceUnavailable("Upload service")
         val taskId = uri.substringAfterLast("/")
@@ -165,17 +198,21 @@ class UploadApiHandler {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Task ID required"}""")
         }
         val success = upload.cancelTask(taskId)
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.NOT_FOUND, WebServer.MIME_JSON,
-            """{"success": $success, "taskId": "$taskId"}"""
-        )
+        val json = JSONObject().put("success", success).put("taskId", taskId)
+        if (!success) json.put("error", "No pending or failed upload with this ID")
+        return ApiHandlerUtils.jsonResponse(if (success) Status.OK else Status.NOT_FOUND, json.toString())
     }
 
+    /** POST /api/upload/retry: queue the failed uploads again; answers how many. */
     private fun retryFailedUploads(): NanoHTTPD.Response {
         val upload = uploadService ?: return ApiHandlerUtils.serviceUnavailable("Upload service")
-        upload.retryFailed()
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, """{"success": true, "message": "Retrying failed uploads"}""")
+        val retried = upload.retryFailed()
+        return ApiHandlerUtils.jsonResponse(Status.OK, JSONObject().put("success", true).put("retried", retried).toString())
     }
+
+    /** A failure reply: {"success": false, "error": [message]}. */
+    private fun failure(status: Status, message: String): NanoHTTPD.Response =
+        ApiHandlerUtils.jsonResponse(status, JSONObject().put("success", false).put("error", message).toString())
 
     private fun clearPendingUploads(): NanoHTTPD.Response {
         val upload = uploadService ?: return ApiHandlerUtils.serviceUnavailable("Upload service")

@@ -21,6 +21,11 @@ enum class ThrottleAction {
     REDUCE_FRAMERATE,
     PAUSE_STREAMING,
     DISABLE_CHARGING,
+
+    /**
+     * Marks an event in the thermal history when a level rises to CRITICAL or EMERGENCY.
+     * Only a log marker: no separate alert or notification is posted.
+     */
     ALERT_USER
 }
 
@@ -142,19 +147,26 @@ data class BitrateReductionConfig(
 )
 
 /**
- * Resolution reduction configuration
+ * Resolution reduction configuration.
+ *
+ * At CPU CRITICAL the encoder is asked for one resolution step down (2160p to 1080p,
+ * 1080p to 720p, aspect ratio kept). The step is requested while either switch is on;
+ * with both off the resolution is left alone.
  */
 data class ResolutionReductionConfig(
-    val enable4KTo1080p: Boolean = true,     // Reduce 4K to 1080p at CRITICAL
-    val enable1080pTo720p: Boolean = true    // Reduce 1080p to 720p if still critical
+    val enable4KTo1080p: Boolean = true,
+    val enable1080pTo720p: Boolean = true
 )
 
 /**
- * Framerate reduction configuration
+ * Framerate reduction configuration.
+ *
+ * [reduceTo24fps]: at CPU CRITICAL the encoder frame rate is capped at 24 fps.
+ * [reduceTo15fps]: not applied; there is no second step below 24 fps.
  */
 data class FramerateReductionConfig(
-    val reduceTo24fps: Boolean = true,       // Reduce to 24fps at CRITICAL
-    val reduceTo15fps: Boolean = true        // Reduce to 15fps if still critical
+    val reduceTo24fps: Boolean = true,
+    val reduceTo15fps: Boolean = true
 )
 
 /**
@@ -301,10 +313,92 @@ data class ThermalStats(
 )
 
 /**
- * Thermal governor listener interface
+ * Thermal governor listener interface. The governor calls it on the main thread.
  */
 interface ThermalGovernorListener {
+    /** A CPU or battery level changed; [status] already reflects the change. */
     fun onThermalLevelChanged(status: ThermalStatus)
+
+    /** A throttle action was switched on or off. */
     fun onThrottleAction(action: ThrottleAction, enabled: Boolean)
+
+    /** Outputs were paused because the CPU or the battery reached EMERGENCY. */
     fun onEmergencyShutdown(reason: String)
+}
+
+/**
+ * The level for a temperature, given the level its source is at now.
+ *
+ * Levels rise as soon as the temperature reaches their threshold. A level is left only
+ * once the temperature is that level's hysteresis below its threshold, so a reading that
+ * hovers around a threshold doesn't flip the level (and the throttling) on every poll.
+ * A fast drop goes straight to the highest level the temperature still holds: with the
+ * default CPU thresholds, 61°C then 50°C gives EMERGENCY then WARNING.
+ *
+ * @param tempC the temperature now
+ * @param current the level before this reading
+ * @param thresholds the thresholds of the source (CPU or battery)
+ */
+fun levelWithHysteresis(
+    tempC: Float,
+    current: ThermalLevel,
+    thresholds: List<ThermalThreshold>
+): ThermalLevel {
+    val raw = thresholds
+        .filter { tempC >= it.temperatureCelsius }
+        .maxOfOrNull { it.level } ?: ThermalLevel.NORMAL
+    if (raw >= current) return raw
+    val held = thresholds
+        .filter { it.level <= current && tempC >= it.temperatureCelsius - it.hysteresisDegreesC }
+        .maxOfOrNull { it.level } ?: ThermalLevel.NORMAL
+    return maxOf(raw, held)
+}
+
+/**
+ * The throttling wanted for one CPU level and one battery level; see [throttlePlanFor].
+ */
+data class ThrottlePlan(
+    val bitrateReductionPercent: Int = 0,
+    val reduceResolution: Boolean = false,
+    val reduceFramerate: Boolean = false,
+    val pauseStreaming: Boolean = false,
+    val holdCharging: Boolean = false
+) {
+    /** The throttle actions this plan puts in force. */
+    fun actions(): List<ThrottleAction> = buildList {
+        if (bitrateReductionPercent > 0) add(ThrottleAction.REDUCE_BITRATE)
+        if (reduceResolution) add(ThrottleAction.REDUCE_RESOLUTION)
+        if (reduceFramerate) add(ThrottleAction.REDUCE_FRAMERATE)
+        if (pauseStreaming) add(ThrottleAction.PAUSE_STREAMING)
+        if (holdCharging) add(ThrottleAction.DISABLE_CHARGING)
+    }
+}
+
+/**
+ * The throttling wanted while the CPU is at [cpu] and the battery at [battery].
+ *
+ * - Bitrate: cut by the warning percentage at CPU WARNING and by the critical percentage
+ *   at CPU CRITICAL and above ([ThermalConfig.bitrateReduction]).
+ * - Resolution one step down and frame rate capped at 24 fps from CPU CRITICAL, unless
+ *   switched off in [ThermalConfig.resolutionReduction] / [ThermalConfig.framerateReduction].
+ * - Outputs paused while the CPU or the battery is at EMERGENCY.
+ * - Charging held while the battery is at WARNING or above.
+ *
+ * The governor derives this from both levels every cycle and applies only the differences,
+ * so the CPU cooling down never lifts a measure the battery still needs, and the reverse.
+ */
+fun throttlePlanFor(cpu: ThermalLevel, battery: ThermalLevel, config: ThermalConfig): ThrottlePlan {
+    val cpuCritical = cpu >= ThermalLevel.CRITICAL
+    val resolution = config.resolutionReduction
+    return ThrottlePlan(
+        bitrateReductionPercent = when {
+            cpuCritical -> config.bitrateReduction.criticalReductionPercent
+            cpu == ThermalLevel.WARNING -> config.bitrateReduction.warningReductionPercent
+            else -> 0
+        },
+        reduceResolution = cpuCritical && (resolution.enable4KTo1080p || resolution.enable1080pTo720p),
+        reduceFramerate = cpuCritical && config.framerateReduction.reduceTo24fps,
+        pauseStreaming = cpu == ThermalLevel.EMERGENCY || battery == ThermalLevel.EMERGENCY,
+        holdCharging = battery >= ThermalLevel.WARNING
+    )
 }

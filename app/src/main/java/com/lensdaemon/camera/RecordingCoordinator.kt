@@ -10,27 +10,49 @@ import com.lensdaemon.output.RecordingListener
 import com.lensdaemon.output.RecordingState
 import com.lensdaemon.output.RecordingStats
 import com.lensdaemon.output.SegmentDuration
+import com.lensdaemon.storage.LocalStorage
 import com.lensdaemon.storage.RecordingFile
+import com.lensdaemon.storage.RetentionConfig
+import com.lensdaemon.storage.RetentionPolicy
+import com.lensdaemon.storage.RetentionResult
 import com.lensdaemon.storage.StorageManager
 import com.lensdaemon.storage.StorageManagerBuilder
+import com.lensdaemon.storage.StorageManagerState
 import com.lensdaemon.storage.StorageStatus
+import com.lensdaemon.storage.StorageWarningLevel
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.io.File
+import java.io.IOException
 
 /**
  * Coordinates local recording, storage management, and retention.
  *
- * Extracted from CameraService to isolate recording concerns.
+ * Extracted from CameraService to isolate recording concerns. The recordings
+ * folder (listing, deleting, space, clean-up) is available from creation; the
+ * recorder itself is set up by [initialize] for the running encoder.
  */
 class RecordingCoordinator(
     private val context: Context,
     private val scope: CoroutineScope
 ) {
     private var storageManager: StorageManager? = null
+
+    /**
+     * The recordings folder, usable with no recorder: the same folder
+     * (EXTERNAL_APP) the recorder writes to. Its space monitor is never
+     * started; the recorder's own storage watches the space while recording.
+     */
+    private val localStorage = LocalStorage(context)
+
+    /** The result of the last clean-up run through [enforceRetention]. */
+    @Volatile
+    private var lastRetentionResult: RetentionResult? = null
 
     /** The encoder settings the file writer was built for (codec, size). */
     private var encoderConfig: EncoderConfig? = null
@@ -65,6 +87,15 @@ class RecordingCoordinator(
             storageManager?.onKeyFrameRequest = value
         }
 
+    /**
+     * Stops the recording when the disk stays critically full after the
+     * retention clean-up, so the owner can release what it holds for the
+     * recording too. Invoked on an IO thread; without it the recorder stops
+     * on its own.
+     */
+    @Volatile
+    var onStorageFull: (() -> Unit)? = null
+
     fun initialize(
         encoderConfig: EncoderConfig = EncoderConfig.PRESET_1080P,
         segmentDuration: SegmentDuration = SegmentDuration.FIVE_MINUTES
@@ -76,12 +107,12 @@ class RecordingCoordinator(
 
         this.encoderConfig = encoderConfig
         this.segmentDuration = segmentDuration
-        storageManager = StorageManagerBuilder(context)
+        val manager = StorageManagerBuilder(context)
             .encoderConfig(encoderConfig)
             .segmentDuration(segmentDuration)
             .build()
 
-        storageManager?.addListener(object : RecordingListener {
+        manager.addListener(object : RecordingListener {
             override fun onRecordingEvent(event: RecordingEvent) {
                 when (event) {
                     is RecordingEvent.Started -> {
@@ -112,8 +143,19 @@ class RecordingCoordinator(
             }
         })
 
-        storageManager?.onKeyFrameRequest = onKeyFrameRequest
-        storageManager?.audioFormat = audioFormat
+        // A full disk stops the recording through the owner (off the
+        // recorder's thread), or right here when nobody asked to handle it
+        manager.onStorageFull = {
+            val stop = onStorageFull
+            if (stop != null) {
+                scope.launch(Dispatchers.IO) { stop() }
+            } else {
+                manager.stopRecording()
+            }
+        }
+        manager.onKeyFrameRequest = onKeyFrameRequest
+        manager.audioFormat = audioFormat
+        storageManager = manager
         Timber.i("Storage manager initialized")
         return true
     }
@@ -168,24 +210,58 @@ class RecordingCoordinator(
 
     fun getStats(): RecordingStats = storageManager?.getRecordingStats() ?: RecordingStats()
 
-    fun getStorageStatus(): StorageStatus = storageManager?.status?.value ?: StorageStatus()
+    /**
+     * Storage status, read now: space and warning level, the recordings on
+     * disk, the recorder's state and the last clean-up. Works with no recorder.
+     */
+    fun getStorageStatus(): StorageStatus {
+        val files = localStorage.listRecordings()
+        val space = localStorage.getStorageSpace()
+        return StorageStatus(
+            state = storageManager?.state?.value ?: StorageManagerState.IDLE,
+            recordingStats = getStats(),
+            storageInfo = space,
+            warningLevel = when {
+                space.isCriticallyLowSpace -> StorageWarningLevel.CRITICAL
+                space.isLowSpace -> StorageWarningLevel.LOW
+                else -> StorageWarningLevel.NORMAL
+            },
+            totalRecordings = files.size,
+            totalRecordingsSizeBytes = files.sumOf { it.sizeBytes },
+            lastRetentionResult = lastRetentionResult
+        )
+    }
 
-    fun listRecordings(): List<RecordingFile> = storageManager?.listRecordings() ?: emptyList()
+    /** The recordings on disk, newest first, including the segment being written. */
+    fun listRecordings(): List<RecordingFile> = localStorage.listRecordings()
 
-    fun deleteRecording(file: RecordingFile): Boolean = storageManager?.deleteRecording(file) == true
+    /** Delete [file]; refused (false) for the segment being written. */
+    fun deleteRecording(file: RecordingFile): Boolean {
+        if (isOpenSegment(file)) {
+            Timber.w("Not deleting ${file.name}: it is being recorded")
+            return false
+        }
+        return localStorage.deleteRecording(file)
+    }
 
-    fun getRecordingsPath(): String =
-        storageManager?.getRecordingsDirectory()?.absolutePath ?: ""
+    fun getRecordingsPath(): String = localStorage.getRecordingsDirectory().absolutePath
 
     fun setSegmentDuration(duration: SegmentDuration) {
         segmentDuration = duration
         storageManager?.updateSegmentDuration(duration)
     }
 
-    fun enforceRetention() {
-        scope.launch {
-            storageManager?.enforceRetention()
-        }
+    /**
+     * Apply the retention policy now (7 days, 10 GB, keep 1 GB free; never the
+     * segment being written) and return what it removed. Runs on the calling
+     * thread and does file IO: call it off the main thread.
+     */
+    fun enforceRetention(): RetentionResult {
+        val openSegment = setOfNotNull(getStats().currentFilePath)
+        val result = storageManager?.enforceRetention()
+            ?: RetentionPolicy(RetentionConfig.DEFAULT).enforce(localStorage.getRecordingsDirectory(), openSegment)
+        lastRetentionResult = result
+        return result
     }
 
     fun isInitialized(): Boolean = storageManager != null
@@ -198,5 +274,17 @@ class RecordingCoordinator(
         storageManager = null
         encoderConfig = null
         _recordingState.value = RecordingState.IDLE
+    }
+
+    /** True if [file] is the segment the recorder holds open, compared by canonical path. */
+    private fun isOpenSegment(file: RecordingFile): Boolean {
+        val open = getStats().currentFilePath ?: return false
+        return try {
+            File(open).canonicalPath == File(file.path).canonicalPath
+        } catch (e: IOException) {
+            // Can't tell them apart: keep the file
+            Timber.w(e, "Cannot resolve ${file.path}")
+            true
+        }
     }
 }

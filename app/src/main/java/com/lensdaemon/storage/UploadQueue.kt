@@ -181,8 +181,11 @@ typealias ProgressCallback = (bytesUploaded: Long, totalBytes: Long) -> Unit
  * Upload queue manager
  *
  * Features:
- * - Persistent queue storage
- * - Retry logic with exponential backoff
+ * - One upload at a time, by a single processing loop
+ * - Persistent queue storage: the upload in progress, pending and failed
+ *   uploads survive a restart
+ * - Retry with backoff: 3 attempts, 2 s and 4 s apart; uploads that use them
+ *   all up are kept in a failed list until retried or cancelled
  * - Progress tracking
  * - Event callbacks
  * - Queue statistics
@@ -195,6 +198,7 @@ class UploadQueue(
         private const val PREFS_NAME = "upload_queue"
         private const val KEY_QUEUE = "queue_tasks"
         private const val KEY_COMPLETED = "completed_tasks"
+        private const val KEY_FAILED = "failed_tasks"
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -202,7 +206,19 @@ class UploadQueue(
     // In-memory queue
     private val pendingQueue = ConcurrentLinkedQueue<UploadTask>()
     private val completedTasks = mutableListOf<UploadTask>()
+
+    /** Uploads that used up their attempts; guarded by synchronized(failedTasks). */
+    private val failedTasks = mutableListOf<UploadTask>()
+
+    @Volatile
     private var currentTask: UploadTask? = null
+
+    /** The processing loop; at most one runs ([startProcessing] and [keepProcessing] hand it over). */
+    private var processingJob: Job? = null
+
+    /** Whether listeners have heard that the queue is empty since it last had work. */
+    @Volatile
+    private var queueEmptyNotified = false
 
     // State
     private val _stats = MutableStateFlow(UploadQueueStats())
@@ -268,27 +284,43 @@ class UploadQueue(
     }
 
     /**
-     * Start processing the queue
+     * Start processing the queue. Only one processing loop ever runs: a start
+     * while one runs (even one finishing its last upload after a stop) just
+     * keeps it going.
      */
+    @Synchronized
     fun startProcessing() {
-        if (_isProcessing.value) {
+        _isProcessing.value = true
+        // A new start reports an empty queue once more, so its state settles
+        queueEmptyNotified = false
+
+        if (processingJob?.isActive == true) {
             Timber.tag(TAG).d("Already processing")
             return
         }
-
-        _isProcessing.value = true
-
-        scope.launch {
+        processingJob = scope.launch {
             processQueue()
         }
     }
 
     /**
-     * Stop processing the queue
+     * Stop processing the queue. The upload in progress finishes first; no
+     * new one starts.
      */
     fun stopProcessing() {
         _isProcessing.value = false
         Timber.tag(TAG).d("Processing stopped")
+    }
+
+    /**
+     * Whether the processing loop should take another task. When it stops, it
+     * gives up its job under the same lock as [startProcessing], so a start
+     * that comes just then launches a new loop instead of relying on this one.
+     */
+    @Synchronized
+    private fun keepProcessing(): Boolean {
+        if (!_isProcessing.value) processingJob = null
+        return _isProcessing.value
     }
 
     /**
@@ -297,21 +329,29 @@ class UploadQueue(
     private suspend fun processQueue() {
         Timber.tag(TAG).d("Starting queue processing")
 
-        while (_isProcessing.value) {
+        while (keepProcessing()) {
             val task = pendingQueue.poll()
 
             if (task == null) {
-                // Queue is empty
-                notifyQueueEmpty()
+                // Queue is empty: tell the listeners once, then wait for work
+                if (!queueEmptyNotified) {
+                    queueEmptyNotified = true
+                    notifyQueueEmpty()
+                }
                 delay(1000) // Wait before checking again
                 continue
             }
+            queueEmptyNotified = false
 
             // Check if file still exists
             if (!task.fileExists()) {
                 Timber.tag(TAG).w("File no longer exists: ${task.localPath}")
                 task.status = UploadStatus.FAILED
                 task.lastError = "File not found"
+                synchronized(failedTasks) { failedTasks.add(task) }
+                saveQueue()
+                updateStats()
+                notifyUploadFailed(task, "File not found")
                 continue
             }
 
@@ -329,28 +369,27 @@ class UploadQueue(
         currentTask = task
         task.status = UploadStatus.UPLOADING
         task.lastAttemptAt = System.currentTimeMillis()
+        // Every attempt uploads the whole file again
+        task.bytesUploaded = 0
+        task.progress = 0
         updateStats()
 
         notifyUploadStarted(task)
 
-        val handler = uploadHandler
-        if (handler == null) {
-            Timber.tag(TAG).e("No upload handler configured")
-            task.status = UploadStatus.FAILED
-            task.lastError = "No upload handler"
-            handleFailedTask(task)
-            return
-        }
-
         val progressCallback: ProgressCallback = { bytesUploaded, totalBytes ->
             task.bytesUploaded = bytesUploaded
-            task.progress = if (totalBytes > 0) ((bytesUploaded * 100) / totalBytes).toInt() else 0
-            updateStats()
+            val percent = if (totalBytes > 0) ((bytesUploaded * 100) / totalBytes).toInt() else 0
+            // Progress comes every few KB: refresh the stats when the whole percentage moves
+            if (percent != task.progress) {
+                task.progress = percent
+                updateStats()
+            }
             notifyUploadProgress(task, bytesUploaded, totalBytes)
         }
 
+        val handler = uploadHandler
         val result = try {
-            handler(task, progressCallback)
+            handler?.invoke(task, progressCallback) ?: Result.failure(IllegalStateException("No upload handler"))
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Upload failed: ${task.fileName}")
             Result.failure(e)
@@ -378,6 +417,8 @@ class UploadQueue(
             Timber.tag(TAG).i("Upload completed: ${task.fileName}")
         } else {
             task.lastError = result.exceptionOrNull()?.message ?: "Unknown error"
+            // FAILED first: only a failed task may be retried (UploadTask.canRetry)
+            task.status = UploadStatus.FAILED
             handleFailedTask(task)
         }
 
@@ -387,7 +428,8 @@ class UploadQueue(
     }
 
     /**
-     * Handle a failed task (retry or mark as failed)
+     * Handle a failed attempt: try again after a backoff (2 s, then 4 s) or,
+     * after the last of its attempts, keep the task in the failed list.
      */
     private suspend fun handleFailedTask(task: UploadTask) {
         task.retryCount++
@@ -395,32 +437,33 @@ class UploadQueue(
         if (task.canRetry()) {
             task.status = UploadStatus.PENDING
             val delayMs = task.getRetryDelayMs()
-            Timber.tag(TAG).d("Retrying in ${delayMs}ms: ${task.fileName} (attempt ${task.retryCount})")
+            Timber.tag(TAG).d("Retrying in ${delayMs}ms: ${task.fileName} (attempt ${task.retryCount + 1})")
 
             delay(delayMs)
             pendingQueue.offer(task)
         } else {
             task.status = UploadStatus.FAILED
+            synchronized(failedTasks) { failedTasks.add(task) }
             notifyUploadFailed(task, task.lastError ?: "Unknown error")
             Timber.tag(TAG).e("Upload failed permanently: ${task.fileName}")
         }
     }
 
     /**
-     * Cancel a specific task
+     * Cancel a pending task, or drop a failed one
      */
     fun cancelTask(taskId: String): Boolean {
         val task = pendingQueue.find { it.id == taskId }
-        if (task != null) {
-            pendingQueue.remove(task)
-            task.status = UploadStatus.CANCELLED
-            notifyUploadCancelled(task)
-            saveQueue()
-            updateStats()
-            Timber.tag(TAG).d("Task cancelled: ${task.fileName}")
-            return true
-        }
-        return false
+            ?: synchronized(failedTasks) { failedTasks.find { it.id == taskId }?.also { failedTasks.remove(it) } }
+            ?: return false
+
+        pendingQueue.remove(task)
+        task.status = UploadStatus.CANCELLED
+        notifyUploadCancelled(task)
+        saveQueue()
+        updateStats()
+        Timber.tag(TAG).d("Task cancelled: ${task.fileName}")
+        return true
     }
 
     /**
@@ -444,18 +487,27 @@ class UploadQueue(
     }
 
     /**
-     * Retry all failed tasks
+     * Queue every failed upload again, with a fresh set of attempts.
+     * The caller starts processing if it is not running.
+     *
+     * @return how many uploads were queued again
      */
-    fun retryFailed() {
-        val failedTasks = pendingQueue.filter { it.status == UploadStatus.FAILED }
-        failedTasks.forEach { task ->
+    fun retryFailed(): Int {
+        val retried = synchronized(failedTasks) {
+            failedTasks.toList().also { failedTasks.clear() }
+        }
+        retried.forEach { task ->
             task.status = UploadStatus.PENDING
             task.retryCount = 0
             task.lastError = null
+            task.bytesUploaded = 0
+            task.progress = 0
+            pendingQueue.offer(task)
         }
         saveQueue()
         updateStats()
-        Timber.tag(TAG).d("Retrying ${failedTasks.size} failed tasks")
+        Timber.tag(TAG).d("Retrying ${retried.size} failed tasks")
+        return retried.size
     }
 
     /**
@@ -469,6 +521,11 @@ class UploadQueue(
     fun getCompletedTasks(): List<UploadTask> = completedTasks.toList()
 
     /**
+     * Get the uploads that used up their attempts, oldest first
+     */
+    fun getFailedTasks(): List<UploadTask> = synchronized(failedTasks) { failedTasks.toList() }
+
+    /**
      * Get current upload task
      */
     fun getCurrentTask(): UploadTask? = currentTask
@@ -477,23 +534,24 @@ class UploadQueue(
      * Get queue statistics
      */
     fun getStats(): UploadQueueStats {
+        val current = currentTask
         val pending = pendingQueue.filter { it.status == UploadStatus.PENDING }
-        val uploading = if (currentTask?.status == UploadStatus.UPLOADING) 1 else 0
+        val uploading = if (current?.status == UploadStatus.UPLOADING) 1 else 0
         val completed = completedTasks.filter { it.status == UploadStatus.COMPLETED }
-        val failed = pendingQueue.filter { it.status == UploadStatus.FAILED }
+        val failedCount = synchronized(failedTasks) { failedTasks.size }
 
-        val totalBytes = pendingQueue.sumOf { it.fileSize } + (currentTask?.fileSize ?: 0)
-        val uploadedBytes = completedTasks.sumOf { it.fileSize } + (currentTask?.bytesUploaded ?: 0)
+        val totalBytes = pendingQueue.sumOf { it.fileSize } + (current?.fileSize ?: 0)
+        val uploadedBytes = completedTasks.sumOf { it.fileSize } + (current?.bytesUploaded ?: 0)
 
         return UploadQueueStats(
             pendingCount = pending.size,
             uploadingCount = uploading,
             completedCount = completed.size,
-            failedCount = failed.size,
+            failedCount = failedCount,
             totalBytes = totalBytes,
             uploadedBytes = uploadedBytes,
-            currentTaskId = currentTask?.id,
-            currentProgress = currentTask?.progress ?: 0
+            currentTaskId = current?.id,
+            currentProgress = current?.progress ?: 0
         )
     }
 
@@ -526,12 +584,22 @@ class UploadQueue(
     }
 
     /**
-     * Save queue to persistent storage
+     * Save queue to persistent storage: the upload in progress (first, as
+     * pending, so it starts over after a restart), the pending uploads, the
+     * failed ones and the last 100 completed.
      */
     private fun saveQueue() {
         try {
+            // Not when it has just completed or failed for good, or is back in the queue
+            val inFlight = currentTask?.takeIf {
+                (it.status == UploadStatus.UPLOADING || it.status == UploadStatus.PENDING) && it !in pendingQueue
+            }
             val queueJson = JSONArray().apply {
+                inFlight?.let { put(it.toJson().put("status", UploadStatus.PENDING.name)) }
                 pendingQueue.forEach { put(it.toJson()) }
+            }
+            val failedJson = JSONArray().apply {
+                synchronized(failedTasks) { failedTasks.forEach { put(it.toJson()) } }
             }
             val completedJson = JSONArray().apply {
                 completedTasks.takeLast(100).forEach { put(it.toJson()) } // Keep last 100
@@ -539,6 +607,7 @@ class UploadQueue(
 
             prefs.edit()
                 .putString(KEY_QUEUE, queueJson.toString())
+                .putString(KEY_FAILED, failedJson.toString())
                 .putString(KEY_COMPLETED, completedJson.toString())
                 .apply()
         } catch (e: Exception) {
@@ -547,32 +616,25 @@ class UploadQueue(
     }
 
     /**
-     * Load queue from persistent storage
+     * Load queue from persistent storage. An upload that was in progress is
+     * pending again; failed uploads go back to the failed list.
      */
     private fun loadQueue() {
         try {
-            val queueStr = prefs.getString(KEY_QUEUE, null)
-            if (queueStr != null) {
-                val queueJson = JSONArray(queueStr)
-                for (i in 0 until queueJson.length()) {
-                    val task = UploadTask.fromJson(queueJson.getJSONObject(i))
+            uploadTasksFrom(prefs.getString(KEY_QUEUE, null)).forEach { task ->
+                if (task.status == UploadStatus.FAILED) {
+                    synchronized(failedTasks) { failedTasks.add(task) }
+                } else {
                     // Reset uploading tasks to pending
-                    if (task.status == UploadStatus.UPLOADING) {
-                        task.status = UploadStatus.PENDING
-                    }
+                    task.status = UploadStatus.PENDING
                     pendingQueue.offer(task)
                 }
             }
+            val failed = uploadTasksFrom(prefs.getString(KEY_FAILED, null))
+            synchronized(failedTasks) { failedTasks.addAll(failed) }
+            completedTasks.addAll(uploadTasksFrom(prefs.getString(KEY_COMPLETED, null)))
 
-            val completedStr = prefs.getString(KEY_COMPLETED, null)
-            if (completedStr != null) {
-                val completedJson = JSONArray(completedStr)
-                for (i in 0 until completedJson.length()) {
-                    completedTasks.add(UploadTask.fromJson(completedJson.getJSONObject(i)))
-                }
-            }
-
-            Timber.tag(TAG).d("Loaded ${pendingQueue.size} pending, ${completedTasks.size} completed tasks")
+            Timber.tag(TAG).d("Loaded ${pendingQueue.size} pending, ${failed.size} failed, ${completedTasks.size} completed tasks")
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Failed to load queue")
         }
@@ -623,4 +685,11 @@ class UploadQueue(
             listeners.forEach { it.onQueueEmpty() }
         }
     }
+}
+
+/** The upload tasks in [json], a JSON array saved by [UploadQueue]; none when there is nothing saved. */
+private fun uploadTasksFrom(json: String?): List<UploadTask> {
+    if (json == null) return emptyList()
+    val array = JSONArray(json)
+    return (0 until array.length()).map { UploadTask.fromJson(array.getJSONObject(it)) }
 }

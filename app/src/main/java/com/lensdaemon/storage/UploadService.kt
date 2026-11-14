@@ -7,10 +7,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.net.ConnectivityManager
+import android.net.Network
 import android.os.Binder
 import android.os.Build
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
+import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.R
 import kotlinx.coroutines.*
@@ -50,12 +53,12 @@ data class UploadServiceStats(
  * - SMB/CIFS network shares
  *
  * Features:
- * - Foreground service for reliable uploads
- * - Upload queue with persistence
- * - Automatic retry with exponential backoff
+ * - Foreground service for reliable uploads (where Android allows starting one)
+ * - Upload queue with persistence; queued uploads resume when the service starts
+ * - Automatic retry: 3 attempts, 2 s and 4 s apart, then kept as failed
  * - Progress notifications
- * - Network state awareness
- * - Concurrent upload support
+ * - Failed uploads retried when the network comes back (kiosk networkRecovery.autoReconnect)
+ * - One upload at a time
  */
 class UploadService : Service(), UploadEventListener {
 
@@ -137,6 +140,36 @@ class UploadService : Service(), UploadEventListener {
     private val _stats = MutableStateFlow(UploadServiceStats())
     val stats: StateFlow<UploadServiceStats> = _stats.asStateFlow()
 
+    /** The upload percentage last shown, so the notification changes only when it moves. */
+    @Volatile
+    private var lastNotifiedPercent = -1
+
+    /** True from losing the network (or starting without one) until it is back. */
+    @Volatile
+    private var networkLost = false
+
+    /**
+     * Retries the failed uploads when the network comes back after a loss,
+     * while kiosk network recovery (networkRecovery.autoReconnect) is on.
+     * Called on a system thread.
+     */
+    private val networkCallback = object : ConnectivityManager.NetworkCallback() {
+        override fun onLost(network: Network) {
+            networkLost = true
+        }
+
+        override fun onAvailable(network: Network) {
+            if (!networkLost) return
+            networkLost = false
+            serviceScope.launch {
+                if ((application as LensDaemonApp).kioskManager.getConfig().networkRecovery.autoReconnect) {
+                    val retried = retryFailed()
+                    Timber.tag(TAG).i("Network is back: retrying $retried failed uploads")
+                }
+            }
+        }
+    }
+
     override fun onCreate() {
         super.onCreate()
         Timber.tag(TAG).i("UploadService created")
@@ -157,10 +190,17 @@ class UploadService : Service(), UploadEventListener {
         initializeClients()
 
         updateStats()
+
+        watchNetwork()
+
+        // Uploads still queued from before (an app restart, a reboot) carry on
+        if (uploadQueue.getPendingTasks().isNotEmpty()) {
+            startUploads()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        Timber.tag(TAG).d("onStartCommand: \${intent?.action}")
+        Timber.tag(TAG).d("onStartCommand: ${intent?.action}")
 
         when (intent?.action) {
             ACTION_START_UPLOADS -> {
@@ -191,6 +231,12 @@ class UploadService : Service(), UploadEventListener {
         super.onDestroy()
         Timber.tag(TAG).i("UploadService destroyed")
 
+        try {
+            getSystemService(ConnectivityManager::class.java).unregisterNetworkCallback(networkCallback)
+        } catch (e: IllegalArgumentException) {
+            Timber.tag(TAG).w(e, "The network callback was not registered")
+        }
+
         uploadQueue.stopProcessing()
         uploadQueue.removeListener(this)
         uploadQueue.release()
@@ -200,22 +246,43 @@ class UploadService : Service(), UploadEventListener {
         serviceScope.cancel()
     }
 
+    /** Watch the default network, so failed uploads are retried when it comes back. */
+    private fun watchNetwork() {
+        try {
+            val connectivity = getSystemService(ConnectivityManager::class.java)
+            networkLost = connectivity.activeNetwork == null
+            connectivity.registerDefaultNetworkCallback(networkCallback)
+        } catch (e: SecurityException) {
+            Timber.tag(TAG).w(e, "Cannot watch the network: failed uploads are not retried when it returns")
+        }
+    }
+
     /**
-     * Initialize storage clients from stored credentials
+     * Initialize storage clients from stored credentials. A backend whose saved
+     * settings can't be read (for example restored from a backup without their
+     * key) is left unconfigured instead of stopping the service.
      */
     private fun initializeClients() {
         // S3 client
-        val s3Creds = credentialStore.getS3Credentials()
-        if (s3Creds != null && s3Creds.isValid()) {
-            s3Client = S3Client(s3Creds)
-            Timber.tag(TAG).d("S3 client initialized: \${s3Creds.backend}")
+        try {
+            val s3Creds = credentialStore.getS3Credentials()
+            if (s3Creds != null && s3Creds.isValid()) {
+                s3Client = S3Client(s3Creds)
+                Timber.tag(TAG).d("S3 client initialized: ${s3Creds.backend}")
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Saved S3 settings could not be loaded; S3 uploads are off")
         }
 
         // SMB client
-        val smbCreds = credentialStore.getSmbCredentials()
-        if (smbCreds != null && smbCreds.isValid()) {
-            smbClient = SmbClient(smbCreds)
-            Timber.tag(TAG).d("SMB client initialized: \${smbCreds.server}")
+        try {
+            val smbCreds = credentialStore.getSmbCredentials()
+            if (smbCreds != null && smbCreds.isValid()) {
+                smbClient = SmbClient(smbCreds)
+                Timber.tag(TAG).d("SMB client initialized: ${smbCreds.server}")
+            }
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Saved SMB settings could not be loaded; SMB uploads are off")
         }
 
         updateStats()
@@ -230,7 +297,13 @@ class UploadService : Service(), UploadEventListener {
             return
         }
 
-        startForeground(NOTIFICATION_ID, createNotification("Starting uploads..."))
+        try {
+            startForeground(NOTIFICATION_ID, createNotification("Starting uploads..."))
+        } catch (e: IllegalStateException) {
+            // Android 12+ refuses it from the background: upload anyway, while
+            // the web server keeps this service bound
+            Timber.tag(TAG).w(e, "Uploading without a foreground notification")
+        }
 
         _state.value = UploadServiceState.UPLOADING
         uploadQueue.startProcessing()
@@ -262,7 +335,7 @@ class UploadService : Service(), UploadEventListener {
     ): UploadTask? {
         val file = File(filePath)
         if (!file.exists()) {
-            Timber.tag(TAG).w("File not found: \$filePath")
+            Timber.tag(TAG).w("File not found: $filePath")
             return null
         }
 
@@ -295,7 +368,7 @@ class UploadService : Service(), UploadEventListener {
             }
         }
 
-        Timber.tag(TAG).i("Enqueued \$count recordings for upload")
+        Timber.tag(TAG).i("Enqueued $count recordings for upload")
         return count
     }
 
@@ -306,7 +379,7 @@ class UploadService : Service(), UploadEventListener {
         credentialStore.storeS3Credentials(credentials)
         s3Client = S3Client(credentials)
         updateStats()
-        Timber.tag(TAG).i("S3 configured: \${credentials.backend} - \${credentials.bucket}")
+        Timber.tag(TAG).i("S3 configured: ${credentials.backend} - ${credentials.bucket}")
     }
 
     /**
@@ -332,7 +405,7 @@ class UploadService : Service(), UploadEventListener {
         smbClient?.disconnect()
         smbClient = SmbClient(credentials)
         updateStats()
-        Timber.tag(TAG).i("SMB configured: \${credentials.server}/\${credentials.share}")
+        Timber.tag(TAG).i("SMB configured: ${credentials.server}/${credentials.share}")
     }
 
     /**
@@ -387,7 +460,12 @@ class UploadService : Service(), UploadEventListener {
     fun getCompletedTasks(): List<UploadTask> = uploadQueue.getCompletedTasks()
 
     /**
-     * Cancel a specific task
+     * Get the uploads that used up their attempts (until retried or cancelled)
+     */
+    fun getFailedTasks(): List<UploadTask> = uploadQueue.getFailedTasks()
+
+    /**
+     * Cancel a pending task, or drop a failed one
      */
     fun cancelTask(taskId: String): Boolean {
         val result = uploadQueue.cancelTask(taskId)
@@ -404,11 +482,18 @@ class UploadService : Service(), UploadEventListener {
     }
 
     /**
-     * Retry all failed tasks
+     * Queue all failed tasks again with fresh attempts, and start uploading if
+     * no upload is running.
+     *
+     * @return how many uploads were queued again
      */
-    fun retryFailed() {
-        uploadQueue.retryFailed()
+    fun retryFailed(): Int {
+        val retried = uploadQueue.retryFailed()
+        if (retried > 0 && _state.value != UploadServiceState.UPLOADING) {
+            startUploads()
+        }
         updateStats()
+        return retried
     }
 
     /**
@@ -498,23 +583,27 @@ class UploadService : Service(), UploadEventListener {
     // ==================== UploadEventListener ====================
 
     override fun onUploadStarted(task: UploadTask) {
-        updateNotification("Uploading: \${task.fileName}")
+        lastNotifiedPercent = -1
+        updateNotification("Uploading: ${task.fileName}")
         updateStats()
     }
 
     override fun onUploadProgress(task: UploadTask, bytesUploaded: Long, totalBytes: Long) {
         val progress = if (totalBytes > 0) ((bytesUploaded * 100) / totalBytes).toInt() else 0
-        updateNotification("Uploading: \${task.fileName} (\$progress%)")
+        // Progress comes every few KB: update only when the whole percentage moves
+        if (progress == lastNotifiedPercent) return
+        lastNotifiedPercent = progress
+        updateNotification("Uploading: ${task.fileName} ($progress%)")
         updateStats()
     }
 
     override fun onUploadCompleted(task: UploadTask) {
-        updateNotification("Upload completed: \${task.fileName}")
+        updateNotification("Upload completed: ${task.fileName}")
         updateStats()
     }
 
     override fun onUploadFailed(task: UploadTask, error: String) {
-        Timber.tag(TAG).e("Upload failed: \${task.fileName} - \$error")
+        Timber.tag(TAG).e("Upload failed: ${task.fileName} - $error")
         updateStats()
     }
 
@@ -522,9 +611,10 @@ class UploadService : Service(), UploadEventListener {
         updateStats()
     }
 
+    /** Called once each time the queue runs out of work, so the notice is posted once. */
     override fun onQueueEmpty() {
-        updateNotification("All uploads completed")
         _state.value = UploadServiceState.IDLE
+        updateNotification("All uploads completed")
         updateStats()
     }
 
@@ -556,20 +646,23 @@ class UploadService : Service(), UploadEventListener {
 
         val stats = uploadQueue.getStats()
         val contentText = if (stats.totalCount > 0) {
-            "\$status (\${stats.completedCount}/\${stats.totalCount})"
+            "$status (${stats.completedCount}/${stats.totalCount})"
         } else {
             status
         }
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        // Only an upload in progress stays put with a progress bar; the
+        // finished and paused notices can be swiped away
+        val uploading = _state.value == UploadServiceState.UPLOADING
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("LensDaemon Uploads")
             .setContentText(contentText)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)
-            .setOngoing(true)
+            .setOngoing(uploading)
             .setSilent(true)
-            .setProgress(100, stats.currentProgress, stats.currentProgress == 0)
-            .build()
+        if (uploading) builder.setProgress(100, stats.currentProgress, stats.currentProgress == 0)
+        return builder.build()
     }
 
     private fun updateNotification(status: String) {

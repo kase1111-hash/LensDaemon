@@ -599,3 +599,188 @@ class ThermalConfigTest {
         assertEquals("Critical - Performance Reduced", modified.statusText)
     }
 }
+
+/**
+ * The governor's pure decisions: levels with hysteresis and the throttling they call for.
+ * (A class of its own keeps ThermalConfigTest under detekt's LargeClass limit.)
+ */
+class ThermalThrottlingTest {
+
+    // -------------------------------------------------------
+    // levelWithHysteresis (defaults: CPU 45/50/55/60 °C with 3 °C
+    // hysteresis, battery 38/42/45/48 °C with 2 °C)
+    // -------------------------------------------------------
+
+    private val cpuThresholds = CpuThermalConfig().getThresholds()
+    private val batteryThresholds = BatteryThermalConfig().getThresholds()
+
+    /** Feed readings one after another, as the governor's 5 s polls do. */
+    private fun replay(start: ThermalLevel, thresholds: List<ThermalThreshold>, vararg temps: Float): List<ThermalLevel> {
+        var level = start
+        return temps.map { temp ->
+            level = levelWithHysteresis(temp, level, thresholds)
+            level
+        }
+    }
+
+    @Test
+    fun hysteresis_cpuCriticalHeldUntilThreeDegreesBelowItsThreshold() {
+        assertEquals(ThermalLevel.CRITICAL, levelWithHysteresis(54.9f, ThermalLevel.CRITICAL, cpuThresholds))
+        assertEquals(ThermalLevel.CRITICAL, levelWithHysteresis(55.1f, ThermalLevel.CRITICAL, cpuThresholds))
+        assertEquals(ThermalLevel.CRITICAL, levelWithHysteresis(52.0f, ThermalLevel.CRITICAL, cpuThresholds))
+        assertEquals(ThermalLevel.WARNING, levelWithHysteresis(51.9f, ThermalLevel.CRITICAL, cpuThresholds))
+    }
+
+    @Test
+    fun hysteresis_cpuHoveringAroundCriticalDoesNotFlip() {
+        val levels = replay(ThermalLevel.WARNING, cpuThresholds, 55.1f, 54.9f, 55.1f, 54.9f, 52.0f, 51.9f)
+        assertEquals(
+            listOf(
+                ThermalLevel.CRITICAL, ThermalLevel.CRITICAL, ThermalLevel.CRITICAL,
+                ThermalLevel.CRITICAL, ThermalLevel.CRITICAL, ThermalLevel.WARNING
+            ),
+            levels
+        )
+    }
+
+    @Test
+    fun hysteresis_cpuEmergencyHeldUntil57() {
+        assertEquals(ThermalLevel.EMERGENCY, levelWithHysteresis(59.9f, ThermalLevel.EMERGENCY, cpuThresholds))
+        assertEquals(ThermalLevel.EMERGENCY, levelWithHysteresis(57.0f, ThermalLevel.EMERGENCY, cpuThresholds))
+        assertEquals(ThermalLevel.CRITICAL, levelWithHysteresis(56.9f, ThermalLevel.EMERGENCY, cpuThresholds))
+    }
+
+    @Test
+    fun hysteresis_cpuFastDropGoesToTheLevelStillHeld() {
+        // 43 °C is below ELEVATED's 45 but within its 3 °C hysteresis
+        assertEquals(ThermalLevel.ELEVATED, levelWithHysteresis(43.0f, ThermalLevel.EMERGENCY, cpuThresholds))
+        assertEquals(ThermalLevel.WARNING, levelWithHysteresis(50.0f, ThermalLevel.EMERGENCY, cpuThresholds))
+        assertEquals(ThermalLevel.NORMAL, levelWithHysteresis(30.0f, ThermalLevel.EMERGENCY, cpuThresholds))
+    }
+
+    @Test
+    fun hysteresis_cpuRisesAsSoonAsAThresholdIsReached() {
+        assertEquals(ThermalLevel.ELEVATED, levelWithHysteresis(49.9f, ThermalLevel.NORMAL, cpuThresholds))
+        assertEquals(ThermalLevel.WARNING, levelWithHysteresis(50.0f, ThermalLevel.ELEVATED, cpuThresholds))
+        assertEquals(ThermalLevel.EMERGENCY, levelWithHysteresis(61.0f, ThermalLevel.NORMAL, cpuThresholds))
+    }
+
+    @Test
+    fun hysteresis_cpuElevatedLeftBelow42() {
+        assertEquals(ThermalLevel.ELEVATED, levelWithHysteresis(42.0f, ThermalLevel.ELEVATED, cpuThresholds))
+        assertEquals(ThermalLevel.NORMAL, levelWithHysteresis(41.9f, ThermalLevel.ELEVATED, cpuThresholds))
+    }
+
+    @Test
+    fun hysteresis_batteryWarningHeldUntil40() {
+        assertEquals(ThermalLevel.WARNING, levelWithHysteresis(41.9f, ThermalLevel.WARNING, batteryThresholds))
+        assertEquals(ThermalLevel.WARNING, levelWithHysteresis(40.0f, ThermalLevel.WARNING, batteryThresholds))
+        assertEquals(ThermalLevel.ELEVATED, levelWithHysteresis(39.9f, ThermalLevel.WARNING, batteryThresholds))
+    }
+
+    @Test
+    fun hysteresis_followsTheDeviceProfileThresholds() {
+        // A profile that throttles earlier than the defaults (CPU 43/48/53 °C)
+        val config = ThermalProfile(deviceModel = "test", cpuWarnC = 43f, cpuCriticalC = 48f, cpuEmergencyC = 53f)
+            .toThermalConfig()
+        val thresholds = config.cpuConfig.getThresholds()
+        assertEquals(ThermalLevel.CRITICAL, levelWithHysteresis(48.5f, ThermalLevel.NORMAL, thresholds))
+        assertEquals(ThermalLevel.CRITICAL, levelWithHysteresis(45.0f, ThermalLevel.CRITICAL, thresholds))
+        assertEquals(ThermalLevel.WARNING, levelWithHysteresis(44.9f, ThermalLevel.CRITICAL, thresholds))
+    }
+
+    // -------------------------------------------------------
+    // throttlePlanFor
+    // -------------------------------------------------------
+
+    private val defaultConfig = ThermalConfig()
+
+    @Test
+    fun plan_allNormalIsNoThrottling() {
+        assertEquals(ThrottlePlan(), throttlePlanFor(ThermalLevel.NORMAL, ThermalLevel.NORMAL, defaultConfig))
+        assertEquals(ThrottlePlan(), throttlePlanFor(ThermalLevel.ELEVATED, ThermalLevel.ELEVATED, defaultConfig))
+        assertTrue(ThrottlePlan().actions().isEmpty())
+    }
+
+    @Test
+    fun plan_cpuWarningCutsBitrateBy20() {
+        assertEquals(
+            ThrottlePlan(bitrateReductionPercent = 20),
+            throttlePlanFor(ThermalLevel.WARNING, ThermalLevel.NORMAL, defaultConfig)
+        )
+    }
+
+    @Test
+    fun plan_cpuCriticalCuts40AndLimitsTheEncoder() {
+        assertEquals(
+            ThrottlePlan(bitrateReductionPercent = 40, reduceResolution = true, reduceFramerate = true),
+            throttlePlanFor(ThermalLevel.CRITICAL, ThermalLevel.NORMAL, defaultConfig)
+        )
+    }
+
+    @Test
+    fun plan_cpuEmergencyAlsoPauses() {
+        assertEquals(
+            ThrottlePlan(bitrateReductionPercent = 40, reduceResolution = true, reduceFramerate = true, pauseStreaming = true),
+            throttlePlanFor(ThermalLevel.EMERGENCY, ThermalLevel.NORMAL, defaultConfig)
+        )
+    }
+
+    @Test
+    fun plan_batteryEmergencyPausesWhileTheCpuIsCool() {
+        // A cool CPU doesn't lift the pause (or the charging hold) the hot battery needs
+        assertEquals(
+            ThrottlePlan(pauseStreaming = true, holdCharging = true),
+            throttlePlanFor(ThermalLevel.ELEVATED, ThermalLevel.EMERGENCY, defaultConfig)
+        )
+    }
+
+    @Test
+    fun plan_batteryCriticalOnlyHoldsCharging() {
+        assertEquals(
+            ThrottlePlan(holdCharging = true),
+            throttlePlanFor(ThermalLevel.NORMAL, ThermalLevel.CRITICAL, defaultConfig)
+        )
+        assertEquals(
+            ThrottlePlan(holdCharging = true),
+            throttlePlanFor(ThermalLevel.NORMAL, ThermalLevel.WARNING, defaultConfig)
+        )
+    }
+
+    @Test
+    fun plan_criticalToWarningGoesBackTo20() {
+        val critical = throttlePlanFor(ThermalLevel.CRITICAL, ThermalLevel.NORMAL, defaultConfig)
+        val warning = throttlePlanFor(ThermalLevel.WARNING, ThermalLevel.NORMAL, defaultConfig)
+        assertEquals(40, critical.bitrateReductionPercent)
+        assertEquals(20, warning.bitrateReductionPercent)
+        assertFalse(warning.reduceResolution)
+        assertFalse(warning.reduceFramerate)
+    }
+
+    @Test
+    fun plan_encoderLimitsFollowTheirSwitches() {
+        val config = ThermalConfig(
+            resolutionReduction = ResolutionReductionConfig(enable4KTo1080p = false, enable1080pTo720p = false),
+            framerateReduction = FramerateReductionConfig(reduceTo24fps = false)
+        )
+        assertEquals(
+            ThrottlePlan(bitrateReductionPercent = 40),
+            throttlePlanFor(ThermalLevel.CRITICAL, ThermalLevel.NORMAL, config)
+        )
+    }
+
+    @Test
+    fun plan_actionsListEverythingInForce() {
+        val plan = throttlePlanFor(ThermalLevel.EMERGENCY, ThermalLevel.WARNING, defaultConfig)
+        assertEquals(
+            listOf(
+                ThrottleAction.REDUCE_BITRATE,
+                ThrottleAction.REDUCE_RESOLUTION,
+                ThrottleAction.REDUCE_FRAMERATE,
+                ThrottleAction.PAUSE_STREAMING,
+                ThrottleAction.DISABLE_CHARGING
+            ),
+            plan.actions()
+        )
+    }
+}

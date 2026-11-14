@@ -194,6 +194,82 @@ class RetentionPolicyTest {
         assertEquals(0, result.filesDeleted)
     }
 
+    // ==================== Excluded files (the segment being recorded) ====================
+
+    @Test
+    fun `max size keeps an excluded newest file that alone is over the limit`() {
+        val older = createTestFile("older.mp4", 1000)
+        older.setLastModified(System.currentTimeMillis() - 3000)
+        val recording = createTestFile("recording.mp4", 5000)
+        recording.setLastModified(System.currentTimeMillis())
+
+        val config = RetentionConfig(type = RetentionType.MAX_SIZE, maxSizeBytes = 2000L, minFreeSpaceBytes = 0L)
+        val result = RetentionPolicy(config).enforce(recordingsDir, setOf(recording.canonicalPath))
+
+        assertTrue("the file being recorded is never deleted", recording.exists())
+        assertTrue("an excluded file does not count towards the limit", older.exists())
+        assertEquals(0, result.filesDeleted)
+    }
+
+    @Test
+    fun `max size still trims the other files when the newest is excluded`() {
+        val oldest = createTestFile("oldest.mp4", 1500)
+        oldest.setLastModified(System.currentTimeMillis() - 3000)
+        val middle = createTestFile("middle.mp4", 1500)
+        middle.setLastModified(System.currentTimeMillis() - 2000)
+        val recording = createTestFile("recording.mp4", 5000)
+        recording.setLastModified(System.currentTimeMillis())
+
+        val config = RetentionConfig(type = RetentionType.MAX_SIZE, maxSizeBytes = 2000L, minFreeSpaceBytes = 0L)
+        val result = RetentionPolicy(config).enforce(recordingsDir, setOf(recording.canonicalPath))
+
+        assertEquals(1, result.filesDeleted)
+        assertFalse(oldest.exists())
+        assertTrue(middle.exists())
+        assertTrue(recording.exists())
+    }
+
+    @Test
+    fun `the free space rule never selects an excluded file`() {
+        val old = createTestFile("old.mp4", 1000)
+        old.setLastModified(System.currentTimeMillis() - 2000)
+        val recording = createTestFile("recording.mp4", 1000)
+        recording.setLastModified(System.currentTimeMillis())
+
+        // No disk has this much free, so the rule takes every file it may
+        val config = RetentionConfig(type = RetentionType.MAX_AGE, minFreeSpaceBytes = Long.MAX_VALUE)
+        val result = RetentionPolicy(config).enforce(recordingsDir, setOf(recording.canonicalPath))
+
+        assertEquals(1, result.filesDeleted)
+        assertFalse(old.exists())
+        assertTrue(recording.exists())
+    }
+
+    @Test
+    fun `excluded paths match by canonical path`() {
+        val recording = createTestFile("recording.mp4", 1000)
+        recording.setLastModified(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(10))
+
+        val config = RetentionConfig(type = RetentionType.MAX_AGE, maxAgeMs = TimeUnit.DAYS.toMillis(1), minFreeSpaceBytes = 0L)
+        val result = RetentionPolicy(config).enforce(recordingsDir, setOf("${recordingsDir.path}/./recording.mp4"))
+
+        assertEquals(0, result.filesDeleted)
+        assertTrue(recording.exists())
+    }
+
+    @Test
+    fun `preview leaves out excluded files`() {
+        val old = createTestFile("old.mp4", 1024)
+        old.setLastModified(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(10))
+        val recording = createTestFile("recording.mp4", 1024)
+        recording.setLastModified(System.currentTimeMillis() - TimeUnit.DAYS.toMillis(10))
+
+        val config = RetentionConfig(type = RetentionType.MAX_AGE, maxAgeMs = TimeUnit.DAYS.toMillis(7), minFreeSpaceBytes = 0L)
+        val toDelete = RetentionPolicy(config).preview(recordingsDir, setOf(recording.canonicalPath))
+
+        assertEquals(listOf(old.absolutePath), toDelete.map { it.absolutePath })
+    }
+
     // ==================== MAX_AGE_AND_SIZE Policy Tests ====================
 
     @Test
