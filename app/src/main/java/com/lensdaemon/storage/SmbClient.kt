@@ -10,8 +10,11 @@ import com.hierynomus.mssmb2.SMBApiException
 import com.hierynomus.smbj.SMBClient
 import com.hierynomus.smbj.SmbConfig
 import com.hierynomus.smbj.auth.AuthenticationContext
+import com.hierynomus.smbj.connection.Connection
+import com.hierynomus.smbj.session.Session
 import com.hierynomus.smbj.share.DiskShare
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.withContext
 import timber.log.Timber
 import java.io.File
@@ -62,6 +65,10 @@ enum class SmbConnectionState {
  * Uploads create missing folders under the path prefix. A failed upload drops the
  * connection and is tried once more on a fresh one, so a session the server dropped
  * (restart, Wi-Fi change, idle timeout) doesn't break every later upload.
+ *
+ * [disconnect] closes the client for good: its owner calls it when the settings are
+ * replaced or removed and when it stops, so an upload under way then fails without
+ * retrying, and nothing reconnects the client to the old server afterwards.
  */
 class SmbClient(
     private val credentials: SmbCredentials
@@ -71,6 +78,7 @@ class SmbClient(
         private const val CONNECT_TIMEOUT_SEC = 30L
         private const val READ_TIMEOUT_SEC = 60L
         private const val BUFFER_SIZE = 65536 // 64KB
+        private const val CLOSED_MESSAGE = "SMB settings were changed or removed; this connection is closed"
     }
 
     private val smbConfig = SmbConfig.builder()
@@ -84,36 +92,53 @@ class SmbClient(
     var state: SmbConnectionState = SmbConnectionState.DISCONNECTED
         private set
 
-    private var connection: com.hierynomus.smbj.connection.Connection? = null
-    private var session: com.hierynomus.smbj.session.Session? = null
+    // Volatile: disconnect() closes them from another thread while an upload runs
+    @Volatile
+    private var connection: Connection? = null
+    @Volatile
+    private var session: Session? = null
+    @Volatile
     private var share: DiskShare? = null
 
+    // Set by disconnect(): the owner is done with this client, so nothing may reconnect it
+    @Volatile
+    private var closed = false
+
     /**
-     * Test connection to SMB share: connect, then check the upload folder (the path
-     * prefix) and create it when missing, so a wrong path or a read-only share fails here
-     * rather than on the first upload. The failure's message says why.
+     * Test connection to SMB share: connect, make sure the upload folder (the path
+     * prefix) exists, creating it when missing, and that the account may create files in
+     * it. The write check creates nothing, yet a wrong path, a read-only share or a
+     * read-only account fails here rather than on the first upload. The failure's message
+     * says why.
      */
     suspend fun testConnection(): Result<Boolean> = withContext(Dispatchers.IO) {
         try {
             connect()
             val diskShare = share ?: throw IOException("Not connected")
-            ensureFolders(diskShare, smbPath(credentials.pathPrefix, ""))
+            val folder = smbPath(credentials.pathPrefix, "")
+            ensureFolders(diskShare, folder)
+            checkCanAddFiles(diskShare, folder)
             Result.success(true)
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "SMB connection test failed")
             Result.failure(e)
         } finally {
-            disconnect()
+            dropConnection()
         }
     }
 
     /**
      * Connect to SMB server, authenticate, and open the share.
+     *
+     * @throws IOException once [disconnect] has closed the client; a connection made while
+     *   it was closing is dropped again
      */
     private fun connect() {
+        if (closed) throw IOException(CLOSED_MESSAGE)
         state = SmbConnectionState.CONNECTING
 
-        connection = client.connect(credentials.server, credentials.port)
+        val newConnection = client.connect(credentials.server, credentials.port)
+        connection = newConnection
         state = SmbConnectionState.CONNECTED
 
         val authContext = AuthenticationContext(
@@ -121,18 +146,34 @@ class SmbClient(
             credentials.password.toCharArray(),
             credentials.domain
         )
-        session = connection!!.authenticate(authContext)
+        val newSession = newConnection.authenticate(authContext)
+        session = newSession
 
-        share = session!!.connectShare(credentials.share) as DiskShare
+        share = newSession.connectShare(credentials.share) as DiskShare
         state = SmbConnectionState.AUTHENTICATED
 
+        if (closed) {
+            dropConnection()
+            throw IOException(CLOSED_MESSAGE)
+        }
         Timber.tag(TAG).d("Connected to ${credentials.server}/${credentials.share}")
     }
 
     /**
-     * Disconnect from SMB server
+     * Close the client for good: drop the connection and refuse to connect again. An
+     * upload under way fails without its retry, and later uploads, tests and other calls
+     * fail too; connecting again takes a new SmbClient. UploadService calls this when the
+     * SMB settings are replaced or removed and when it stops.
      */
     fun disconnect() {
+        closed = true
+        dropConnection()
+    }
+
+    /**
+     * Drop the current connection, if any. The next call connects again (unless closed).
+     */
+    private fun dropConnection() {
         try {
             share?.close()
             session?.close()
@@ -149,7 +190,10 @@ class SmbClient(
 
     /**
      * Upload a file to SMB share. Missing folders are created first. When the attempt
-     * fails, the connection is dropped and the upload tried once more on a new one.
+     * fails, the connection is dropped and the upload tried once more on a new one, but
+     * not once the upload was cancelled or [disconnect] closed the client (settings
+     * replaced or removed, service stopping): the queue retries it later with the client
+     * the settings then name.
      */
     suspend fun uploadFile(
         localFile: File,
@@ -164,17 +208,29 @@ class SmbClient(
         try {
             Result.success(uploadOnce(localFile, fullPath, progressCallback))
         } catch (e: Exception) {
-            Timber.tag(TAG).w(e, "SMB upload failed; retrying on a new connection")
-            disconnect()
-            try {
-                Result.success(uploadOnce(localFile, fullPath, progressCallback))
-            } catch (retryError: Exception) {
-                Timber.tag(TAG).e(retryError, "SMB upload failed")
-                disconnect()
-                Result.failure(retryError)
+            dropConnection()
+            ensureActive()
+            if (closed) {
+                Timber.tag(TAG).w(e, "SMB upload stopped: the client was closed")
+                Result.failure(IOException(CLOSED_MESSAGE, e))
+            } else {
+                Timber.tag(TAG).w(e, "SMB upload failed; retrying on a new connection")
+                retryUpload(localFile, fullPath, progressCallback)
             }
         }
     }
+
+    /**
+     * The one retry of a failed upload, on a new connection.
+     */
+    private fun retryUpload(localFile: File, fullPath: String, progressCallback: ProgressCallback?): Result<SmbUploadResult> =
+        try {
+            Result.success(uploadOnce(localFile, fullPath, progressCallback))
+        } catch (retryError: Exception) {
+            Timber.tag(TAG).e(retryError, "SMB upload failed")
+            dropConnection()
+            Result.failure(retryError)
+        }
 
     /**
      * One upload attempt: connect when needed, create the missing folders, write the file.
@@ -240,6 +296,30 @@ class SmbClient(
                 }
             }
         }
+    }
+
+    /**
+     * Check that the account may create files in [dir] (a path from [smbPath], "" for the
+     * top of the share): open the folder asking for the right to add files. Nothing is
+     * created; a read-only share or account is refused (STATUS_ACCESS_DENIED).
+     *
+     * @throws IOException when the server refuses, naming the folder
+     */
+    private fun checkCanAddFiles(diskShare: DiskShare, dir: String) {
+        val folder = try {
+            diskShare.openDirectory(
+                dir,
+                EnumSet.of(AccessMask.FILE_ADD_FILE),
+                null,
+                SMB2ShareAccess.ALL,
+                SMB2CreateDisposition.FILE_OPEN,
+                null
+            )
+        } catch (e: SMBApiException) {
+            val where = if (dir.isEmpty()) "the share" else "folder '$dir' on the share"
+            throw IOException("Cannot create files in $where: ${e.message}", e)
+        }
+        folder.close()
     }
 
     /**

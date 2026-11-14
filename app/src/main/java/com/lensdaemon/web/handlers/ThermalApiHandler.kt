@@ -168,13 +168,18 @@ class ThermalApiHandler(
 
     /**
      * POST /api/thermal/battery/disable (hold = true) and /enable (hold = false): set or
-     * release the manual charging hold. Phones without a charging switch the app can write
-     * get 409 with advice instead, and nothing changes.
+     * release the manual charging hold, answering 200 once the charging switch has done it.
+     * Phones without a charging switch the app can write get 409 with advice instead, and
+     * nothing changes; so does a phone whose switch refuses to turn charging off (the
+     * bypass then gives that switch up). A switch that rejects the change while charging
+     * is already off gets 500 with the state and chargingBlocked: charging stays off, and
+     * after a refused /enable the manual hold stays.
      */
     private fun setManualChargingHold(hold: Boolean): NanoHTTPD.Response {
         val thermal = thermalGovernor ?: return ApiHandlerUtils.serviceUnavailable("Thermal service")
         val bypass = thermal.getBatteryBypass() ?: return ApiHandlerUtils.serviceUnavailable("Battery bypass")
-        if (!bypass.hasHardwareControl()) {
+        val switched = bypass.hasHardwareControl() && (if (hold) bypass.disableCharging() else bypass.enableCharging())
+        if (!switched && !bypass.hasHardwareControl()) {
             val advice = bypass.getStatus().recommendation.ifEmpty {
                 if (hold) "Unplug the charger to stop charging" else "Charging is not held back by LensDaemon"
             }
@@ -185,13 +190,13 @@ class ThermalApiHandler(
                 .put("recommendation", advice)
             return ApiHandlerUtils.jsonResponse(Status.CONFLICT, json.toString())
         }
-        if (hold) bypass.disableCharging() else bypass.enableCharging()
         val status = bypass.getStatus()
         val json = JSONObject()
-            .put("success", true)
+            .put("success", switched)
             .put("state", status.state.name)
             .put("chargingBlocked", status.chargingBlocked)
-        return ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
+        if (!switched) json.put("error", "The phone's charging switch did not accept the change")
+        return ApiHandlerUtils.jsonResponse(if (switched) Status.OK else Status.INTERNAL_ERROR, json.toString())
     }
 
     private fun bypassJson(status: BatteryBypass.BatteryBypassStatus): JSONObject = JSONObject().apply {

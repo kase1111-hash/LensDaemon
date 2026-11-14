@@ -48,6 +48,7 @@ class CameraServiceSmokeTest {
 
         // Should not be streaming initially
         assertFalse("Should not be streaming initially", service.isStreaming())
+        assertFalse("No thermal pause should be in effect initially", service.isThermalPaused())
     }
 
     @Test

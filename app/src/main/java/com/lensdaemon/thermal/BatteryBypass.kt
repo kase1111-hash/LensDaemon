@@ -20,6 +20,38 @@ import timber.log.Timber
 import java.io.File
 
 /**
+ * What to tell the user on a phone where LensDaemon can't switch charging (the
+ * software-only battery bypass), or "" when nothing needs doing.
+ *
+ * The battery counts as too warm while a thermal hold wants charging off ([heldForHeat])
+ * or once it reaches [BatteryBypassConfig.maxBatteryTempC]. Too warm, the advice is to
+ * unplug the charger or to let the battery cool before plugging it in: never to plug in,
+ * however low the charge.
+ */
+internal fun chargingAdvice(
+    heldForHeat: Boolean,
+    isCharging: Boolean,
+    percent: Int,
+    tempC: Float,
+    config: BatteryBypassConfig
+): String {
+    val tooWarm = heldForHeat || tempC >= config.maxBatteryTempC
+    return when {
+        tooWarm && isCharging ->
+            "Unplug charger to reduce battery temperature (${tempC}°C)"
+        tooWarm ->
+            "Battery too warm to charge (${tempC}°C); let it cool before plugging in"
+        tempC >= config.maxBatteryTempC - 3f && isCharging ->
+            "Battery warming (${tempC}°C). Consider unplugging charger soon"
+        percent >= config.targetChargePercent && isCharging ->
+            "Battery at ${percent}%. Unplug charger to preserve battery health"
+        !isCharging && percent <= config.resumeChargePercent ->
+            "Battery low (${percent}%). Plug in charger"
+        else -> ""
+    }
+}
+
+/**
  * Battery bypass / charge limiting controller
  *
  * Manages battery charging to prevent degradation during long-term operation:
@@ -30,7 +62,11 @@ import java.io.File
  * Charging can only be switched off on phones whose kernel exposes a charging switch
  * (a sysfs node) that the app itself may write; there is no root/su path. Most phones
  * have none: the bypass then runs software-only and gives advice ([getStatus]'s
- * recommendation, such as unplugging the charger) instead of stopping the charge.
+ * recommendation, such as unplugging the charger) instead of stopping the charge. A
+ * switch that rejects being turned off is given up on the same way. Software-only, the
+ * charge-limit cycle (CHARGING, HOLDING) and manual holds don't run, and the status
+ * never reports charging as blocked; THERMAL_HOLD is still reported, as what the battery
+ * needs, with the advice to unplug.
  *
  * Two holds can block charging at once: a manual hold ([disableCharging], from the API)
  * and the governor's thermal hold ([disableChargingForThermal]). Each is lifted only by
@@ -77,9 +113,11 @@ class BatteryBypass(
     private val _status = MutableStateFlow(BatteryBypassStatus())
     val status: StateFlow<BatteryBypassStatus> = _status.asStateFlow()
 
-    // Detected control path
+    // Detected control path. hasHardwareControl turns false for good when the switch
+    // rejects turning charging off; HTTP threads read it without the lock
     private var controlPath: String? = null
     private var isInverted: Boolean = false
+    @Volatile
     private var hasHardwareControl: Boolean = false
 
     // Battery state
@@ -249,38 +287,55 @@ class BatteryBypass(
     }
 
     /**
-     * Manually disable charging (manual hold, kept until [enableCharging])
+     * Manually disable charging (manual hold, kept until [enableCharging]).
+     *
+     * @return false when charging could not be switched off: the phone has no usable
+     *   charging switch, or the switch rejected it (and is given up on, see
+     *   [hasHardwareControl]). Nothing is held then.
      */
     @Synchronized
-    fun disableCharging() {
+    fun disableCharging(): Boolean {
+        if (!hasHardwareControl || !setChargingEnabled(false)) {
+            updateStatus("Charging could not be switched off")
+            return false
+        }
         manualDisable = true
-        setChargingEnabled(false)
         _bypassState.value = BypassState.MANUAL_HOLD
         updateStatus("Charging manually disabled")
+        return true
     }
 
     /**
      * Manually enable charging: ends the manual hold. Charging stays off while the
      * governor's thermal hold lasts.
+     *
+     * @return false when the charging switch rejected switching charging back on: it is
+     *   still off, and the manual hold stays
      */
     @Synchronized
-    fun enableCharging() {
-        manualDisable = false
+    fun enableCharging(): Boolean {
         if (thermalHold) {
+            manualDisable = false
             _bypassState.value = BypassState.THERMAL_HOLD
             updateStatus("Manual hold released; charging stays off until the battery cools")
-            return
+            return true
         }
-        setChargingEnabled(true)
+        if (!setChargingEnabled(true)) {
+            updateStatus("Charging could not be switched back on")
+            return false
+        }
+        manualDisable = false
         if (_bypassState.value == BypassState.MANUAL_HOLD) {
             _bypassState.value = BypassState.DISABLED
         }
         updateStatus("Charging enabled")
+        return true
     }
 
     /**
      * Disable charging due to thermal condition (the governor's thermal hold, kept until
-     * [releaseThermalHold])
+     * [releaseThermalHold]). The state is THERMAL_HOLD even where charging can't be
+     * switched off; the status then says charging isn't blocked and advises unplugging.
      */
     @Synchronized
     fun disableChargingForThermal() {
@@ -319,7 +374,8 @@ class BatteryBypass(
     }
 
     /**
-     * Check if hardware control is available
+     * Whether LensDaemon can switch charging off on this phone: a writable charging switch
+     * was found and hasn't rejected turning charging off. Once it has, this stays false.
      */
     fun hasHardwareControl(): Boolean = hasHardwareControl
 
@@ -370,20 +426,23 @@ class BatteryBypass(
             // Fall through to normal evaluation
         }
 
-        // Normal bypass logic
+        // Holding the charge at the target needs the charging switch; without one,
+        // getStatus() only advises
+        if (!hasHardwareControl) return
+
+        // Normal bypass logic. The state changes only once the switch has done it
         when {
             currentPercent >= config.targetChargePercent -> {
                 // At or above target - stop charging
-                if (state != BypassState.HOLDING) {
-                    setChargingEnabled(false)
+                if (state != BypassState.HOLDING && setChargingEnabled(false)) {
                     _bypassState.value = BypassState.HOLDING
                     updateStatus("Holding at ${currentPercent}%")
                 }
             }
             currentPercent <= config.resumeChargePercent -> {
                 // Below resume threshold - start charging
-                if (state == BypassState.HOLDING || state == BypassState.DISABLED) {
-                    setChargingEnabled(true)
+                val canResume = state == BypassState.HOLDING || state == BypassState.DISABLED
+                if (canResume && setChargingEnabled(true)) {
                     _bypassState.value = BypassState.CHARGING
                     updateStatus("Charging from ${currentPercent}%")
                 }
@@ -400,18 +459,27 @@ class BatteryBypass(
     }
 
     /**
-     * Set charging enabled/disabled
+     * Switch charging on or off through the charging switch. Software-only, nothing is
+     * written and only the wanted state is kept.
+     *
+     * When the switch rejects the write, the charging state stays as it was. If charging
+     * is on (the switch refused to turn it off), the switch is given up on: the bypass is
+     * software-only from then on and gives advice instead. If charging is off (it refused
+     * to turn it back on), the switch is kept, so the status still says charging is blocked.
+     *
+     * @return false when the switch rejected the write
      */
-    private fun setChargingEnabled(enabled: Boolean) {
-        _chargingEnabled.value = enabled
-
-        if (hasHardwareControl && controlPath != null) {
+    private fun setChargingEnabled(enabled: Boolean): Boolean {
+        val path = controlPath
+        if (hasHardwareControl && path != null) {
             try {
                 val value = if (enabled xor isInverted) "1" else "0"
-                File(controlPath!!).writeText(value)
-                Timber.tag(TAG).d("Set charging ${if (enabled) "enabled" else "disabled"} via $controlPath")
+                File(path).writeText(value)
+                Timber.tag(TAG).d("Set charging ${if (enabled) "enabled" else "disabled"} via $path")
             } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "Failed to control charging via sysfs")
+                Timber.tag(TAG).e(e, "The charging switch $path rejected the change")
+                if (_chargingEnabled.value) giveUpHardwareControl()
+                return false
             }
         } else {
             // Software-only mode - track state and generate recommendations
@@ -422,48 +490,40 @@ class BatteryBypass(
             }
         }
 
+        _chargingEnabled.value = enabled
         listeners.forEach { it.onChargingControlChanged(enabled) }
+        return true
     }
 
     /**
-     * Generate recommendation based on current state for software-only mode
+     * The charging switch refused to turn charging off: treat the phone as software-only
+     * from now on, so the API stops offering control and gives advice instead. The
+     * charge-limit cycle needs the switch, so it stops too.
+     */
+    private fun giveUpHardwareControl() {
+        hasHardwareControl = false
+        val state = _bypassState.value
+        if (state == BypassState.CHARGING || state == BypassState.HOLDING) {
+            _bypassState.value = BypassState.DISABLED
+        }
+        Timber.tag(TAG).w("Charging switch $controlPath unusable: software-only from now on")
+    }
+
+    /**
+     * Advice for software-only mode (none while LensDaemon controls charging itself).
      */
     private fun generateRecommendation(): String {
         if (hasHardwareControl) return ""
 
-        val state = _bypassState.value
-        return when {
-            state == BypassState.THERMAL_HOLD && isCharging ->
-                "Unplug charger to reduce battery temperature (${currentTempC}°C)"
-            state == BypassState.HOLDING && isCharging ->
-                "Unplug charger — battery at ${currentPercent}% (target: ${config.targetChargePercent}%)"
-            currentTempC >= config.maxBatteryTempC - 3f && isCharging ->
-                "Battery warming (${currentTempC}°C). Consider unplugging charger soon"
-            currentPercent >= config.targetChargePercent && isCharging ->
-                "Battery at ${currentPercent}%. Unplug charger to preserve battery health"
-            !isCharging && currentPercent <= config.resumeChargePercent ->
-                "Battery low (${currentPercent}%). Plug in charger"
-            else -> ""
-        }
+        val heldForHeat = thermalHold || _bypassState.value == BypassState.THERMAL_HOLD
+        return chargingAdvice(heldForHeat, isCharging, currentPercent, currentTempC, config)
     }
 
     /**
      * Update status and notify listeners
      */
     private fun updateStatus(reason: String) {
-        _status.value = BatteryBypassStatus(
-            state = _bypassState.value,
-            batteryPercent = currentPercent,
-            batteryTempC = currentTempC,
-            targetPercent = config.targetChargePercent,
-            resumePercent = config.resumeChargePercent,
-            isCharging = isCharging,
-            chargingBlocked = !_chargingEnabled.value,
-            hasHardwareControl = hasHardwareControl,
-            softwareOnly = !hasHardwareControl,
-            recommendation = generateRecommendation(),
-            reason = reason
-        )
+        _status.value = currentStatus(reason)
 
         listeners.forEach { it.onBypassStateChanged(_status.value) }
     }
@@ -475,17 +535,24 @@ class BatteryBypass(
      * until the bypass first starts).
      */
     @Synchronized
-    fun getStatus(): BatteryBypassStatus = _status.value.copy(
+    fun getStatus(): BatteryBypassStatus = currentStatus(_status.value.reason)
+
+    /**
+     * The status as it is now. chargingBlocked is true only when the charging switch has
+     * actually turned charging off: software-only, a wanted hold blocks nothing.
+     */
+    private fun currentStatus(reason: String) = BatteryBypassStatus(
         state = _bypassState.value,
         batteryPercent = currentPercent,
         batteryTempC = currentTempC,
         targetPercent = config.targetChargePercent,
         resumePercent = config.resumeChargePercent,
         isCharging = isCharging,
-        chargingBlocked = !_chargingEnabled.value,
+        chargingBlocked = hasHardwareControl && !_chargingEnabled.value,
         hasHardwareControl = hasHardwareControl,
         softwareOnly = !hasHardwareControl,
-        recommendation = generateRecommendation()
+        recommendation = generateRecommendation(),
+        reason = reason
     )
 
     /**

@@ -784,3 +784,106 @@ class ThermalThrottlingTest {
         )
     }
 }
+
+/**
+ * Time at each level from the saved thermal history, which now outlives the app process.
+ */
+class ThermalHistoryStatsTest {
+
+    private val twoMinutes = 120_000L
+
+    private fun entry(minute: Long, cpu: ThermalLevel, battery: ThermalLevel = ThermalLevel.NORMAL) =
+        ThermalHistoryEntry(minute * 60_000L, 40f, 30f, cpu, battery)
+
+    @Test
+    fun timeAtLevels_countsEachStepForTheLaterEntrysHigherLevel() {
+        val totals = timeAtLevels(
+            listOf(
+                entry(0, ThermalLevel.NORMAL),
+                entry(1, ThermalLevel.WARNING),
+                entry(2, ThermalLevel.WARNING),
+                entry(3, ThermalLevel.NORMAL, battery = ThermalLevel.CRITICAL)
+            ),
+            twoMinutes
+        )
+        assertEquals(120_000L, totals[ThermalLevel.WARNING])
+        assertEquals(60_000L, totals[ThermalLevel.CRITICAL])
+        assertNull(totals[ThermalLevel.EMERGENCY])
+    }
+
+    @Test
+    fun timeAtLevels_downtimeBetweenRunsIsNotCounted() {
+        // The app was down for two hours and came back with the battery still at WARNING
+        val totals = timeAtLevels(
+            listOf(entry(0, ThermalLevel.NORMAL), entry(120, ThermalLevel.WARNING), entry(121, ThermalLevel.WARNING)),
+            twoMinutes
+        )
+        assertEquals(180_000L, totals[ThermalLevel.WARNING])
+    }
+
+    @Test
+    fun timeAtLevels_aClockStepBackCountsForNothing() {
+        val totals = timeAtLevels(listOf(entry(10, ThermalLevel.NORMAL), entry(5, ThermalLevel.EMERGENCY)), twoMinutes)
+        assertEquals(0L, totals[ThermalLevel.EMERGENCY])
+    }
+
+    @Test
+    fun timeAtLevels_needsTwoEntries() {
+        assertTrue(timeAtLevels(emptyList(), twoMinutes).isEmpty())
+        assertTrue(timeAtLevels(listOf(entry(0, ThermalLevel.CRITICAL)), twoMinutes).isEmpty())
+    }
+}
+
+/**
+ * The battery advice given on phones where LensDaemon can't switch charging off.
+ */
+class ChargingAdviceTest {
+
+    // Defaults: target 50 %, resume 40 %, too warm from 42 °C
+    private val config = BatteryBypassConfig()
+
+    @Test
+    fun advice_tooWarmAndUnpluggedNeverSaysPlugIn() {
+        // A thermal hold at 43 °C with the battery at 38 %: the low charge must not win
+        val advice = chargingAdvice(heldForHeat = true, isCharging = false, percent = 38, tempC = 43f, config = config)
+        assertEquals("Battery too warm to charge (43.0°C); let it cool before plugging in", advice)
+    }
+
+    @Test
+    fun advice_aThermalHoldCountsBelowTheMaximumTemperature() {
+        // The governor's hold lasts through its hysteresis: battery at 41 °C, 20 %
+        val advice = chargingAdvice(heldForHeat = true, isCharging = false, percent = 20, tempC = 41f, config = config)
+        assertTrue(advice.startsWith("Battery too warm to charge"))
+    }
+
+    @Test
+    fun advice_tooWarmWhileChargingSaysUnplug() {
+        assertEquals(
+            "Unplug charger to reduce battery temperature (43.5°C)",
+            chargingAdvice(heldForHeat = true, isCharging = true, percent = 80, tempC = 43.5f, config = config)
+        )
+        // At the maximum temperature even before any hold
+        assertEquals(
+            "Unplug charger to reduce battery temperature (42.0°C)",
+            chargingAdvice(heldForHeat = false, isCharging = true, percent = 30, tempC = 42f, config = config)
+        )
+    }
+
+    @Test
+    fun advice_coolBattery() {
+        assertEquals(
+            "Battery low (38%). Plug in charger",
+            chargingAdvice(heldForHeat = false, isCharging = false, percent = 38, tempC = 30f, config = config)
+        )
+        assertEquals(
+            "Battery at 80%. Unplug charger to preserve battery health",
+            chargingAdvice(heldForHeat = false, isCharging = true, percent = 80, tempC = 30f, config = config)
+        )
+        assertEquals(
+            "Battery warming (40.0°C). Consider unplugging charger soon",
+            chargingAdvice(heldForHeat = false, isCharging = true, percent = 45, tempC = 40f, config = config)
+        )
+        assertEquals("", chargingAdvice(heldForHeat = false, isCharging = false, percent = 60, tempC = 30f, config = config))
+        assertEquals("", chargingAdvice(heldForHeat = false, isCharging = true, percent = 45, tempC = 30f, config = config))
+    }
+}

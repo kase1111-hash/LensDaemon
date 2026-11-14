@@ -100,5 +100,8 @@ class MpegTsCoordinator {
 
     fun isRunning(): Boolean = publisher?.isRunning() ?: false
 
+    /** The settings of the running publisher (mode, port, target), or null when none runs. */
+    fun getConfig(): MpegTsUdpConfig? = publisher?.takeIf { it.isRunning() }?.config
+
     fun getStats(): MpegTsUdpStats? = publisher?.getStats()
 }

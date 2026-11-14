@@ -19,7 +19,8 @@ import kotlin.math.roundToInt
  *
  * Commands are compared with the camera's own state (the open lens, the applied zoom,
  * the focus mode), not with what the adapter last asked for, so a cue still acts after
- * the lens, zoom or focus was changed on the phone or the dashboard.
+ * the lens, zoom or focus was changed on the phone or the dashboard. Only a lens switch
+ * or zoom animation still under way counts as where the camera is heading.
  */
 class CameraControllerAdapter(
     private val cameraService: CameraService
@@ -30,6 +31,12 @@ class CameraControllerAdapter(
 
         /** Zoom levels closer than this count as the same. */
         private const val ZOOM_TOLERANCE = 0.01f
+
+        /**
+         * How long a lens switch the camera accepted counts as under way. CameraService reopens
+         * the camera in the background: until it starts, the old lens still shows as open.
+         */
+        private const val LENS_SWITCH_SETTLE_MS = 2_000L
 
         /** Exposure compensation of each preset, in EV, as [ExposurePreset] documents them. */
         private fun evFor(preset: ExposurePreset): Float = when (preset) {
@@ -44,9 +51,12 @@ class CameraControllerAdapter(
     /** A focus target the adapter applied, with the lens family and camera focus mode it left. */
     private data class AppliedFocus(val target: FocusTarget, val lensFamily: String?, val mode: FocusMode)
 
-    /** The lens family ("wide", "main", "tele") of the last switch the camera accepted. */
+    /** The lens family ("wide", "main", "tele") of the last switch the camera accepted, and when. */
     @Volatile
     private var lastAcceptedLens: String? = null
+
+    @Volatile
+    private var lastAcceptedAtMs = 0L
 
     /** The zoom an animation of ours is heading to, until [animationEndsAtMs]. */
     @Volatile
@@ -59,16 +69,23 @@ class CameraControllerAdapter(
     private var appliedFocus: AppliedFocus? = null
 
     /**
-     * Switch camera lens ("wide", "main", "tele"), unless that family is open already or is
-     * the one the camera is reopening for. Maps String → LensType at the module boundary.
+     * Switch camera lens ("wide", "main", "tele"), unless the camera is on that family or
+     * heading there. The last switch the camera accepted is where it is heading while no lens
+     * is open (the camera reopens) and for [LENS_SWITCH_SETTLE_MS] after it was asked for,
+     * since until the reopen starts the old lens still shows as open: cues that follow at once
+     * don't reopen the camera again. Maps String → LensType at the module boundary.
      */
     override fun switchLens(lens: String) {
         val current = currentLensFamily()
-        if (lens == current || (current == null && lens == lastAcceptedLens)) return
+        val now = System.currentTimeMillis()
+        val switching = lastAcceptedLens?.takeIf { current == null || now - lastAcceptedAtMs < LENS_SWITCH_SETTLE_MS }
+        val heading = switching ?: current
+        if (lens == heading) return
 
-        Timber.tag(TAG).d("Switching lens: ${current ?: "(camera reopening)"} -> $lens")
+        Timber.tag(TAG).d("Switching lens: ${heading ?: "(camera closed)"} -> $lens")
         if (cameraService.switchLens(lens)) {
             lastAcceptedLens = lens
+            lastAcceptedAtMs = now
         } else {
             Timber.tag(TAG).w("The camera has no \"$lens\" lens")
         }
@@ -182,6 +199,7 @@ class CameraControllerAdapter(
     /** Forgets the lens request, zoom animation and focus target the adapter remembers. */
     fun reset() {
         lastAcceptedLens = null
+        lastAcceptedAtMs = 0L
         animatingTo = null
         animationEndsAtMs = 0L
         appliedFocus = null

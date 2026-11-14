@@ -19,6 +19,23 @@ import java.io.File
 import java.util.concurrent.ConcurrentLinkedDeque
 
 /**
+ * Time spent at each level over [entries] (oldest first). Each step between two entries
+ * counts for the later entry's level, the higher of CPU and battery. A step counts for at
+ * most [maxStepMs], so a gap in the history (the app wasn't running) doesn't add the
+ * downtime to the level the first entry after it shows; a step backwards (clock change)
+ * counts for nothing.
+ */
+internal fun timeAtLevels(entries: List<ThermalHistoryEntry>, maxStepMs: Long): Map<ThermalLevel, Long> {
+    val totals = mutableMapOf<ThermalLevel, Long>()
+    for (i in 1 until entries.size) {
+        val step = (entries[i].timestamp - entries[i - 1].timestamp).coerceIn(0L, maxStepMs.coerceAtLeast(0L))
+        val level = maxOf(entries[i].cpuLevel, entries[i].batteryLevel)
+        totals[level] = (totals[level] ?: 0L) + step
+    }
+    return totals
+}
+
+/**
  * Thermal history tracker
  *
  * Records temperature history for analysis and dashboard display:
@@ -39,6 +56,9 @@ class ThermalHistory(
         private const val MAX_HISTORY_ENTRIES = 1440  // 24 hours at 1 per minute
         private const val MAX_EVENT_ENTRIES = 500
         private const val SAVE_EVERY_ENTRIES = 10  // About every 10 minutes
+
+        // Time-in-state counts a step between entries for at most this many intervals
+        private const val MAX_STEP_INTERVALS = 2
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -242,7 +262,9 @@ class ThermalHistory(
     }
 
     /**
-     * Calculate statistics for a time period
+     * Calculate statistics for a time period. Time at WARNING, CRITICAL and EMERGENCY
+     * counts each step between entries for at most two recording intervals, so time the
+     * app wasn't running (the history survives restarts) isn't counted.
      */
     fun getStats(lastHours: Int = 24): ThermalStats {
         val historyList = getHistory(lastHours)
@@ -267,21 +289,7 @@ class ThermalHistory(
         val batteryTemps = historyList.map { it.batteryTemperatureC }
 
         // Calculate time in each state
-        var warningTime = 0L
-        var criticalTime = 0L
-        var emergencyTime = 0L
-
-        for (i in 1 until historyList.size) {
-            val duration = historyList[i].timestamp - historyList[i - 1].timestamp
-            val level = maxOf(historyList[i].cpuLevel, historyList[i].batteryLevel)
-
-            when (level) {
-                ThermalLevel.WARNING -> warningTime += duration
-                ThermalLevel.CRITICAL -> criticalTime += duration
-                ThermalLevel.EMERGENCY -> emergencyTime += duration
-                else -> {}
-            }
-        }
+        val timeAtLevel = timeAtLevels(historyList, config.historyIntervalMs * MAX_STEP_INTERVALS)
 
         val eventList = getEvents(lastHours)
         val throttleEvents = eventList.count {
@@ -297,9 +305,9 @@ class ThermalHistory(
             batteryTempMin = batteryTemps.minOrNull() ?: 0f,
             batteryTempMax = batteryTemps.maxOrNull() ?: 0f,
             batteryTempAvg = batteryTemps.average().toFloat(),
-            timeInWarningMs = warningTime,
-            timeInCriticalMs = criticalTime,
-            timeInEmergencyMs = emergencyTime,
+            timeInWarningMs = timeAtLevel[ThermalLevel.WARNING] ?: 0L,
+            timeInCriticalMs = timeAtLevel[ThermalLevel.CRITICAL] ?: 0L,
+            timeInEmergencyMs = timeAtLevel[ThermalLevel.EMERGENCY] ?: 0L,
             throttleEventCount = throttleEvents
         )
     }
