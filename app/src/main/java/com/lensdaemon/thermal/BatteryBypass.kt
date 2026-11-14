@@ -470,8 +470,9 @@ class BatteryBypass(
 
     /**
      * Current status, with the battery readings, the charging control and the
-     * recommendation worked out now (the stored status changes only with the bypass
-     * state, and is a placeholder until the bypass first starts)
+     * recommendation worked out now. Only [BatteryBypassStatus.reason] comes from the
+     * stored [status], which changes only with the bypass state (and holds its defaults
+     * until the bypass first starts).
      */
     @Synchronized
     fun getStatus(): BatteryBypassStatus = _status.value.copy(

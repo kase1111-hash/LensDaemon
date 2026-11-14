@@ -11,6 +11,7 @@ import timber.log.Timber
 import java.io.File
 import java.util.*
 import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CopyOnWriteArrayList
 
 /**
  * Upload destination type
@@ -205,7 +206,9 @@ class UploadQueue(
 
     // In-memory queue
     private val pendingQueue = ConcurrentLinkedQueue<UploadTask>()
-    private val completedTasks = mutableListOf<UploadTask>()
+
+    /** Finished uploads; read by status requests while the processing loop adds to it. */
+    private val completedTasks = CopyOnWriteArrayList<UploadTask>()
 
     /** Uploads that used up their attempts; guarded by synchronized(failedTasks). */
     private val failedTasks = mutableListOf<UploadTask>()
@@ -390,6 +393,12 @@ class UploadQueue(
         val handler = uploadHandler
         val result = try {
             handler?.invoke(task, progressCallback) ?: Result.failure(IllegalStateException("No upload handler"))
+        } catch (e: CancellationException) {
+            // Released (the service stopped) mid-upload: end here, not as a failed
+            // attempt, so the task stays pending as release() saved it
+            if (!currentCoroutineContext().isActive) throw e
+            Timber.tag(TAG).e(e, "Upload cancelled: ${task.fileName}")
+            Result.failure(e)
         } catch (e: Exception) {
             Timber.tag(TAG).e(e, "Upload failed: ${task.fileName}")
             Result.failure(e)
@@ -602,7 +611,7 @@ class UploadQueue(
                 synchronized(failedTasks) { failedTasks.forEach { put(it.toJson()) } }
             }
             val completedJson = JSONArray().apply {
-                completedTasks.takeLast(100).forEach { put(it.toJson()) } // Keep last 100
+                completedTasks.toList().takeLast(100).forEach { put(it.toJson()) } // Keep last 100
             }
 
             prefs.edit()
@@ -617,11 +626,12 @@ class UploadQueue(
 
     /**
      * Load queue from persistent storage. An upload that was in progress is
-     * pending again; failed uploads go back to the failed list.
+     * pending again, listed once even if a save caught it on its way back into
+     * the queue; failed uploads go back to the failed list.
      */
     private fun loadQueue() {
         try {
-            uploadTasksFrom(prefs.getString(KEY_QUEUE, null)).forEach { task ->
+            uploadTasksFrom(prefs.getString(KEY_QUEUE, null)).distinctBy { it.id }.forEach { task ->
                 if (task.status == UploadStatus.FAILED) {
                     synchronized(failedTasks) { failedTasks.add(task) }
                 } else {

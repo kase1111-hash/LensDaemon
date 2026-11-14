@@ -611,10 +611,14 @@ class UploadService : Service(), UploadEventListener {
         updateStats()
     }
 
-    /** Called once each time the queue runs out of work, so the notice is posted once. */
+    /**
+     * Called once each time the queue runs out of work, so the notice is
+     * posted once; it says how many uploads are left in the failed list.
+     */
     override fun onQueueEmpty() {
         _state.value = UploadServiceState.IDLE
-        updateNotification("All uploads completed")
+        val failed = uploadQueue.getStats().failedCount
+        updateNotification(if (failed > 0) "Uploads finished: $failed failed" else "All uploads completed")
         updateStats()
     }
 

@@ -353,6 +353,8 @@ class StreamApiHandler {
         }
 
         val success = camera.startRecording(encoderConfigFrom(body), segmentDuration)
+        // A start that lost a race with another one finds that recording open
+        if (!success && (camera.isRecording() || camera.isRecordingPaused())) return alreadyRecording(camera)
 
         val json = JSONObject().apply {
             put("success", success)
@@ -504,6 +506,7 @@ class StreamApiHandler {
         val json = JSONObject().apply {
             put("success", success)
             put("filename", filename)
+            if (!success) put("error", "Could not delete the recording")
         }
 
         return NanoHTTPD.newFixedLengthResponse(
