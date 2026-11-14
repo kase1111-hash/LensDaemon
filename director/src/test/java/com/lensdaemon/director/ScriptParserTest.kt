@@ -1229,6 +1229,15 @@ class ScriptParserTest {
     }
 
     @Test
+    fun `the first cue written on a line is the one used`() {
+        val result = parser.parseScript("[FOCUS: FACE] [SHOT: WIDE]")
+
+        assertEquals(CueType.FOCUS, result.scenes[0].cues[0].type)
+        assertEquals(FocusTarget.FACE, result.scenes[0].cues[0].focusTarget)
+        assertEquals(listOf("Line 1: only the first cue on a line is used"), result.errors)
+    }
+
+    @Test
     fun `DOF in a script is reported as not a cue`() {
         val result = parser.parseScript("[SHOT: WIDE]\n[DOF: SHALLOW]")
         assertEquals(listOf("Line 2: not a cue: [DOF: SHALLOW]"), result.errors)

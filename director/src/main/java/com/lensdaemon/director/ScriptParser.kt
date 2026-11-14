@@ -1,6 +1,7 @@
 package com.lensdaemon.director
 
 import timber.log.Timber
+import java.util.regex.Matcher
 import java.util.regex.Pattern
 
 /**
@@ -220,106 +221,85 @@ class ScriptParser(
     }
 
     /**
-     * Parse explicit cue format [CUE_TYPE: value]
+     * Parse explicit cue format [CUE_TYPE: value]: the first cue written on the line
      */
     private fun parseExplicitCue(line: String, lineNumber: Int): DirectorCue? {
-        // SHOT cue
-        val shotMatcher = SHOT_PATTERN.matcher(line)
-        if (shotMatcher.find()) {
-            val shotType = shotTypeOrNull(normalizeShotName(shotMatcher.group(1) ?: "")) ?: ShotType.MEDIUM
-            return DirectorCue(
+        var first: Matcher? = null
+        for (pattern in CUE_PATTERNS) {
+            val matcher = pattern.matcher(line)
+            if (matcher.find() && (first == null || matcher.start() < first.start())) {
+                first = matcher
+            }
+        }
+        val found = first ?: return null
+
+        return when (found.pattern()) {
+            SHOT_PATTERN -> DirectorCue(
                 type = CueType.SHOT,
                 rawText = line,
-                shotType = shotType,
+                shotType = shotTypeOrNull(normalizeShotName(found.group(1) ?: "")) ?: ShotType.MEDIUM,
                 lineNumber = lineNumber,
-                notes = extractDescription(line, shotMatcher.end())
+                notes = extractDescription(line, found.end())
             )
-        }
-
-        // TRANSITION cue
-        val transitionMatcher = TRANSITION_PATTERN.matcher(line)
-        if (transitionMatcher.find()) {
-            val transitionStr = transitionMatcher.group(1)?.uppercase()?.replace(" ", "_") ?: ""
-            val durationStr = transitionMatcher.group(2)
-            val durationMs = if (durationStr != null) {
-                (durationStr.toFloatOrNull() ?: 1f) * 1000
-            } else {
-                config.defaultTransitionDurationMs.toFloat()
-            }
-
-            return DirectorCue(
-                type = CueType.TRANSITION,
-                rawText = line,
-                transitionType = parseTransitionType(transitionStr),
-                transitionDurationMs = durationMs.toLong(),
-                lineNumber = lineNumber,
-                notes = extractDescription(line, transitionMatcher.end())
-            )
-        }
-
-        // FOCUS cue
-        val focusMatcher = FOCUS_PATTERN.matcher(line)
-        if (focusMatcher.find()) {
-            val focusStr = focusMatcher.group(1)?.uppercase() ?: "AUTO"
-            return DirectorCue(
+            TRANSITION_PATTERN -> transitionCue(line, lineNumber, found)
+            FOCUS_PATTERN -> DirectorCue(
                 type = CueType.FOCUS,
                 rawText = line,
-                focusTarget = parseFocusTarget(focusStr),
+                focusTarget = parseFocusTarget(found.group(1)?.uppercase() ?: "AUTO"),
                 lineNumber = lineNumber
             )
-        }
-
-        // EXPOSURE cue
-        val exposureMatcher = EXPOSURE_PATTERN.matcher(line)
-        if (exposureMatcher.find()) {
-            val exposureStr = exposureMatcher.group(1)?.uppercase() ?: "AUTO"
-            return DirectorCue(
+            EXPOSURE_PATTERN -> DirectorCue(
                 type = CueType.EXPOSURE,
                 rawText = line,
-                exposurePreset = parseExposurePreset(exposureStr),
+                exposurePreset = parseExposurePreset(found.group(1)?.uppercase() ?: "AUTO"),
                 lineNumber = lineNumber
             )
-        }
-
-        // BEAT/HOLD cue
-        val beatMatcher = BEAT_PATTERN.matcher(line)
-        if (beatMatcher.find()) {
-            val holdSeconds = beatMatcher.group(1)?.toFloatOrNull() ?: 0f
-            return DirectorCue(
-                type = CueType.BEAT,
-                rawText = line,
-                holdDurationMs = if (holdSeconds > 0) (holdSeconds * 1000).toLong() else config.defaultHoldDurationMs,
-                lineNumber = lineNumber
-            )
-        }
-
-        // TAKE cue
-        val takeMatcher = TAKE_PATTERN.matcher(line)
-        if (takeMatcher.find()) {
-            val takeNum = takeMatcher.group(1)?.toIntOrNull() ?: 1
-            return DirectorCue(
+            BEAT_PATTERN -> {
+                // [BEAT], or [HOLD: seconds]
+                val holdSeconds = found.group(1)?.toFloatOrNull() ?: 0f
+                DirectorCue(
+                    type = CueType.BEAT,
+                    rawText = line,
+                    holdDurationMs = if (holdSeconds > 0) (holdSeconds * 1000).toLong() else config.defaultHoldDurationMs,
+                    lineNumber = lineNumber
+                )
+            }
+            TAKE_PATTERN -> DirectorCue(
                 type = CueType.TAKE,
                 rawText = line,
-                takeNumber = takeNum,
+                takeNumber = found.group(1)?.toIntOrNull() ?: 1,
                 lineNumber = lineNumber
             )
-        }
-
-        // CUT TO cue
-        val cutMatcher = CUT_TO_PATTERN.matcher(line)
-        if (cutMatcher.find()) {
-            val shotType = shotTypeOrNull(normalizeShotName(cutMatcher.group(1) ?: "")) ?: ShotType.MEDIUM
-            return DirectorCue(
+            // CUT TO
+            else -> DirectorCue(
                 type = CueType.CUT,
                 rawText = line,
-                shotType = shotType,
+                shotType = shotTypeOrNull(normalizeShotName(found.group(1) ?: "")) ?: ShotType.MEDIUM,
                 transitionType = TransitionType.CUT,
                 transitionDurationMs = 0,
                 lineNumber = lineNumber
             )
         }
+    }
 
-        return null
+    /** A TRANSITION cue, with the duration written after it ("- 2s") or the default one. */
+    private fun transitionCue(line: String, lineNumber: Int, matcher: Matcher): DirectorCue {
+        val transitionStr = matcher.group(1)?.uppercase()?.replace(" ", "_") ?: ""
+        val durationStr = matcher.group(2)
+        val durationMs = if (durationStr != null) {
+            (durationStr.toFloatOrNull() ?: 1f) * 1000
+        } else {
+            config.defaultTransitionDurationMs.toFloat()
+        }
+
+        return DirectorCue(
+            type = CueType.TRANSITION,
+            rawText = line,
+            transitionType = parseTransitionType(transitionStr),
+            transitionDurationMs = durationMs.toLong(),
+            lineNumber = lineNumber,
+            notes = extractDescription(line, matcher.end())
+        )
     }
 
     /**
