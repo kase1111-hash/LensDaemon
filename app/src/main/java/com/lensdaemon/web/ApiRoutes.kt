@@ -35,7 +35,7 @@ import java.io.ByteArrayInputStream
  * Status, lens, camera, snapshot, config, and encoder routes remain inline.
  *
  * Every request passes, in order: body read, cross-site check ([CrossSiteGuard]),
- * token check ([authorize]) and rate limit (per connection address).
+ * then [admit]: the rate limit (per connection address) and the token check.
  */
 class ApiRoutes(
     private val context: Context

@@ -27,13 +27,18 @@ import kotlin.concurrent.withLock
  * [stallTimeoutMs] (a phone locked with the preview open, a laptop that left
  * the Wi-Fi) is closed, which ends the write and frees its place.
  *
- * At most [maxViewers] watch at once; more get 503.
+ * At most [maxViewers] watch at once. A viewer that left is only noticed when
+ * a write to it fails, and while the camera sends no frames nothing is
+ * written, so at the cap the viewer that has gone longest without a write
+ * (over [idleEvictMs]) gives its place to the newcomer: it has left, is stuck,
+ * or is watching a camera that sends nothing. Otherwise more viewers get 503.
  */
 class MjpegStreamer(
     private val quality: Int = 80,
     private val maxFps: Int = 15,
     private val maxViewers: Int = MAX_VIEWERS,
-    private val stallTimeoutMs: Long = STALL_TIMEOUT_MS
+    private val stallTimeoutMs: Long = STALL_TIMEOUT_MS,
+    private val idleEvictMs: Long = IDLE_EVICT_MS
 ) {
     companion object {
         private const val TAG = "MjpegStreamer"
@@ -45,6 +50,14 @@ class MjpegStreamer(
 
         /** A viewer whose write has taken longer than this is closed. */
         const val STALL_TIMEOUT_MS = 5_000L
+
+        /**
+         * At the cap, a viewer with no write started or finished for longer
+         * than this makes room for a new one. Preview frames come several
+         * times a second while the camera runs, so only a viewer that left,
+         * is stuck, or waits on a camera sending nothing goes this long.
+         */
+        const val IDLE_EVICT_MS = 3_000L
 
         /** How long a viewer waits for a frame before it looks again whether to stop. */
         private const val FRAME_WAIT_MS = 1_000L
@@ -78,6 +91,7 @@ class MjpegStreamer(
     private var lastFrameTime = 0L  // camera thread only
     private val minFrameIntervalMs = 1000L / maxFps
     private val stallTimeoutNanos = TimeUnit.MILLISECONDS.toNanos(stallTimeoutMs)
+    private val idleEvictNanos = TimeUnit.MILLISECONDS.toNanos(idleEvictMs)
 
     // Running state
     private val isRunning = AtomicBoolean(true)
@@ -111,7 +125,8 @@ class MjpegStreamer(
 
     /**
      * The HTTP response for a new viewer: the stream itself, written on the
-     * connection's own thread, or 503 when [maxViewers] are already watching.
+     * connection's own thread, or 503 when [maxViewers] are already watching
+     * and none of them can make room (see [openClient]).
      */
     fun createStreamResponse(): NanoHTTPD.Response {
         val client = openClient() ?: return unavailable(if (isRunning.get()) "Too many preview viewers" else "Preview stopped")
@@ -134,13 +149,36 @@ class MjpegStreamer(
         return response
     }
 
-    /** Register a new viewer; null when [maxViewers] are watching or the streamer has stopped. */
+    /**
+     * Register a new viewer; null when the streamer has stopped, or when
+     * [maxViewers] are watching and none has gone over [idleEvictMs] without
+     * a write. At the cap, the viewer that has gone longest without one is
+     * closed to make room: a viewer that left (the browser stopped the
+     * preview, the tab was hidden) is only noticed when a write to it fails,
+     * and while the camera sends no frames nothing is written to anyone.
+     */
     @Synchronized
     internal fun openClient(): MjpegClient? {
-        if (!isRunning.get() || clients.size >= maxViewers) return null
+        if (!isRunning.get()) return null
+        if (clients.size >= maxViewers) closeIdlestViewer()
+        if (clients.size >= maxViewers) return null
         val client = MjpegClient(clientIdCounter.incrementAndGet())
         clients[client.id] = client
         return client
+    }
+
+    /** Close the viewer that has gone longest without a write, if that is over [idleEvictMs]. */
+    private fun closeIdlestViewer() {
+        val now = System.nanoTime()
+        val (idlest, idleNanos) = clients.values
+            .map { it to it.idleNanos(now) }
+            .maxByOrNull { it.second } ?: return
+        if (idleNanos <= idleEvictNanos) return
+        Timber.i(
+            "$TAG: Viewer ${idlest.id} has had nothing written for " +
+                "${TimeUnit.NANOSECONDS.toMillis(idleNanos)} ms: closing it to make room for a new viewer"
+        )
+        idlest.close()
     }
 
     private fun unavailable(message: String): NanoHTTPD.Response = NanoHTTPD.newFixedLengthResponse(
@@ -200,8 +238,15 @@ class MjpegStreamer(
         @Volatile
         private var writeStartedAt = NOT_WRITING
 
-        /** True once the viewer has been closed (it left, stalled, or the streamer stopped). */
+        // When a write last started or finished (System.nanoTime); when the viewer came, before its first
+        @Volatile
+        private var lastActivityAt = System.nanoTime()
+
+        /** True once the viewer has been closed (it left, stalled, was made room for, or the streamer stopped). */
         val isClosed: Boolean get() = closed
+
+        /** How long, at [nowNanos], since a write to this viewer last started or finished (or since it came). */
+        fun idleNanos(nowNanos: Long): Long = nowNanos - lastActivityAt
 
         /** Leave [jpeg] for the viewer, in place of a frame it has not taken yet. */
         fun offer(jpeg: ByteArray) {
@@ -256,14 +301,20 @@ class MjpegStreamer(
             frame
         }
 
-        /** Write [parts] and flush, noting when the write started so a stuck one is noticed. */
+        /**
+         * Write [parts] and flush, noting when the write started so a stuck one
+         * is noticed, and when it started and ended so an idle viewer is.
+         */
         private fun write(out: OutputStream, vararg parts: ByteArray) {
-            writeStartedAt = System.nanoTime()
+            val started = System.nanoTime()
+            writeStartedAt = started
+            lastActivityAt = started
             try {
                 parts.forEach { out.write(it) }
                 out.flush()
             } finally {
                 writeStartedAt = NOT_WRITING
+                lastActivityAt = System.nanoTime()
             }
         }
 

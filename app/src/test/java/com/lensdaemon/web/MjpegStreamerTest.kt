@@ -6,6 +6,7 @@ import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayOutputStream
@@ -30,8 +31,11 @@ class MjpegStreamerTest {
         threads.forEach { it.join(JOIN_MS) }
     }
 
-    private fun streamer(stallTimeoutMs: Long = MjpegStreamer.STALL_TIMEOUT_MS): MjpegStreamer =
-        MjpegStreamer(maxFps = 1000, stallTimeoutMs = stallTimeoutMs).also { streamers.add(it) }
+    private fun streamer(
+        stallTimeoutMs: Long = MjpegStreamer.STALL_TIMEOUT_MS,
+        idleEvictMs: Long = MjpegStreamer.IDLE_EVICT_MS
+    ): MjpegStreamer =
+        MjpegStreamer(maxFps = 1000, stallTimeoutMs = stallTimeoutMs, idleEvictMs = idleEvictMs).also { streamers.add(it) }
 
     /** Serve a new viewer of [streamer] over [out] on its own thread, as NanoHTTPD would. */
     private fun watch(streamer: MjpegStreamer, out: OutputStream): Pair<MjpegStreamer.MjpegClient, Thread> {
@@ -154,6 +158,48 @@ class MjpegStreamerTest {
         responses.first().close()
         assertEquals(7, streamer.getClientCount())
         assertEquals(Status.OK, streamer.createStreamResponse().status)
+    }
+
+    @Test
+    fun `viewers that left while the camera sent nothing make room for new ones`() {
+        val streamer = streamer(idleEvictMs = 500)
+        // Eight viewers came and left with no frame written: nothing has told the streamer they are gone
+        val gone = List(MjpegStreamer.MAX_VIEWERS) { checkNotNull(streamer.openClient()) { "a viewer should be accepted" } }
+        assertNull("none has been idle long enough to give up its place", streamer.openClient())
+
+        Thread.sleep(700)
+        assertNotNull("the viewer idle longest should make room", streamer.openClient())
+        assertEquals("only one should go", 1, gone.count { it.isClosed })
+        assertTrue("the one there longest goes", gone.first().isClosed)
+        assertEquals(MjpegStreamer.MAX_VIEWERS, streamer.getClientCount())
+        assertEquals(Status.OK, streamer.createStreamResponse().status)
+    }
+
+    @Test
+    fun `a viewer that keeps getting frames keeps its place at the cap`() {
+        val streamer = streamer(idleEvictMs = 300)
+        // The one watching came first, so it has been there longest
+        val sink = Sink()
+        val (watching, _) = watch(streamer, sink)
+        val gone = List(MjpegStreamer.MAX_VIEWERS - 1) { checkNotNull(streamer.openClient()) { "a viewer should be accepted" } }
+
+        // Frames flow for longer than the idle time: the viewers that left take none, the one watching takes them
+        var n = 0
+        val until = System.currentTimeMillis() + 500
+        while (System.currentTimeMillis() < until) {
+            pushQuickly(streamer, frame(n++))
+            Thread.sleep(20)
+        }
+        assertTrue("the viewer watching should get frames", waitFor(2000) { sink.frameCount() > 0 })
+
+        assertNotNull("a viewer that left should make room", streamer.openClient())
+        assertFalse("the viewer watching keeps its place", watching.isClosed)
+        assertEquals(1, gone.count { it.isClosed })
+    }
+
+    @Test
+    fun `the idle time that gives up a place at the cap is three seconds`() {
+        assertEquals(3_000L, MjpegStreamer.IDLE_EVICT_MS)
     }
 
     @Test

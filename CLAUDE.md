@@ -1153,7 +1153,8 @@ output (RTSP, MPEG-TS or recording) and shares it with the rest; stopping an
 output stops the encoder only when nothing else uses it. `startStreaming(config)`
 holds the encoder on its own and restarts it if the settings change;
 `stopStreaming()` stops every output and the encoder. The phone's Start Stream
-button and kiosk boot auto-start both start RTSP.
+button starts RTSP; kiosk boot auto-start starts RTSP and/or a recording, each
+on its own, as `autoStart.startRtsp` and `startRecording` say.
 
 - Stream defaults (`camera/StreamDefaults.kt`, prefs `lensdaemon_stream`): codec,
   size, frame rate, bitrate, RTSP port and file length. Each successful start
