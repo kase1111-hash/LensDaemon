@@ -214,8 +214,8 @@ class CameraService : Service() {
 
     /**
      * Rebuilds the encoder after it failed while running (see
-     * [scheduleEncoderRecovery]); null when none runs. Set and cleared under
-     * [encoderRecoveryLock].
+     * [scheduleEncoderRecovery]); null (or no longer active) when none runs.
+     * Set and cleared under [encoderRecoveryLock].
      */
     @Volatile private var encoderRecoveryJob: Job? = null
 
@@ -1663,7 +1663,7 @@ class CameraService : Service() {
      */
     private fun scheduleEncoderRecovery() {
         synchronized(encoderRecoveryLock) {
-            if (encoderRecoveryJob != null) return
+            if (encoderRecoveryJob?.isActive == true) return
             if (SystemClock.elapsedRealtime() - encoderRebuiltAtMs > ENCODER_HEALTHY_MS) encoderRecoveryStep = 0
             encoderRecoveryJob = serviceScope.launch(Dispatchers.Default) { rebuildEncoder() }
         }
