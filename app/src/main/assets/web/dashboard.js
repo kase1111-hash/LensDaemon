@@ -17,9 +17,6 @@ const SLOW_POLL_MS = 5000;
 const KIOSK_POLL_MS = 10000;
 const LIBRARY_POLL_MS = 30000;
 
-// The RTSP port used when the phone has no saved default
-const DEFAULT_RTSP_PORT = 8554;
-
 // State
 let isStreaming = false;
 let isRtspRunning = false;
@@ -613,13 +610,15 @@ function showStreamDefaults() {
     elements.defaultsSummary.textContent = streamDefaults ? `Phone default: ${describeDefaults(streamDefaults)}` : '';
 }
 
-/** Save the settings form (and the recording's file length) as the phone's stream defaults. */
+/**
+ * Save the settings form (and the recording's file length) as the phone's
+ * stream defaults. The form has no RTSP port: the phone's own goes back with
+ * them, or, while it isn't known, is left out, which keeps the saved one.
+ */
 async function saveStreamDefaults() {
-    const defaults = {
-        ...encoderSettings(),
-        rtspPort: streamDefaults?.rtspPort || DEFAULT_RTSP_PORT,
-        segmentMinutes: parseInt(elements.segmentMinutes.value, 10)
-    };
+    const defaults = { ...encoderSettings() };
+    if (streamDefaults?.rtspPort) defaults.rtspPort = streamDefaults.rtspPort;
+    defaults.segmentMinutes = parseInt(elements.segmentMinutes.value, 10);
     showResult(elements.defaultsResult, null, 'Saving…');
     const result = await apiCall('/api/config', 'PUT', { defaults });
     if (!succeeded(result)) {
@@ -801,8 +800,10 @@ async function stopStream() {
 }
 
 async function startRtsp() {
-    // On the phone's own RTSP port, so the address viewers know stays the same
-    const config = { ...encoderSettings(), port: streamDefaults?.rtspPort || DEFAULT_RTSP_PORT };
+    // On the phone's own RTSP port, so the address viewers know stays the same;
+    // while it isn't known the port is left out and the phone picks it
+    const config = { ...encoderSettings() };
+    if (streamDefaults?.rtspPort) config.port = streamDefaults.rtspPort;
     const result = await apiCall('/api/rtsp/start', 'POST', config);
     if (succeeded(result)) {
         encoderFormEdited = false;
