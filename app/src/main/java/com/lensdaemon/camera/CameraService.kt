@@ -151,16 +151,23 @@ class CameraService : Service() {
     private val exposureController = ExposureController()
     private val zoomController = ZoomController()
 
-    // Current state (volatile: read from NanoHTTPD threads via isPreviewActive()/isStreaming())
-    private var currentConfig = CaptureConfig()
+    // Current state (volatile: read and changed from NanoHTTPD and director threads too)
+    @Volatile private var currentConfig = CaptureConfig()
     @Volatile private var isPreviewActive = false
     @Volatile private var isStreamingActive = false
 
     /** A camera open has been launched and has not finished yet. */
     private val cameraOpenPending = AtomicBoolean(false)
 
-    /** The lens last opened, to reopen after the camera is lost. */
+    /**
+     * The lens the controllers and capture settings are for: the one a
+     * [switchLens] asked for (it may still be opening), or else the one last
+     * opened. Reopened after the camera is lost.
+     */
     @Volatile private var lastLensType = LensType.MAIN
+
+    /** Sets the controllers and capture settings up for one lens at a time ([prepareForLens]). */
+    private val lensSettingsLock = Any()
 
     /** Reopens the camera after it was lost while running. */
     private var cameraRecoveryJob: Job? = null
@@ -205,8 +212,18 @@ class CameraService : Service() {
     /** Set while a thermal pause holds the outputs stopped; a start or stop by the user clears it ([cancelThermalPause]). */
     @Volatile private var thermalPaused: PausedOutputs? = null
 
-    /** Rebuilds the encoder after it failed while running (see [scheduleEncoderRecovery]). */
+    /**
+     * Rebuilds the encoder after it failed while running (see
+     * [scheduleEncoderRecovery]); null when none runs. Set and cleared under
+     * [encoderRecoveryLock].
+     */
     @Volatile private var encoderRecoveryJob: Job? = null
+
+    /**
+     * Guards starting and ending [encoderRecoveryJob], so an encoder failure
+     * reported while a recovery is finishing is never lost between the two.
+     */
+    private val encoderRecoveryLock = Any()
 
     /** Index of the next wait in [ENCODER_RECOVERY_DELAYS_MS]. */
     @Volatile private var encoderRecoveryStep = 0
@@ -502,31 +519,40 @@ class CameraService : Service() {
     /**
      * Start RTSP when [rtsp] and a recording when [record], each on its own
      * (one failing never keeps the other off), with the saved stream defaults.
-     * A start that fails with them is tried once more at 1080p30 on port 8554,
-     * so a bad saved value never leaves the appliance dark; the saved defaults
-     * stay as they were.
+     * A start that fails with them is tried once more at 1080p30 (RTSP on port
+     * 8554), so a bad saved value never leaves the appliance dark; the saved
+     * defaults stay as they were.
      */
     private fun autoStartOutputs(rtsp: Boolean, record: Boolean) {
+        if (rtsp && !startRtspWithSavedDefaults()) Timber.e("Auto-start: RTSP could not start")
+        if (!record) return
         val defaults = streamDefaults()
-        val config = defaults.toEncoderConfig()
         val segment = defaults.segmentDuration()
-        var fellBack = false
-        if (rtsp && !startRtspStreaming(config, defaults.rtspPort)) {
-            Timber.w("Auto-start: RTSP did not start with the saved defaults; trying 1080p30 on port $DEFAULT_RTSP_PORT")
-            fellBack = true
-            if (!startRtspStreaming(EncoderConfig.PRESET_1080P, DEFAULT_RTSP_PORT)) {
-                Timber.e("Auto-start: RTSP could not start")
-            }
+        if (startRecording(defaults.toEncoderConfig(), segment)) return
+        Timber.w("Auto-start: recording did not start with the saved defaults; trying 1080p30")
+        if (startRecording(EncoderConfig.PRESET_1080P, segment)) {
+            // A fallback start is no new choice: keep the saved defaults for next time
+            saveStreamDefaults(defaults)
+        } else {
+            Timber.e("Auto-start: recording could not start")
         }
-        if (record && !startRecording(config, segment)) {
-            Timber.w("Auto-start: recording did not start with the saved defaults; trying 1080p30")
-            fellBack = true
-            if (!startRecording(EncoderConfig.PRESET_1080P, segment)) {
-                Timber.e("Auto-start: recording could not start")
-            }
-        }
-        // A fallback start is no new choice: keep the saved defaults for next time
-        if (fellBack) saveStreamDefaults(defaults)
+    }
+
+    /**
+     * Serve RTSP with the saved stream defaults (the phone's Start Stream,
+     * kiosk auto-start and the restart after Android stopped the app). If they
+     * fail (a codec, size or frame rate this phone's encoder cannot do, or the
+     * port is taken), try once more at 1080p30 on port 8554. A fallback start
+     * is no new choice: the saved defaults stay as they were.
+     */
+    private fun startRtspWithSavedDefaults(): Boolean {
+        val defaults = streamDefaults()
+        if (startRtspStreaming(defaults.toEncoderConfig(), defaults.rtspPort)) return true
+        Timber.w("RTSP did not start with the saved defaults; trying 1080p30 on port $DEFAULT_RTSP_PORT")
+        if (!startRtspStreaming(EncoderConfig.PRESET_1080P, DEFAULT_RTSP_PORT)) return false
+        // The fallback start saved its own settings as the defaults: put the chosen ones back
+        saveStreamDefaults(defaults)
+        return true
     }
 
     /** Start thermal monitoring in the foreground, as the app and boot do; it may be refused in the background. */
@@ -717,11 +743,8 @@ class CameraService : Service() {
             if (opened) {
                 val lens = lensDaemonCameraManager.currentLens.value
                 lens?.let {
-                    val lensChanged = it.lensType != lastLensType
-                    lastLensType = it.lensType
                     lensController.setCurrentLens(it)
-                    initializeControllersForCamera(it.cameraId)
-                    syncConfigToLens(lensChanged)
+                    prepareForLens(it)
                 }
                 isPreviewActive = true
                 startCameraPreview(currentPreviewSurface())
@@ -739,11 +762,8 @@ class CameraService : Service() {
             Timber.i("Opening camera with lens: ${lens.lensType.displayName}")
             val opened = lensDaemonCameraManager.openCamera(lens)
             if (opened) {
-                val lensChanged = lens.lensType != lastLensType
-                lastLensType = lens.lensType
                 lensController.setCurrentLens(lens)
-                initializeControllersForCamera(lens.cameraId)
-                syncConfigToLens(lensChanged)
+                prepareForLens(lens)
                 isPreviewActive = true
                 startCameraPreview(currentPreviewSurface())
                 updateNotification()
@@ -756,17 +776,55 @@ class CameraService : Service() {
     }
 
     /**
-     * Bring the capture settings in line with the lens just opened, before its
-     * session starts. A different lens starts at 1x zoom and 0 EV, in its own
-     * zoom range and exposure steps; the same lens reopened (after the camera
-     * was lost) keeps its zoom and exposure, clamped to the lens. The focus
-     * mode falls back to one the lens supports, and tap regions, which were in
-     * the old lens's coordinates, are dropped. Zoom goes through the zoom
-     * controller, so the reported zoom and the applied one agree.
+     * Make [lens] the one the controllers and the capture settings are for.
+     * [switchLens] does this when it is asked, before the lens opens in the
+     * background, so the zoom, exposure and focus asked for meanwhile are
+     * already the new lens's (its zoom range, exposure steps and focus modes)
+     * and carry into its session; every open does it again for the lens it
+     * opened. See [syncConfigToLens].
+     */
+    private fun prepareForLens(lens: CameraLens) {
+        synchronized(lensSettingsLock) {
+            val lensChanged = lens.lensType != lastLensType
+            lastLensType = lens.lensType
+            initializeControllersForCamera(lens.cameraId)
+            syncConfigToLens(lensChanged)
+        }
+    }
+
+    /**
+     * Bring the capture settings in line with the lens the controllers were
+     * just set up for, before its session starts.
+     *
+     * A different lens starts at 1x zoom, 0 EV and continuous autofocus, with
+     * no tap regions (those were in the old lens's coordinates); nothing of
+     * this reaches the old lens, which keeps its picture until it closes.
+     * Otherwise (the lens a [switchLens] already prepared, now open, or the
+     * same lens reopened after the camera was lost) the zoom, exposure, focus
+     * mode and regions asked for are kept, zoom and exposure clamped to the
+     * lens. Either way the focus mode falls back to the first of
+     * CONTINUOUS_VIDEO, AUTO and MANUAL the lens supports when it lacks the
+     * one asked for; since a lens change starts from continuous autofocus
+     * again, a fallback for a fixed-focus lens never sticks to the next lens.
+     * Zoom goes through the zoom controller, so the reported zoom and the
+     * applied one agree.
      */
     private fun syncConfigToLens(lensChanged: Boolean) {
-        zoomController.setZoom(if (lensChanged) 1f else currentConfig.zoomRatio)
-        exposureController.setExposureCompensation(if (lensChanged) 0 else currentConfig.exposureCompensation)
+        if (lensChanged) {
+            // Stops a zoom animation; 1x as the controller was just set up, without telling the old lens
+            zoomController.reset()
+            _currentZoom.value = 1f
+            currentConfig = currentConfig.copy(
+                zoomRatio = 1f,
+                exposureCompensation = 0,
+                focusMode = FocusMode.CONTINUOUS_VIDEO,
+                afRegions = null,
+                aeRegions = null
+            )
+        } else {
+            zoomController.setZoom(currentConfig.zoomRatio)
+        }
+        exposureController.setExposureCompensation(currentConfig.exposureCompensation)
         val supported = focusController.getSupportedFocusModes()
         val focus = when {
             supported.isEmpty() || currentConfig.focusMode in supported -> currentConfig.focusMode
@@ -775,9 +833,7 @@ class CameraService : Service() {
         if (focus in supported) focusController.setFocusMode(focus)
         currentConfig = currentConfig.copy(
             exposureCompensation = exposureController.exposureCompensation.value,
-            focusMode = focus,
-            afRegions = null,
-            aeRegions = null
+            focusMode = focus
         )
     }
 
@@ -844,6 +900,12 @@ class CameraService : Service() {
      * Switch to a different camera lens: that type, or the nearest of its family
      * when the phone lacks it (a WIDE request takes the ultra-wide on a phone
      * without a plain wide lens). Returns false when the phone has no such lens.
+     *
+     * The lens opens in the background, but the capture settings are the new
+     * lens's as soon as this returns: a different lens starts at 1x zoom, 0 EV
+     * and continuous autofocus, and the zoom, exposure, focus and tap regions
+     * asked for from then on (say a director cue's zoom right after its lens
+     * change) are checked against the new lens and carry into its session.
      */
     fun switchLens(lensType: LensType): Boolean {
         val available = lensDaemonCameraManager.availableLenses
@@ -854,6 +916,7 @@ class CameraService : Service() {
             return false
         }
         Timber.i("Switching lens to: ${lens.lensType}")
+        prepareForLens(lens)
         serviceScope.launch { openCameraAndStartPreview(lens) }
         return true
     }
@@ -1388,8 +1451,10 @@ class CameraService : Service() {
      * progress. Leaves a thermal pause's record alone (see [pauseForThermal]).
      */
     private fun stopAllOutputs() {
-        encoderRecoveryJob?.cancel()
-        encoderRecoveryJob = null
+        synchronized(encoderRecoveryLock) {
+            encoderRecoveryJob?.cancel()
+            encoderRecoveryJob = null
+        }
         encoderRecoveryStep = 0
         recordingInterrupted = false
         encodingRequested = false
@@ -1444,7 +1509,10 @@ class CameraService : Service() {
      * caps the frame rate at 24 (see [ThermalEncoderLimits]). A running
      * encoder is restarted with the limited settings, keeping the outputs (a
      * recording continues in a new file), and returns to the requested ones
-     * once both limits clear. Encoders started meanwhile start limited.
+     * once both limits clear. Encoders started meanwhile start limited. No
+     * user asked for this restart, so when the new encoder does not start the
+     * outputs are kept and it is rebuilt like after a runtime failure (see
+     * [scheduleEncoderRecovery]) instead of everything stopping for good.
      *
      * Thread-safe; may block while the encoder restarts, so call it off the
      * main thread, in the order the governor reports changes.
@@ -1457,7 +1525,7 @@ class CameraService : Service() {
         val target = thermallyLimited(requestedEncoderConfig ?: return)
         if (target == getEncoderConfig()) return
         Timber.i("Thermal limits (lower resolution: $reduceResolution, 24 fps: $reduceFramerate): restarting the encoder")
-        restartEncoder(target)
+        if (!restartEncoder(target, keepOutputsOnFailure = true)) scheduleEncoderRecovery()
     }
 
     /**
@@ -1495,10 +1563,12 @@ class CameraService : Service() {
      * encoder, remembering which ran and how (the requested encoder settings,
      * Start Streaming, the RTSP port, the MPEG-TS settings, the recording's
      * segment length and whether it was paused) for [resumeAfterThermal].
-     * Does nothing when nothing runs or a pause is already in effect. The CPU
-     * is kept awake during the pause: the thermal monitor that calls for the
-     * resume only runs while it is, and with the screen off the phone would
-     * otherwise go to sleep and never bring the outputs back.
+     * Does nothing when nothing runs or a pause is already in effect. An
+     * encoder that runs with nothing to restart (say its only output, a
+     * recording, failed) is stopped all the same, with no pause to resume. The
+     * CPU is kept awake during the pause: the thermal monitor that calls for
+     * the resume only runs while it is, and with the screen off the phone
+     * would otherwise go to sleep and never bring the outputs back.
      *
      * Thread-safe; blocks while the outputs stop, so call it off the main thread.
      */
@@ -1514,7 +1584,13 @@ class CameraService : Service() {
             recording = recordingCoordinator.segmentDuration.takeIf { isRecordingActive() || recordingInterrupted },
             recordingPaused = recordingToContinuePaused()
         )
-        if (!paused.restartsAnything()) return
+        if (!paused.restartsAnything()) {
+            if (isStreamingActive) {
+                Timber.w("Phone too hot: stopping the encoder, which no output needs any more")
+                stopAllOutputs()
+            }
+            return
+        }
         Timber.w("Phone too hot: stopping every output until it cools down")
         stopAllOutputs()
         thermalPaused = paused
@@ -1573,45 +1649,82 @@ class CameraService : Service() {
     // ==================== Encoder recovery ====================
 
     /**
-     * The encoder failed while outputs ran (a non-transient codec error):
-     * rebuild it with the same settings after 1, 2, 5, 10 and 30 s, keeping the
-     * outputs, until one rebuild runs; if none does, stop the outputs so the
-     * status is honest. One recovery at a time. A rebuilt encoder that fails
-     * again within a minute continues with the next wait instead of starting
-     * over, so a codec that keeps failing ends in a stop rather than a loop.
-     * Called on the main thread by the encoder state collector.
+     * The encoder failed while outputs ran (a non-transient codec error, or a
+     * thermal restart that did not start): rebuild it with the same settings
+     * after 1, 2, 5, 10 and 30 s, keeping the outputs, until one rebuild runs;
+     * if none does, stop the outputs so the status is honest. One recovery at
+     * a time: a failure reported while one runs is left to it, and it only
+     * ends once the encoder is running (see [endEncoderRecovery]), so a rebuilt
+     * encoder that fails before the rebuild is done is rebuilt again. A rebuilt
+     * encoder that fails again within a minute continues with the next wait
+     * instead of starting over, so a codec that keeps failing ends in a stop
+     * rather than a loop. Called by the encoder state collector on the main
+     * thread and after a failed thermal restart; thread-safe.
      */
     private fun scheduleEncoderRecovery() {
-        if (encoderRecoveryJob?.isActive == true) return
-        if (SystemClock.elapsedRealtime() - encoderRebuiltAtMs > ENCODER_HEALTHY_MS) encoderRecoveryStep = 0
-        encoderRecoveryJob = serviceScope.launch(Dispatchers.Default) {
-            while (encoderRecoveryStep < ENCODER_RECOVERY_DELAYS_MS.size) {
-                delay(ENCODER_RECOVERY_DELAYS_MS[encoderRecoveryStep++])
-                if (recoverEncoder()) return@launch
-            }
-            giveUpEncoderRecovery()
+        synchronized(encoderRecoveryLock) {
+            if (encoderRecoveryJob != null) return
+            if (SystemClock.elapsedRealtime() - encoderRebuiltAtMs > ENCODER_HEALTHY_MS) encoderRecoveryStep = 0
+            encoderRecoveryJob = serviceScope.launch(Dispatchers.Default) { rebuildEncoder() }
         }
     }
 
     /**
-     * One rebuild of a broken encoder, with the requested settings within the
-     * thermal limits. True when nothing is left to do: the encoder runs (again)
-     * or is no longer needed.
+     * The recovery job: wait, rebuild, and go on with the next wait while the
+     * encoder is still (or again) broken; after the last wait, give up.
      */
-    @Synchronized
-    private fun recoverEncoder(): Boolean {
-        if (!encoderBroken()) return true
-        val config = requestedEncoderConfig?.let { thermallyLimited(it) } ?: getEncoderConfig() ?: return false
-        Timber.w("Encoder failed while running; rebuilding it")
-        val rebuilt = restartEncoder(config, keepOutputsOnFailure = true)
-        if (rebuilt) encoderRebuiltAtMs = SystemClock.elapsedRealtime()
-        return rebuilt
+    private suspend fun rebuildEncoder() {
+        val job = currentCoroutineContext()[Job]
+        do {
+            val step = encoderRecoveryStep++
+            if (step < ENCODER_RECOVERY_DELAYS_MS.size) {
+                delay(ENCODER_RECOVERY_DELAYS_MS[step])
+                recoverEncoder(job)
+            } else {
+                giveUpEncoderRecovery(job)
+            }
+        } while (!endEncoderRecovery(job))
     }
 
-    /** Every rebuild failed: stop the outputs, so nothing reports a stream that is not there. */
+    /**
+     * Whether the recovery job [job] is done: it was stopped or replaced, or
+     * the encoder runs (or is no longer needed). Decided under the lock
+     * [scheduleEncoderRecovery] takes, and the job is cleared with that
+     * decision, so a failure reported after it starts a new recovery and one
+     * reported before it keeps this one going.
+     */
+    private fun endEncoderRecovery(job: Job?): Boolean {
+        synchronized(encoderRecoveryLock) {
+            if (encoderRecoveryJob !== job) return true
+            if (encoderBroken()) return false
+            encoderRecoveryJob = null
+            return true
+        }
+    }
+
+    /**
+     * One rebuild of a broken encoder by the recovery job [job], with the
+     * requested settings within the thermal limits; nothing when the encoder
+     * runs (again), is no longer needed, or [job] was stopped meanwhile (a
+     * newer recovery owns the encoder then). A rebuild that does not start
+     * keeps the outputs for the next one.
+     */
     @Synchronized
-    private fun giveUpEncoderRecovery() {
-        if (!encoderBroken()) return
+    private fun recoverEncoder(job: Job?) {
+        if (encoderRecoveryJob !== job || !encoderBroken()) return
+        val config = requestedEncoderConfig?.let { thermallyLimited(it) } ?: getEncoderConfig() ?: return
+        Timber.w("Encoder failed while running; rebuilding it")
+        if (restartEncoder(config, keepOutputsOnFailure = true)) encoderRebuiltAtMs = SystemClock.elapsedRealtime()
+    }
+
+    /**
+     * Every rebuild by the recovery job [job] failed: stop the outputs, so
+     * nothing reports a stream that is not there; unless [job] was stopped
+     * meanwhile or the encoder runs after all.
+     */
+    @Synchronized
+    private fun giveUpEncoderRecovery(job: Job?) {
+        if (encoderRecoveryJob !== job || !encoderBroken()) return
         Timber.e("The encoder could not be rebuilt; stopping every output")
         stopAllOutputs()
     }
@@ -1968,10 +2081,19 @@ class CameraService : Service() {
     fun isRtspServerRunning(): Boolean = rtspCoordinator.isRunning()
 
     /**
+     * The phone's Start Stream: serve the camera over RTSP with the saved
+     * stream defaults, or, if they fail on this phone, once more at 1080p30 on
+     * port 8554, keeping the saved defaults as they were (the same single
+     * fallback as kiosk auto-start).
+     */
+    fun startRtspStreaming(): Boolean = startRtspWithSavedDefaults()
+
+    /**
      * Serve the camera over RTSP. Uses the running encoder if there is one
-     * (another output started it), otherwise starts one with [config]. Without
-     * arguments (the phone's Start Stream button) the saved stream defaults are
-     * used; a successful start makes its settings the new defaults.
+     * (another output started it), otherwise starts one with [config] (by
+     * default the saved stream defaults; with no arguments at all the
+     * overload with the 1080p30 fallback runs instead). A successful start
+     * makes its settings the new defaults.
      */
     @Synchronized
     fun startRtspStreaming(

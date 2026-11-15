@@ -82,29 +82,32 @@ class KioskActivityController(
         } else if (!config.enabled && pinned) {
             Timber.i("Kiosk mode is off: unpinning LensDaemon")
             kioskManager.disableKiosk(activity)
-            pinned = kioskManager.isLockTaskActive()
         }
         applyScreen(config, pinned)
     }
 
     /**
-     * The screen for [config]: its mode while [pinned] (when it changed since
-     * last applied), the normal preview once unpinned, and keep-screen-on.
+     * The screen for [config]: its mode while kiosk mode is on and the phone
+     * is [pinned] (when it changed since last applied), the normal preview
+     * otherwise, and keep-screen-on. Kiosk mode off always brings the normal
+     * screen back: Android reports the end of lock task mode a moment after
+     * stopLockTask, so [pinned] can still read true right after unpinning.
      * OFF shows the preview and lets the screen timeout turn the display off:
      * ScreenController's OFF locks the phone, and since this runs on every
      * resume, the phone would lock again before Vol Up + Vol Down could be held.
      */
     private fun applyScreen(config: KioskConfig, pinned: Boolean) {
-        if (pinned && config.screen != appliedScreen) {
+        val kioskScreen = pinned && config.enabled
+        if (kioskScreen && config.screen != appliedScreen) {
             screen.configure(config.screen.copy(autoOffTimeoutSec = 0))
             screen.applyMode(activity, if (config.screen.mode == ScreenMode.OFF) ScreenMode.PREVIEW else config.screen.mode)
             appliedScreen = config.screen
-        } else if (!pinned && appliedScreen != null) {
+        } else if (!kioskScreen && appliedScreen != null) {
             screen.applyMode(activity, ScreenMode.PREVIEW)
             appliedScreen = null
         }
         // Last, because applyMode may have set the flag
-        val keepOn = !config.enabled || !pinned || (config.screen.keepScreenOn && config.screen.mode != ScreenMode.OFF)
+        val keepOn = !kioskScreen || (config.screen.keepScreenOn && config.screen.mode != ScreenMode.OFF)
         if (keepOn) {
             activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         } else {
