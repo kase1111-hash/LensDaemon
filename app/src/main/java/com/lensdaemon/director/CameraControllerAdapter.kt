@@ -1,8 +1,17 @@
 package com.lensdaemon.director
 
+import android.os.SystemClock
 import com.lensdaemon.camera.CameraService
+import com.lensdaemon.camera.CameraState
 import com.lensdaemon.camera.FocusMode
 import com.lensdaemon.camera.LensSelection
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import timber.log.Timber
 import kotlin.math.abs
 import kotlin.math.roundToInt
@@ -18,9 +27,11 @@ import kotlin.math.roundToInt
  * module has no dependency on :app camera types.
  *
  * Commands are compared with the camera's own state (the open lens, the applied zoom,
- * the focus mode), not with what the adapter last asked for, so a cue still acts after
- * the lens, zoom or focus was changed on the phone or the dashboard. Only a lens switch
- * or zoom animation still under way counts as where the camera is heading.
+ * the focus mode, the exposure compensation), not with what the adapter last asked for,
+ * so a cue still acts after the camera was changed on the phone or the dashboard. Only a
+ * lens switch or zoom animation still under way counts as where the camera is heading.
+ * Those windows are measured on [SystemClock.elapsedRealtime], which setting the phone's
+ * time doesn't move.
  */
 class CameraControllerAdapter(
     private val cameraService: CameraService
@@ -37,6 +48,13 @@ class CameraControllerAdapter(
          * the camera in the background: until it starts, the old lens still shows as open.
          */
         private const val LENS_SWITCH_SETTLE_MS = 2_000L
+
+        /**
+         * How long after the director asks for an exposure preset other than AUTO it is put
+         * back on a lens that opens. A lens change completes in the background after the
+         * command that asked for it returns, and the new lens starts at 0 EV.
+         */
+        private const val EXPOSURE_KEEP_MS = 5_000L
 
         /** Exposure compensation of each preset, in EV, as [ExposurePreset] documents them. */
         private fun evFor(preset: ExposurePreset): Float = when (preset) {
@@ -68,6 +86,18 @@ class CameraControllerAdapter(
     @Volatile
     private var appliedFocus: AppliedFocus? = null
 
+    /** Keeps exposure changes in order: the director's calls and the ones [exposureKeeper] makes. */
+    private val exposureLock = Any()
+
+    /** The preset the director asked for last (under [exposureLock]), or null after [reset]. */
+    private var wantedExposure: ExposurePreset? = null
+
+    /** Puts [wantedExposure] back on lenses that open after it was asked for. */
+    private val exposureScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+    @Volatile
+    private var exposureKeeper: Job? = null
+
     /**
      * Switch camera lens ("wide", "main", "tele"), unless the camera is on that family or
      * heading there. The last switch the camera accepted is where it is heading while no lens
@@ -77,7 +107,7 @@ class CameraControllerAdapter(
      */
     override fun switchLens(lens: String) {
         val current = currentLensFamily()
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val switching = lastAcceptedLens?.takeIf { current == null || now - lastAcceptedAtMs < LENS_SWITCH_SETTLE_MS }
         val heading = switching ?: current
         if (lens == heading) return
@@ -97,7 +127,7 @@ class CameraControllerAdapter(
      */
     override fun setZoom(level: Float, animated: Boolean, durationMs: Long) {
         val target = level.coerceIn(1f, cameraService.getMaxZoom().coerceAtLeast(1f))
-        val now = System.currentTimeMillis()
+        val now = SystemClock.elapsedRealtime()
         val heading = animatingTo?.takeIf { now < animationEndsAtMs }
         val reached = heading ?: cameraService.currentZoom.value
         if (abs(target - reached) <= ZOOM_TOLERANCE) return
@@ -149,17 +179,50 @@ class CameraControllerAdapter(
 
     /**
      * Set the exposure compensation of a preset: AUTO 0, BRIGHT +1, DARK −1, BACKLIT +2 and
-     * SILHOUETTE −2 EV, in the camera's own steps and within its range. The director calls
-     * this only when the preset changes.
+     * SILHOUETTE −2 EV, in the open lens's own steps and within its range, unless the camera
+     * has it already. The director sends a preset other than AUTO with every command, and
+     * AUTO only when a cue goes back to it. A preset other than AUTO also goes onto each lens
+     * that opens in the next [EXPOSURE_KEEP_MS]: a lens switch the same command asked for is
+     * still under way, and the new lens starts at 0 EV.
      */
     override fun setExposurePreset(preset: ExposurePreset) {
+        synchronized(exposureLock) {
+            wantedExposure = preset
+            exposureKeeper?.cancel()
+            applyExposure(preset)
+            exposureKeeper = if (preset != ExposurePreset.AUTO) keepExposure(preset) else null
+        }
+    }
+
+    /** Sets [preset]'s compensation on the open lens, unless the camera has it already (under [exposureLock]). */
+    private fun applyExposure(preset: ExposurePreset) {
         val step = cameraService.getExposureCompensationStep()
         val steps = if (step > 0f) (evFor(preset) / step).roundToInt() else 0
         val range = cameraService.getExposureCompensationRange()
         val value = steps.coerceIn(range.lower, range.upper)
+        if (cameraService.getConfig().exposureCompensation == value) return
 
         Timber.tag(TAG).d("Setting exposure preset: $preset ($value steps of $step EV)")
         cameraService.setExposureCompensation(value)
+    }
+
+    /**
+     * For [EXPOSURE_KEEP_MS], each time the camera starts capturing (a lens opened, or the
+     * session restarted) puts [preset] back if the camera lost it, while the director still
+     * wants it.
+     */
+    private fun keepExposure(preset: ExposurePreset): Job = exposureScope.launch {
+        withTimeoutOrNull(EXPOSURE_KEEP_MS) {
+            combine(cameraService.getCameraState(), cameraService.getCurrentLens()) { state, lens ->
+                lens != null && (state == CameraState.PREVIEWING || state == CameraState.STREAMING)
+            }.collect { capturing ->
+                if (capturing) {
+                    synchronized(exposureLock) {
+                        if (wantedExposure == preset) applyExposure(preset)
+                    }
+                }
+            }
+        }
     }
 
     override fun getCurrentTemperature(): Int {
@@ -196,13 +259,18 @@ class CameraControllerAdapter(
 
     fun getMotionShakiness(): Float = cameraService.getMotionShakiness()
 
-    /** Forgets the lens request, zoom animation and focus target the adapter remembers. */
+    /** Forgets the lens request, zoom animation, focus target and exposure preset the adapter remembers. */
     fun reset() {
         lastAcceptedLens = null
         lastAcceptedAtMs = 0L
         animatingTo = null
         animationEndsAtMs = 0L
         appliedFocus = null
+        synchronized(exposureLock) {
+            wantedExposure = null
+            exposureKeeper?.cancel()
+            exposureKeeper = null
+        }
     }
 
     /** The family of the open lens, or null while the camera is closed or reopening. */

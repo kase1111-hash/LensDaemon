@@ -3,6 +3,7 @@ package com.lensdaemon.web.handlers
 import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -43,8 +44,12 @@ object ApiHandlerUtils {
         return jsonResponse(Status.OK, json)
     }
 
+    /**
+     * {"error": [message]}, built with JSONObject so a message holding quotes,
+     * backslashes or line breaks (a file name, a host from the request) stays valid JSON.
+     */
     fun errorJson(status: Status, message: String): NanoHTTPD.Response {
-        return jsonResponse(status, """{"error": "$message"}""")
+        return jsonResponse(status, JSONObject().put("error", message).toString())
     }
 
     fun serviceUnavailable(serviceName: String): NanoHTTPD.Response {

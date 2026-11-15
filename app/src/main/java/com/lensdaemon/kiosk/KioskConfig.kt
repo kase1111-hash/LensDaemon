@@ -38,25 +38,28 @@ enum class LockTaskFeature {
 }
 
 /**
- * Auto-start configuration
+ * Auto-start configuration: what [BootReceiver] (and the camera's restart
+ * after a crash) starts. The outputs use the saved stream defaults.
  */
 data class AutoStartConfig(
     val enabled: Boolean = true,
-    val delaySeconds: Int = 5,              // Delay after boot before starting
-    val startStreaming: Boolean = true,     // Auto-start streaming
-    val startRtsp: Boolean = true,          // Auto-start RTSP server
-    val startRecording: Boolean = false     // Auto-start recording
+    val delaySeconds: Int = 5,              // Wait after boot before the app and camera start (0-120 s)
+    val startStreaming: Boolean = true,     // Kept for older settings: on its own it starts nothing
+    val startRtsp: Boolean = true,          // Auto-start the RTSP server
+    val startRecording: Boolean = false     // Auto-start recording (independent of RTSP)
 )
 
 /**
- * Screen control configuration
+ * Screen control configuration, applied while the phone is pinned in kiosk
+ * mode (see [KioskActivityController]). With keepScreenOn off or mode OFF the
+ * phone's own screen timeout turns the display off; nothing locks it.
  */
 data class ScreenConfig(
     val mode: ScreenMode = ScreenMode.PREVIEW,
-    val dimBrightness: Int = 10,            // Brightness level for DIM mode (0-255)
-    val autoOffTimeoutSec: Int = 60,        // Auto screen off after inactivity
+    val dimBrightness: Int = 10,            // Brightness level for DIM and BLACK mode (0-255)
+    val autoOffTimeoutSec: Int = 60,        // Not used: the phone's screen timeout applies
     val wakeOnMotion: Boolean = false,      // Wake screen on camera motion (future)
-    val keepScreenOn: Boolean = true        // Keep screen on during streaming
+    val keepScreenOn: Boolean = true        // Keep the screen on while pinned
 )
 
 /**
@@ -163,7 +166,33 @@ data class KioskConfig(
 }
 
 /**
- * Kiosk status snapshot
+ * A copy of [preset] that keeps this configuration's exit PIN and on/off state:
+ * applying a preset (which the setup wizard does on every activation) must
+ * neither remove the PIN nor turn kiosk mode on or off.
+ */
+fun KioskConfig.withPreset(preset: KioskConfig): KioskConfig =
+    preset.copy(enabled = enabled, security = preset.security.copy(exitPin = security.exitPin))
+
+/** Exit PINs are 4 to 12 digits, typed on the phone's number pad. */
+private val EXIT_PIN_PATTERN = Regex("^\\d{4,12}$")
+
+/**
+ * Why [pin] can't be the exit PIN, or null when it can: 4 to 12 digits, or
+ * empty for no PIN. The phone's PIN dialog only takes digits, so any other
+ * PIN could never be entered there.
+ */
+fun exitPinError(pin: String): String? =
+    if (pin.isEmpty() || EXIT_PIN_PATTERN.matches(pin)) null else "exitPin must be 4-12 digits, or empty to remove it"
+
+/** The [ScreenMode] called [name], in any letter case, or null when there is none. */
+fun parseScreenMode(name: String): ScreenMode? =
+    ScreenMode.entries.find { it.name.equals(name.trim(), ignoreCase = true) }
+
+/**
+ * Kiosk status snapshot. isScreenLocked is always false: kiosk mode never
+ * locks the screen, the phone's own screen timeout turns the display off.
+ * restartCount and lastRestartTime count the automatic restarts after a
+ * crash, kept across restarts.
  */
 data class KioskStatus(
     val state: KioskState = KioskState.DISABLED,
@@ -202,7 +231,8 @@ enum class KioskEventType {
     CRASH_RECOVERY,
     NETWORK_LOST,
     NETWORK_RECOVERED,
-    SCREEN_MODE_CHANGED
+    SCREEN_MODE_CHANGED,
+    PRESET_APPLIED
 }
 
 /**

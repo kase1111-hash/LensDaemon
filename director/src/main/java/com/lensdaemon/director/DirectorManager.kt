@@ -73,6 +73,13 @@ class DirectorManager internal constructor(
         fun switchLens(lens: String)
         fun setZoom(level: Float, animated: Boolean = false, durationMs: Long = 0)
         fun setFocusMode(target: FocusTarget)
+
+        /**
+         * Apply an exposure preset. The director sends a preset other than AUTO with every
+         * command while it is in force, and AUTO only when a cue goes back to it. The camera
+         * sets the preset wherever its exposure differs, including on a lens that opens after
+         * the call: a lens change starts the new lens at 0 EV.
+         */
         fun setExposurePreset(preset: ExposurePreset)
         fun getCurrentTemperature(): Int
 
@@ -145,9 +152,10 @@ class DirectorManager internal constructor(
     private var runGeneration = 0
 
     /**
-     * The exposure preset the director last applied (under [cameraLock]). Commands with the
-     * same preset leave the camera's exposure alone, so cues that don't change exposure never
-     * undo a value set on the dashboard.
+     * The exposure preset the director last sent (under [cameraLock]). AUTO goes to the camera
+     * only when a cue changes the preset back to it, so a script without [EXPOSURE] cues never
+     * undoes an exposure set on the dashboard. Any other preset goes with every command, and
+     * the camera puts it back where it was lost: a lens change starts the new lens at 0 EV.
      */
     private var lastAppliedExposure = ExposurePreset.AUTO
 
@@ -155,6 +163,7 @@ class DirectorManager internal constructor(
     @Volatile
     private var thermalCheckJob: Job? = null
 
+    /** When the temperature was last read, on [TakeManager.monotonicNowMs]'s clock. */
     @Volatile
     private var lastThermalCheckMs = 0L
 
@@ -162,6 +171,8 @@ class DirectorManager internal constructor(
     private var lastTemperatureC: Int? = null
 
     init {
+        // A pause doesn't count in the score of the take it keeps open
+        takeManager.samplingPaused = { _state.value == DirectorState.PAUSED }
         if (config.enabled) {
             _state.value = DirectorState.IDLE
             startThermalMonitoring()
@@ -220,24 +231,23 @@ class DirectorManager internal constructor(
      * list the parser's problems, scenes without cues and shots the camera can't do.
      */
     fun loadScript(scriptText: String): Result<ParsedScript> {
-        synchronized(controlLock) {
-            when (_state.value) {
-                DirectorState.DISABLED -> return Result.failure(IllegalStateException("The director is off"))
-                DirectorState.RUNNING, DirectorState.PAUSED ->
-                    return Result.failure(IllegalStateException("Stop the director before loading another script"))
-                else -> Unit
-            }
+        loadRefusal()?.let { return Result.failure(it) }
 
-            val parsed = try {
-                scriptParser.parseScript(scriptText)
-            } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "Script parsing failed")
-                return Result.failure(IllegalArgumentException("Could not read the script: ${e.message}", e))
-            }
-            if (parsed.scenes.isEmpty() || parsed.totalCues == 0) {
-                val reason = (listOf("Script contains no valid scenes or cues") + parsed.errors).joinToString("; ")
-                return Result.failure(IllegalArgumentException(reason))
-            }
+        // Parsed before taking the control lock: a long script doesn't hold up the other controls
+        val parsed = try {
+            scriptParser.parseScript(scriptText)
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Script parsing failed")
+            return Result.failure(IllegalArgumentException("Could not read the script: ${e.message}", e))
+        }
+        if (parsed.scenes.isEmpty() || parsed.totalCues == 0) {
+            val reason = (listOf("Script contains no valid scenes or cues") + parsed.errors).joinToString("; ")
+            return Result.failure(IllegalArgumentException(reason))
+        }
+
+        synchronized(controlLock) {
+            // The director may have started, or been turned off, while the script was parsed
+            loadRefusal()?.let { return Result.failure(it) }
 
             // Validate against what the camera can do now
             refreshCapabilities()
@@ -294,7 +304,8 @@ class DirectorManager internal constructor(
     }
 
     /**
-     * Pause execution: the run stops where it is, and its take stays open for resume
+     * Pause execution: the run stops where it is, and its take stays open for resume.
+     * Quality samples taken while paused don't count in that take.
      */
     fun pauseExecution() {
         synchronized(controlLock) {
@@ -572,8 +583,9 @@ class DirectorManager internal constructor(
         val generation = ++runGeneration
         cueExecutionJob?.cancel()
         cueExecutionJob = scope.launch {
-            // When each cue is meant to run: the start plus the waits before it
-            var expectedAtMs = System.currentTimeMillis()
+            // When each cue is meant to run: the start plus the waits before it, on the
+            // monotonic clock the take manager times cues with
+            var expectedAtMs = TakeManager.monotonicNowMs()
             while (isActive && _state.value == DirectorState.RUNNING) {
                 val cue = _currentSession.value?.currentCue
                 if (cue == null) {
@@ -634,7 +646,7 @@ class DirectorManager internal constructor(
         }
     }
 
-    /** Runs a camera command (holding [cameraLock]); the exposure preset only when it changed. */
+    /** Runs a camera command (holding [cameraLock]); the exposure preset as [lastAppliedExposure] says. */
     private fun executeCommand(command: ShotMapper.CameraCommand): Boolean {
         val controller = cameraController ?: run {
             Timber.tag(TAG).w("No camera controller set, command not executed")
@@ -653,10 +665,11 @@ class DirectorManager internal constructor(
             // Set focus mode
             controller.setFocusMode(command.focusMode)
 
-            // Set exposure preset, when a cue changed it
-            if (command.exposurePreset != lastAppliedExposure) {
-                controller.setExposurePreset(command.exposurePreset)
-                lastAppliedExposure = command.exposurePreset
+            // Exposure: a preset other than AUTO every time, AUTO when a cue goes back to it
+            val preset = command.exposurePreset
+            if (preset != ExposurePreset.AUTO || lastAppliedExposure != ExposurePreset.AUTO) {
+                controller.setExposurePreset(preset)
+                lastAppliedExposure = preset
             }
 
             Timber.tag(TAG).d("Executed command: ${command.notes}")
@@ -669,13 +682,17 @@ class DirectorManager internal constructor(
 
     /**
      * A [TAKE] cue: the take in progress ends and the next one starts, for the current
-     * scene. [generation] is the run's (null for a cue run by hand).
+     * scene. A take of that scene in which no cue has run yet goes on instead, so a [TAKE]
+     * written at the start of a scene doesn't leave an empty take behind. [generation] is
+     * the run's (null for a cue run by hand).
      */
     private fun takeBoundary(generation: Int?) {
         synchronized(sessionLock) {
             if (generation != null && generation != runGeneration) return
+            val scene = _currentSession.value?.currentScene
+            if (scene != null && takeManager.isUnusedTakeOf(scene.id)) return
             endCurrentTake()
-            _currentSession.value?.currentScene?.let { startTakeFor(it) }
+            scene?.let { startTakeFor(it) }
         }
     }
 
@@ -809,6 +826,13 @@ class DirectorManager internal constructor(
         }
     }
 
+    /** Why a script can't be loaded in the current state, or null when it can. */
+    private fun loadRefusal(): IllegalStateException? = when (_state.value) {
+        DirectorState.DISABLED -> IllegalStateException("The director is off")
+        DirectorState.RUNNING, DirectorState.PAUSED -> IllegalStateException("Stop the director before loading another script")
+        else -> null
+    }
+
     private fun refreshCapabilities() {
         val capabilities = try {
             cameraController?.getCapabilities()
@@ -834,7 +858,7 @@ class DirectorManager internal constructor(
     private fun checkThermalState(fresh: Boolean): Boolean {
         if (!config.thermalAutoDisable) return true
         if (_state.value == DirectorState.THERMAL_HOLD) return false
-        if (!fresh && System.currentTimeMillis() - lastThermalCheckMs < THERMAL_CHECK_INTERVAL_MS) return true
+        if (!fresh && TakeManager.monotonicNowMs() - lastThermalCheckMs < THERMAL_CHECK_INTERVAL_MS) return true
 
         val temp = readTemperature() ?: return true
         if (temp < config.thermalThresholdDisable) return true
@@ -851,7 +875,7 @@ class DirectorManager internal constructor(
             return null
         }
         lastTemperatureC = temp
-        lastThermalCheckMs = System.currentTimeMillis()
+        lastThermalCheckMs = TakeManager.monotonicNowMs()
         return temp
     }
 

@@ -29,16 +29,33 @@ class DirectorManagerTest {
         }
     }
 
-    /** A camera that records what it is asked to do, at a temperature the test sets. */
+    /**
+     * A camera that records what it is asked to do, at a temperature the test sets. Like the
+     * phone, it opens another lens at 0 EV (AUTO), here at once.
+     */
     private class FakeCamera : DirectorManager.CameraController {
         val calls: MutableList<String> = Collections.synchronizedList(mutableListOf())
         val exposures: MutableList<ExposurePreset> = Collections.synchronizedList(mutableListOf())
 
+        /** The exposure each lens had when the camera left it for another, in order. */
+        val exposuresLeft: MutableList<ExposurePreset> = Collections.synchronizedList(mutableListOf())
+
         @Volatile
         var temperature = 35
 
+        @Volatile
+        var lens: String? = null
+
+        @Volatile
+        var exposure = ExposurePreset.AUTO
+
         override fun switchLens(lens: String) {
             calls.add("lens $lens")
+            if (lens != this.lens) {
+                if (this.lens != null) exposuresLeft.add(exposure)
+                this.lens = lens
+                exposure = ExposurePreset.AUTO
+            }
         }
 
         override fun setZoom(level: Float, animated: Boolean, durationMs: Long) {
@@ -51,6 +68,7 @@ class DirectorManagerTest {
 
         override fun setExposurePreset(preset: ExposurePreset) {
             exposures.add(preset)
+            exposure = preset
         }
 
         override fun getCurrentTemperature(): Int = temperature
@@ -252,6 +270,22 @@ class DirectorManagerTest {
     }
 
     @Test
+    fun `quality samples taken while paused do not count`() {
+        director.loadScript("[SCENE: A]\n[SHOT: WIDE]\n[HOLD: 30]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the hold") { cueIndex() == 1 }
+        repeat(4) { director.recordFocusSample(true) }
+
+        director.pauseExecution()
+        repeat(12) { director.recordFocusSample(false) }
+        assertTrue(director.resumeExecution())
+        repeat(4) { director.recordFocusSample(true) }
+        director.stopExecution()
+
+        assertEquals(100, director.getTakeManager().recordedTakes.value.single().qualityFactors.focusLockPercent)
+    }
+
+    @Test
     fun `pause and resume continue the same take`() {
         director.loadScript("[SCENE: A]\n[SHOT: WIDE]\n[HOLD: 30]\n[SHOT: MEDIUM]").getOrThrow()
         assertTrue(director.startExecution())
@@ -306,16 +340,52 @@ class DirectorManagerTest {
     }
 
     @Test
-    fun `exposure is applied only when a cue changes it`() {
+    fun `TAKE at the start of a scene keeps the take the scene just started`() {
         director.loadScript(
-            "[SCENE: A]\n[SHOT: WIDE]\n[SHOT: MEDIUM]\n[EXPOSURE: BACKLIT]\n[SHOT: CLOSE-UP]\n[EXPOSURE: BACKLIT]\n[CUT TO: WIDE]"
+            "[SCENE: A]\n[TAKE: 1]\n[SHOT: WIDE]\n[HOLD: 0.02]\n[TAKE: 2]\n[SHOT: MEDIUM]\n[SCENE: B]\n[TAKE: 3]\n[SHOT: CLOSE-UP]"
         ).getOrThrow()
         assertTrue(director.startExecution())
 
-        await("all six cues") { cuesRun().size == 6 }
+        await("the end") { director.state.value == DirectorState.READY && takeNumbers().size == 3 }
+
+        val takes = director.getTakeManager().recordedTakes.value
+        assertEquals(listOf(1, 2, 3), takes.map { it.takeNumber })
+        assertEquals(listOf(3, 2, 2), takes.map { it.cuesExecuted })
+        await("the take events") {
+            countEvents(DirectorManager.DirectorEvent.TakeStarted::class.java) == 3 &&
+                countEvents(DirectorManager.DirectorEvent.TakeEnded::class.java) == 3
+        }
+    }
+
+    @Test
+    fun `a preset other than AUTO goes with every command, AUTO only when a cue goes back to it`() {
+        director.loadScript(
+            "[SCENE: A]\n[SHOT: WIDE]\n[SHOT: MEDIUM]\n[EXPOSURE: BACKLIT]\n[SHOT: CLOSE-UP]\n[CUT TO: WIDE]\n" +
+                "[EXPOSURE: AUTO]\n[SHOT: MEDIUM]"
+        ).getOrThrow()
+        assertTrue(director.startExecution())
+
+        await("all seven cues") { cuesRun().size == 7 }
         await("the end") { director.state.value == DirectorState.READY }
 
-        assertEquals(listOf(ExposurePreset.BACKLIT), camera.exposures.toList())
+        // The shots before [EXPOSURE] and after the return to AUTO leave the exposure alone
+        val backlit = ExposurePreset.BACKLIT
+        assertEquals(listOf(backlit, backlit, backlit, ExposurePreset.AUTO), camera.exposures.toList())
+    }
+
+    @Test
+    fun `an exposure preset stays on through the lens changes of later shots`() {
+        director.loadScript(
+            "[SCENE: Window]\n[SHOT: MEDIUM]\n[EXPOSURE: BACKLIT]\n[SHOT: WIDE]\n[HOLD: 0.02]\n[SHOT: MEDIUM]\n[HOLD: 0.02]"
+        ).getOrThrow()
+        assertTrue(director.startExecution())
+
+        await("the end") { director.state.value == DirectorState.READY }
+
+        // The wide shot and the medium shot after it each opened a lens at 0 EV, and got BACKLIT back
+        assertEquals(listOf(ExposurePreset.BACKLIT, ExposurePreset.BACKLIT), camera.exposuresLeft.toList())
+        assertEquals("main", camera.lens)
+        assertEquals(ExposurePreset.BACKLIT, camera.exposure)
     }
 
     @Test

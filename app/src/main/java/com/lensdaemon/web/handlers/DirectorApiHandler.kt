@@ -291,7 +291,7 @@ class DirectorApiHandler(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    /** Marks a take: {"takeNumber", "quality"} (or "mark" for the quality). */
+    /** Marks a take: {"takeNumber", "quality"} (or "mark" for the quality); 404 with an error for an unknown take. */
     private fun markTake(body: JSONObject?): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
         body ?: return ApiHandlerUtils.bodyRequired()
@@ -304,10 +304,11 @@ class DirectorApiHandler(
         val quality = try { TakeQuality.valueOf(qualityStr.uppercase()) } catch (e: Exception) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid quality. Use: UNMARKED, GOOD, BAD, CIRCLE, HOLD"}""")
         }
-        val success = director.getTakeManager().markTake(takeNumber, quality, notes)
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.NOT_FOUND, WebServer.MIME_JSON,
-            """{"success": $success, "takeNumber": $takeNumber, "quality": "${quality.name}"}""")
+        val json = JSONObject().put("takeNumber", takeNumber).put("quality", quality.name)
+        if (!director.getTakeManager().markTake(takeNumber, quality, notes)) {
+            return reply(Status.NOT_FOUND, json.put("success", false).put("error", "Take $takeNumber not found"))
+        }
+        return reply(Status.OK, json.put("success", true))
     }
 
     private fun getBestTakes(): NanoHTTPD.Response {
@@ -503,7 +504,11 @@ class DirectorApiHandler(
         }
     }
 
-    /** Returns a saved script and loads it; "loaded" false with an "error" when the director refused it. */
+    /**
+     * Returns a saved script and loads it. Opening the file succeeds even when the director
+     * refuses the script (while it runs, say): "loaded" is then false and "loadError" says
+     * why, outside "error", which marks a failed request.
+     */
     private fun loadScriptFile(uri: String): NanoHTTPD.Response {
         val rawFileName = uri.removePrefix("/api/director/scripts/")
         if (rawFileName.isEmpty() || rawFileName == "save" || rawFileName == "export" || rawFileName == "import") {
@@ -528,7 +533,7 @@ class DirectorApiHandler(
                 .put("content", content)
                 .put("loaded", script != null)
             if (script == null) {
-                json.put("error", loadResult?.exceptionOrNull()?.message ?: "Director service not available")
+                json.put("loadError", loadResult?.exceptionOrNull()?.message ?: "Director service not available")
             }
             NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
         } catch (e: Exception) {

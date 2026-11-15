@@ -1272,4 +1272,49 @@ class ScriptParserTest {
         parser.config = DirectorConfig(defaultHoldDurationMs = 750)
         assertEquals(750L, parser.parseSingleCue("[BEAT]")!!.holdDurationMs)
     }
+
+    // ========================================================================
+    // Bracket text and parsing time
+    // ========================================================================
+
+    @Test
+    fun `unclosed cues followed by long runs of spaces parse in linear time`() {
+        val spaces = " ".repeat(200_000)
+        val script = listOf(
+            "[SHOT: a${spaces}b",
+            "[SCENE: ${spaces}b",
+            "[CUT TO: ${spaces}b",
+            "[TRANSITION: CUT]${spaces}x",
+            "[SHOT: a".repeat(25_000),
+            "[SCENE: A]",
+            "[SHOT: WIDE]"
+        ).joinToString("\n")
+
+        val started = System.nanoTime()
+        val result = parser.parseScript(script)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+        // Each of these lines used to take minutes: the matcher tried every split of the spaces
+        assertTrue("parsing took $elapsedMs ms", elapsedMs < 5_000)
+        assertEquals(2, result.scenes.size)
+        assertEquals(CueType.TRANSITION, result.scenes[0].cues.single().type)
+        assertEquals(CueType.SHOT, result.scenes[1].cues.single().type)
+        assertEquals(listOf(1, 2, 3, 5), result.errors.map { it.substringBefore(":").removePrefix("Line ").toInt() })
+    }
+
+    @Test
+    fun `a scene marker without a label is Untitled`() {
+        val result = parser.parseScript("[SCENE:]\n[SHOT: WIDE]\n[SCENE: ]\n[SHOT: MEDIUM]")
+
+        assertEquals(listOf("Untitled", "Untitled"), result.scenes.map { it.label })
+        assertTrue(result.errors.isEmpty())
+    }
+
+    @Test
+    fun `spaces before the closing bracket are not part of the shot name`() {
+        val result = parser.parseScript("[SHOT: CLOSE-UP  ]\n[CUT TO: WIDE ]")
+
+        assertEquals(listOf(ShotType.CLOSE_UP, ShotType.WIDE), result.scenes[0].cues.map { it.shotType })
+        assertTrue(result.errors.isEmpty())
+    }
 }

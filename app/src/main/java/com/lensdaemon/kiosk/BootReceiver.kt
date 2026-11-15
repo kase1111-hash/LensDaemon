@@ -6,94 +6,128 @@ import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import androidx.core.content.ContextCompat
+import com.lensdaemon.AdminReceiver
+import com.lensdaemon.LensDaemonApp
 import com.lensdaemon.MainActivity
 import com.lensdaemon.camera.CameraService
+import com.lensdaemon.thermal.ThermalService
 import com.lensdaemon.web.WebServerService
 import timber.log.Timber
 
 /**
- * Broadcast receiver to auto-start LensDaemon on device boot.
+ * Starts LensDaemon after the phone boots, when kiosk mode and its auto-start
+ * are on.
  *
- * Handles:
- * - Boot completed detection
- * - Configurable startup delay
- * - Auto-start of camera, streaming, and RTSP services
- * - Kiosk mode reactivation
+ * - At once, while the boot broadcast lets the app start foreground services:
+ *   the web server (dashboard and API) and thermal monitoring. Their foreground
+ *   services also keep the process alive through the delay.
+ * - After autoStart.delaySeconds (clamped to 0-120 s): the app's screen, which
+ *   pins itself again as device owner, and the outputs autoStart asks for, RTSP
+ *   and recording, each on its own, with the saved stream defaults (see
+ *   [CameraService.autoStartIntent]). startStreaming alone starts nothing: an
+ *   encoder with no output serves nobody.
+ *
+ * What Android allows at boot:
+ * - BOOT_COMPLETED arrives only after the first unlock, so restarting
+ *   unattended after a power cut needs a phone without a secure screen lock
+ *   (PIN, pattern or password).
+ * - Without Device Owner, Android 10+ won't open the app's screen from the
+ *   background, and Android 11+ gives a service started at boot no camera, so
+ *   the camera is not started there.
+ *
+ * Boot and auto-start go into the kiosk event log (GET /api/kiosk/events).
+ * After a crash, CameraService brings the outputs back itself (Android's
+ * sticky restart, within the crash recovery budget).
  */
 class BootReceiver : BroadcastReceiver() {
 
     companion object {
         private const val TAG = "BootReceiver"
+
+        /** Set on the boot start of [MainActivity]. */
         const val EXTRA_BOOT_START = "boot_start"
         private const val PREFS_NAME = "lensdaemon_boot"
         private const val KEY_LAST_BOOT_TIME = "last_boot_time"
         private const val KEY_BOOT_COUNT = "boot_count"
+        private const val ACTION_QUICKBOOT_POWERON = "android.intent.action.QUICKBOOT_POWERON"
+
+        /** The longest wait, in seconds, before the app and the camera start. */
+        const val MAX_DELAY_S = 120
+        private const val MS_PER_SECOND = 1000L
     }
 
     private val handler = Handler(Looper.getMainLooper())
 
     override fun onReceive(context: Context, intent: Intent) {
         val action = intent.action
-
-        if (action != Intent.ACTION_BOOT_COMPLETED &&
-            action != "android.intent.action.QUICKBOOT_POWERON") {
-            return
-        }
+        if (action != Intent.ACTION_BOOT_COMPLETED && action != ACTION_QUICKBOOT_POWERON) return
 
         Timber.tag(TAG).i("Boot completed received")
+        val bootNumber = countBoot(context)
 
-        // Load configuration
-        val configStore = KioskConfigStore(context)
-        val config = configStore.loadConfig()
-
-        // Log the boot event
-        logBootEvent(context, config)
-
-        // Check if auto-start is enabled
+        val kiosk = kioskManager(context)
+        val config = kiosk.getConfig()
         if (!config.enabled || !config.autoStart.enabled) {
             Timber.tag(TAG).i("Auto-start disabled, skipping boot sequence")
             return
         }
+        kiosk.recordEvent(KioskEventType.BOOT_COMPLETED, "Phone started (boot $bootNumber)", mapOf("boot" to bootNumber))
 
-        // Get delay before starting
-        val delayMs = config.autoStart.delaySeconds * 1000L
-        Timber.tag(TAG).i("Auto-start enabled, launching in ${config.autoStart.delaySeconds} seconds")
+        // Now, inside the boot broadcast: Android lets a receiver of it start
+        // foreground services from the background, and they keep the process
+        // alive during the delay
+        launchService(context, WebServerService.createStartIntent(context), "web server")
+        launchService(context, ThermalService.createStartIntent(context), "thermal monitoring")
 
-        // Schedule the startup sequence
-        handler.postDelayed({
-            startupSequence(context, config)
-        }, delayMs)
+        val delaySeconds = config.autoStart.delaySeconds.coerceIn(0, MAX_DELAY_S)
+        Timber.tag(TAG).i("Auto-start enabled, opening LensDaemon in $delaySeconds s")
+        val appContext = context.applicationContext
+        val autoStart = config.autoStart
+        handler.postDelayed({ startupSequence(appContext, autoStart) }, delaySeconds * MS_PER_SECOND)
     }
 
     /**
-     * Execute the startup sequence
+     * After the delay: the app's screen, then the camera outputs [autoStart]
+     * asks for. Android 11+ without Device Owner gives a service started at
+     * boot no camera, so the camera is skipped there.
      */
-    private fun startupSequence(context: Context, config: KioskConfig) {
+    private fun startupSequence(context: Context, autoStart: AutoStartConfig) {
         Timber.tag(TAG).i("Executing startup sequence")
+        startMainActivity(context)
 
-        try {
-            // 1. Start the main activity
-            startMainActivity(context)
-
-            // 2. Start web server service (needed for API access)
-            startWebServerService(context)
-
-            // 3. Start streaming (camera, encoder and RTSP server) and, if
-            //    configured, recording alongside it
-            val autoStart = config.autoStart
-            if (autoStart.startStreaming || autoStart.startRtsp || autoStart.startRecording) {
-                startCameraService(context, record = autoStart.startRecording)
-            }
-
-            Timber.tag(TAG).i("Startup sequence completed")
-
-        } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Error during startup sequence")
+        if (!autoStart.startRtsp && !autoStart.startRecording) {
+            Timber.tag(TAG).i("Auto-start: no output to start (startRtsp and startRecording are off)")
+            return
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R && !AdminReceiver.isDeviceOwner(context)) {
+            Timber.tag(TAG).w(
+                "Auto-start: without Device Owner, Android 11+ gives a service started at boot no camera; " +
+                    "not starting it (adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver)"
+            )
+            return
+        }
+        val intent = CameraService.autoStartIntent(
+            context,
+            rtsp = autoStart.startRtsp,
+            record = autoStart.startRecording
+        )
+        if (launchService(context, intent, "camera")) {
+            val outputs = listOfNotNull(
+                "RTSP".takeIf { autoStart.startRtsp },
+                "recording".takeIf { autoStart.startRecording }
+            )
+            kioskManager(context).recordEvent(
+                KioskEventType.AUTO_START,
+                "Auto-start: ${outputs.joinToString(" and ")}",
+                mapOf("rtsp" to autoStart.startRtsp, "record" to autoStart.startRecording)
+            )
         }
     }
 
     /**
-     * Start the main activity
+     * Start the main activity. Android 10+ lets an app open its screen from the
+     * background only as device owner; otherwise this is blocked.
      */
     private fun startMainActivity(context: Context) {
         try {
@@ -110,324 +144,35 @@ class BootReceiver : BroadcastReceiver() {
         }
     }
 
-    /**
-     * Start the camera foreground service serving RTSP, recording too if [record].
-     */
-    private fun startCameraService(context: Context, record: Boolean) {
-        try {
-            val serviceIntent = CameraService.startRtspStreamingIntent(context, record)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
-            }
-            Timber.tag(TAG).i("Camera service started: RTSP${if (record) " + recording" else ""}")
-        } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Failed to start camera service")
-        }
+    /** Start the foreground service [intent] ([what], for the log); false when Android refuses it. */
+    private fun launchService(context: Context, intent: Intent, what: String): Boolean = try {
+        ContextCompat.startForegroundService(context, intent)
+        Timber.tag(TAG).i("Started $what")
+        true
+    } catch (e: IllegalStateException) {
+        // ForegroundServiceStartNotAllowedException (Android 12+) is one
+        Timber.tag(TAG).e(e, "Android refused to start $what")
+        false
+    } catch (e: SecurityException) {
+        Timber.tag(TAG).e(e, "Android refused to start $what")
+        false
     }
 
-    /**
-     * Start the web server foreground service
-     */
-    private fun startWebServerService(context: Context) {
-        try {
-            val serviceIntent = Intent(context, WebServerService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                context.startForegroundService(serviceIntent)
-            } else {
-                context.startService(serviceIntent)
-            }
-            Timber.tag(TAG).d("Web server service started")
-        } catch (e: Exception) {
-            Timber.tag(TAG).e(e, "Failed to start web server service")
-        }
-    }
+    private fun kioskManager(context: Context): KioskManager =
+        (context.applicationContext as LensDaemonApp).kioskManager
 
-    /**
-     * Log the boot event for tracking
-     */
-    private fun logBootEvent(context: Context, config: KioskConfig) {
-        // Store boot timestamp for crash recovery tracking
+    /** Count this boot in the boot preferences; returns its number. */
+    private fun countBoot(context: Context): Int {
         val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val lastBootTime = prefs.getLong(KEY_LAST_BOOT_TIME, 0)
-        val bootCount = prefs.getInt(KEY_BOOT_COUNT, 0)
+        val bootNumber = prefs.getInt(KEY_BOOT_COUNT, 0) + 1
 
         prefs.edit()
             .putLong(KEY_LAST_BOOT_TIME, System.currentTimeMillis())
-            .putInt(KEY_BOOT_COUNT, bootCount + 1)
+            .putInt(KEY_BOOT_COUNT, bootNumber)
             .apply()
 
-        Timber.tag(TAG).i("Boot #${bootCount + 1}, last boot: $lastBootTime")
-    }
-}
-
-/**
- * Crash recovery manager
- *
- * Monitors app crashes and handles automatic restart
- */
-class CrashRecoveryManager(
-    private val context: Context,
-    private val config: CrashRecoveryConfig = CrashRecoveryConfig()
-) {
-    companion object {
-        private const val TAG = "CrashRecoveryManager"
-        private const val PREFS_NAME = "lensdaemon_crash"
-        private const val KEY_CRASH_TIMES = "crash_times"
-        private const val KEY_RESTART_COUNT = "restart_count"
-        const val EXTRA_CRASH_RESTART = "crash_restart"
-    }
-
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-    private val handler = Handler(Looper.getMainLooper())
-
-    /**
-     * Install crash handler
-     */
-    fun install() {
-        val defaultHandler = Thread.getDefaultUncaughtExceptionHandler()
-
-        Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
-            Timber.tag(TAG).e(throwable, "Uncaught exception on thread ${thread.name}")
-
-            recordCrash()
-
-            if (shouldRestart()) {
-                scheduleRestart()
-            }
-
-            // Call default handler (will terminate the app)
-            defaultHandler?.uncaughtException(thread, throwable)
-        }
-
-        Timber.tag(TAG).i("Crash recovery handler installed")
-    }
-
-    /**
-     * Record a crash occurrence
-     */
-    private fun recordCrash() {
-        val crashTimes = getCrashTimes().toMutableList()
-        crashTimes.add(System.currentTimeMillis())
-
-        // Keep only crashes within the window
-        val windowStart = System.currentTimeMillis() - (config.restartWindowMinutes * 60 * 1000L)
-        val recentCrashes = crashTimes.filter { it >= windowStart }
-
-        prefs.edit()
-            .putString(KEY_CRASH_TIMES, recentCrashes.joinToString(","))
-            .apply()
-
-        Timber.tag(TAG).d("Crash recorded, ${recentCrashes.size} crashes in window")
-    }
-
-    /**
-     * Get crash times within the recovery window
-     */
-    private fun getCrashTimes(): List<Long> {
-        val stored = prefs.getString(KEY_CRASH_TIMES, "") ?: ""
-        if (stored.isEmpty()) return emptyList()
-
-        val windowStart = System.currentTimeMillis() - (config.restartWindowMinutes * 60 * 1000L)
-        return stored.split(",")
-            .mapNotNull { it.toLongOrNull() }
-            .filter { it >= windowStart }
-    }
-
-    /**
-     * Check if we should restart after crash
-     */
-    private fun shouldRestart(): Boolean {
-        if (!config.autoRestart) {
-            return false
-        }
-
-        val crashCount = getCrashTimes().size
-        if (config.maxRestartAttempts > 0 && crashCount >= config.maxRestartAttempts) {
-            Timber.tag(TAG).w("Max restart attempts ($config.maxRestartAttempts) exceeded")
-            return false
-        }
-
-        return true
-    }
-
-    /**
-     * Schedule app restart
-     */
-    private fun scheduleRestart() {
-        Timber.tag(TAG).i("Scheduling restart in ${config.restartDelayMs}ms")
-
-        val restartIntent = Intent(context, MainActivity::class.java).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            addFlags(Intent.FLAG_ACTIVITY_CLEAR_TASK)
-            putExtra(CrashRecoveryManager.EXTRA_CRASH_RESTART, true)
-        }
-
-        handler.postDelayed({
-            try {
-                context.startActivity(restartIntent)
-            } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "Failed to restart app")
-            }
-        }, config.restartDelayMs)
-    }
-
-    /**
-     * Get restart count since last boot
-     */
-    fun getRestartCount(): Int {
-        return prefs.getInt(KEY_RESTART_COUNT, 0)
-    }
-
-    /**
-     * Increment restart count (call from MainActivity when recovering)
-     */
-    fun incrementRestartCount() {
-        val count = getRestartCount() + 1
-        prefs.edit().putInt(KEY_RESTART_COUNT, count).apply()
-    }
-
-    /**
-     * Reset restart count (call on clean start)
-     */
-    fun resetRestartCount() {
-        prefs.edit().putInt(KEY_RESTART_COUNT, 0).apply()
-    }
-
-    /**
-     * Clear all crash data
-     */
-    fun clearCrashData() {
-        prefs.edit()
-            .remove(KEY_CRASH_TIMES)
-            .remove(KEY_RESTART_COUNT)
-            .apply()
-    }
-}
-
-/**
- * Network recovery handler
- *
- * Monitors network connectivity and handles reconnection
- */
-class NetworkRecoveryHandler(
-    private val context: Context,
-    private val config: NetworkRecoveryConfig = NetworkRecoveryConfig()
-) {
-    companion object {
-        private const val TAG = "NetworkRecoveryHandler"
-    }
-
-    private val handler = Handler(Looper.getMainLooper())
-    private var reconnectAttempts = 0
-    private var reconnectRunnable: Runnable? = null
-    private var listener: NetworkRecoveryListener? = null
-    private var isConnected = true
-
-    /**
-     * Listener interface
-     */
-    interface NetworkRecoveryListener {
-        fun onNetworkLost()
-        fun onNetworkRecovered()
-        fun onReconnectAttempt(attempt: Int, maxAttempts: Int)
-    }
-
-    /**
-     * Set listener
-     */
-    fun setListener(networkListener: NetworkRecoveryListener?) {
-        this.listener = networkListener
-    }
-
-    /**
-     * Called when network is lost
-     */
-    fun onNetworkLost() {
-        if (!isConnected) return
-        isConnected = false
-
-        Timber.tag(TAG).w("Network lost")
-        listener?.onNetworkLost()
-
-        if (config.autoReconnect) {
-            startReconnectLoop()
-        }
-    }
-
-    /**
-     * Called when network is recovered
-     */
-    fun onNetworkRecovered() {
-        if (isConnected) return
-        isConnected = true
-
-        Timber.tag(TAG).i("Network recovered after $reconnectAttempts attempts")
-        stopReconnectLoop()
-        reconnectAttempts = 0
-        listener?.onNetworkRecovered()
-    }
-
-    /**
-     * Start the reconnection attempt loop
-     */
-    private fun startReconnectLoop() {
-        if (reconnectRunnable != null) return
-
-        reconnectRunnable = object : Runnable {
-            override fun run() {
-                if (isConnected) {
-                    stopReconnectLoop()
-                    return
-                }
-
-                reconnectAttempts++
-
-                if (config.maxReconnectAttempts > 0 && reconnectAttempts > config.maxReconnectAttempts) {
-                    Timber.tag(TAG).w("Max reconnect attempts exceeded")
-                    stopReconnectLoop()
-                    return
-                }
-
-                Timber.tag(TAG).d("Reconnect attempt $reconnectAttempts")
-                listener?.onReconnectAttempt(reconnectAttempts, config.maxReconnectAttempts)
-
-                // Schedule next attempt
-                handler.postDelayed(this, config.reconnectIntervalSec * 1000L)
-            }
-        }
-
-        handler.postDelayed(reconnectRunnable!!, config.reconnectIntervalSec * 1000L)
-    }
-
-    /**
-     * Stop the reconnection loop
-     */
-    private fun stopReconnectLoop() {
-        reconnectRunnable?.let { handler.removeCallbacks(it) }
-        reconnectRunnable = null
-    }
-
-    /**
-     * Get current reconnect attempts
-     */
-    fun getReconnectAttempts(): Int = reconnectAttempts
-
-    /**
-     * Reset state
-     */
-    fun reset() {
-        stopReconnectLoop()
-        reconnectAttempts = 0
-        isConnected = true
-    }
-
-    /**
-     * Release resources
-     */
-    fun release() {
-        stopReconnectLoop()
-        listener = null
+        Timber.tag(TAG).i("Boot #$bootNumber, last boot: $lastBootTime")
+        return bootNumber
     }
 }

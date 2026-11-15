@@ -23,19 +23,32 @@ import com.lensdaemon.director.asMetricsSink
 import com.lensdaemon.director.asMetricsSource
 import com.lensdaemon.storage.UploadService
 import com.lensdaemon.thermal.ThermalService
+import com.lensdaemon.thermal.ThrottleAction
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.ExecutorCoroutineDispatcher
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.util.concurrent.Executors
 
 /**
  * Foreground service for the embedded HTTP web server.
  * Serves the dashboard UI and REST API endpoints.
+ *
+ * It also connects the services: the thermal governor's throttling reaches the
+ * camera through here (a bitrate cut, lower resolution and frame rate at
+ * CRITICAL, and at EMERGENCY a pause that restarts the same outputs once the
+ * phone has cooled down), and the AI Director's take scoring samples the
+ * camera while a take runs.
  */
 class WebServerService : Service() {
 
@@ -66,6 +79,11 @@ class WebServerService : Service() {
     // Coroutine scope
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
 
+    // Thermal throttling calls into the camera run here, one at a time and in the order
+    // the governor made them: they may block while the encoder restarts, so never on Main
+    private val thermalDispatcher: ExecutorCoroutineDispatcher =
+        Executors.newSingleThreadExecutor { task -> Thread(task, "LensDaemon-thermal") }.asCoroutineDispatcher()
+
     // Web server components
     private var webServer: WebServer? = null
     private var apiRoutes: ApiRoutes? = null
@@ -76,7 +94,11 @@ class WebServerService : Service() {
     private var cameraControllerAdapter: CameraControllerAdapter? = null
     private var qualityMetricsCollector: QualityMetricsCollector? = null
 
-    // Camera service connection
+    // Starts and stops the quality metrics collection with the director's takes
+    private var takeWatchJob: Job? = null
+
+    // Camera service connection; read on the thermal thread too
+    @Volatile
     private var cameraService: CameraService? = null
     private var cameraBound = false
 
@@ -100,6 +122,9 @@ class WebServerService : Service() {
 
             // Set up AI Director integration
             setupDirectorIntegration()
+
+            // Throttling the governor applied before the camera was connected
+            pushThermalStateToCamera()
 
             Timber.i("$TAG: CameraService connected")
         }
@@ -149,47 +174,32 @@ class WebServerService : Service() {
     private val thermalConnection = object : ServiceConnection {
         override fun onServiceConnected(name: ComponentName?, service: IBinder?) {
             val binder = service as ThermalService.ThermalBinder
-            thermalService = binder.getService()
+            val thermal = binder.getService()
+            thermalService = thermal
             thermalBound = true
 
             // Connect thermal governor to API routes
-            apiRoutes?.thermalGovernor = thermalService?.getGovernor()
+            apiRoutes?.thermalGovernor = thermal.getGovernor()
 
-            // Wire thermal throttle callbacks to camera service
-            thermalService?.onReduceBitrate = reduceBitrate@{ percent ->
-                val camera = cameraService ?: return@reduceBitrate
-                // A share of the configured bitrate (bitrate changes leave the configuration
-                // as it was), so a 0% reduction restores it instead of keeping the throttled rate
-                val configured = camera.getEncoderConfig()?.bitrateBps ?: return@reduceBitrate
-                val newBitrate = (configured.toLong() * (100 - percent) / 100).coerceAtLeast(500_000L)
-                camera.updateEncoderBitrate(newBitrate.toInt())
-                Timber.w("$TAG: Thermal throttle: bitrate at ${100 - percent}% of $configured bps: $newBitrate bps")
-            }
-
-            thermalService?.onPauseStreaming = {
-                cameraService?.stopStreaming()
-                Timber.w("$TAG: Thermal throttle: paused streaming")
-            }
-
-            thermalService?.onResumeStreaming = {
-                Timber.i("$TAG: Thermal throttle: resume streaming (requires manual restart)")
-            }
-
-            thermalService?.onRestoreSettings = {
-                Timber.i("$TAG: Thermal throttle: settings restored to normal")
-            }
+            // Throttling from now on, and what the governor applied before it was connected
+            wireThermalCallbacks(thermal)
+            pushThermalStateToCamera()
 
             Timber.i("$TAG: ThermalService connected")
         }
 
         override fun onServiceDisconnected(name: ComponentName?) {
-            thermalService?.onReduceBitrate = null
-            thermalService?.onPauseStreaming = null
-            thermalService?.onResumeStreaming = null
-            thermalService?.onRestoreSettings = null
+            thermalService?.let { clearThermalCallbacks(it) }
             thermalService = null
             thermalBound = false
             apiRoutes?.thermalGovernor = null
+
+            // Nothing watches the temperatures any more: lift every throttle, as the governor does when it stops
+            launchThermal { camera ->
+                camera.setThermalBitrateReduction(0)
+                camera.setThermalEncoderLimits(reduceResolution = false, reduceFramerate = false)
+                camera.resumeAfterThermal()
+            }
             Timber.i("$TAG: ThermalService disconnected")
         }
     }
@@ -249,7 +259,72 @@ class WebServerService : Service() {
         unbindUploadService()
         unbindThermalService()
         serviceScope.cancel()
+        thermalDispatcher.close()
         Timber.i("$TAG: Service destroyed")
+    }
+
+    // ==================== Thermal throttling ====================
+
+    /**
+     * Pass the governor's throttling on to the camera, each change on the
+     * thermal thread in the order the governor made it: the bitrate cut, the
+     * CRITICAL resolution and frame-rate limits, and the EMERGENCY pause,
+     * which stops every output and restarts the same ones once the phone has
+     * cooled down (the governor resumes only after the hysteresis, and only
+     * when neither the CPU nor the battery is at EMERGENCY).
+     */
+    private fun wireThermalCallbacks(thermal: ThermalService) {
+        thermal.onReduceBitrate = { percent -> launchThermal { it.setThermalBitrateReduction(percent) } }
+        thermal.onEncoderLimits = { resolution, framerate ->
+            launchThermal { it.setThermalEncoderLimits(resolution, framerate) }
+        }
+        thermal.onPauseStreaming = { launchThermal { it.pauseForThermal() } }
+        thermal.onResumeStreaming = { launchThermal { it.resumeAfterThermal() } }
+        thermal.onRestoreSettings = { Timber.i("$TAG: Thermal throttling lifted") }
+    }
+
+    private fun clearThermalCallbacks(thermal: ThermalService) {
+        thermal.onReduceBitrate = null
+        thermal.onEncoderLimits = null
+        thermal.onPauseStreaming = null
+        thermal.onResumeStreaming = null
+        thermal.onRestoreSettings = null
+    }
+
+    /**
+     * Bring the camera in line with the governor's current throttling: the
+     * governor reports changes only as they happen, so those made before both
+     * services were connected would otherwise be lost. A pause goes first and
+     * a resume last, as the governor orders them, so outputs aren't restarted
+     * only to be stopped and resumed ones start within the limits.
+     */
+    private fun pushThermalStateToCamera() {
+        val thermal = thermalService ?: return
+        if (cameraService == null) return
+        val status = thermal.getStatus()
+        val paused = ThrottleAction.PAUSE_STREAMING in status.activeActions
+        launchThermal { camera ->
+            if (paused) camera.pauseForThermal()
+            camera.setThermalBitrateReduction(status.bitrateReductionPercent)
+            camera.setThermalEncoderLimits(status.resolutionReduced, status.framerateReduced)
+            if (!paused) camera.resumeAfterThermal()
+        }
+    }
+
+    /**
+     * Run [block] with the camera on the thermal thread, after every block
+     * launched before it; skipped while no camera is connected. A failure is
+     * logged rather than taking the app down.
+     */
+    private fun launchThermal(block: (CameraService) -> Unit) {
+        serviceScope.launch(thermalDispatcher) {
+            val camera = cameraService ?: return@launch
+            try {
+                block(camera)
+            } catch (e: RuntimeException) {
+                Timber.e(e, "$TAG: Thermal throttling could not be applied to the camera")
+            }
+        }
     }
 
     /**
@@ -259,28 +334,39 @@ class WebServerService : Service() {
         if (!BuildConfig.ENABLE_DIRECTOR) return
         val camera = cameraService ?: return
 
-        // Create director manager
-        directorManager = DirectorManager(this)
+        // The director drives the camera through the adapter, within the camera's capabilities
+        val director = DirectorManager(this)
+        val adapter = CameraControllerAdapter(camera)
+        director.setCameraController(adapter)
+        director.getShotMapper().updateCapabilities(adapter.getCameraCapabilities())
 
-        // Create camera controller adapter
-        cameraControllerAdapter = CameraControllerAdapter(camera)
-
-        // Connect director to camera controller
-        directorManager?.setCameraController(cameraControllerAdapter)
-
-        // Update shot mapper with camera capabilities
-        cameraControllerAdapter?.let { adapter ->
-            directorManager?.getShotMapper()?.updateCapabilities(adapter.getCameraCapabilities())
+        // Quality samples go from the camera to the take manager, which scores each take
+        val takeManager = director.getTakeManager()
+        val collector = QualityMetricsCollector().apply {
+            setSource(adapter.asMetricsSource())
+            setSink(takeManager.asMetricsSink())
         }
 
-        // Set up quality metrics collector
-        qualityMetricsCollector = QualityMetricsCollector().apply {
-            cameraControllerAdapter?.let { setSource(it.asMetricsSource()) }
-            directorManager?.getTakeManager()?.let { setSink(it.asMetricsSink()) }
+        directorManager = director
+        cameraControllerAdapter = adapter
+        qualityMetricsCollector = collector
+
+        // Sample the camera while a take runs, so each take is scored on its own footage
+        takeWatchJob = serviceScope.launch {
+            takeManager.currentTake
+                .map { it != null }
+                .distinctUntilChanged()
+                .collect { inTake ->
+                    if (inTake) {
+                        collector.startCollection()
+                    } else if (collector.isCollecting.value) {
+                        collector.stopCollection()
+                    }
+                }
         }
 
         // Connect director to API routes
-        apiRoutes?.directorManager = directorManager
+        apiRoutes?.directorManager = director
 
         Timber.i("$TAG: AI Director integration set up")
     }
@@ -289,6 +375,9 @@ class WebServerService : Service() {
      * Clean up AI Director integration
      */
     private fun cleanupDirectorIntegration() {
+        takeWatchJob?.cancel()
+        takeWatchJob = null
+
         qualityMetricsCollector?.destroy()
         qualityMetricsCollector = null
 
@@ -392,9 +481,11 @@ class WebServerService : Service() {
     }
 
     /**
-     * Unbind from thermal service
+     * Unbind from thermal service, which may live on (started, or bound by the
+     * activity): its throttling then no longer calls into this service
      */
     private fun unbindThermalService() {
+        thermalService?.let { clearThermalCallbacks(it) }
         if (thermalBound) {
             unbindService(thermalConnection)
             thermalBound = false
@@ -500,7 +591,7 @@ class WebServerService : Service() {
     fun getDirectorManager(): DirectorManager? = directorManager
 
     /**
-     * Get quality metrics collector
+     * Get quality metrics collector; it collects while a director take runs
      */
     fun getQualityMetricsCollector(): QualityMetricsCollector? = qualityMetricsCollector
 
@@ -508,18 +599,4 @@ class WebServerService : Service() {
      * Check if AI Director is enabled
      */
     fun isDirectorEnabled(): Boolean = directorManager?.isEnabled() ?: false
-
-    /**
-     * Start quality metrics collection (call when recording/streaming)
-     */
-    fun startQualityMetricsCollection() {
-        qualityMetricsCollector?.startCollection()
-    }
-
-    /**
-     * Stop quality metrics collection
-     */
-    fun stopQualityMetricsCollection() {
-        qualityMetricsCollector?.stopCollection()
-    }
 }

@@ -2,6 +2,7 @@ package com.lensdaemon.kiosk
 
 import android.text.InputType
 import android.view.KeyEvent
+import android.view.WindowManager
 import android.widget.EditText
 import android.widget.Toast
 import androidx.appcompat.app.AlertDialog
@@ -20,7 +21,16 @@ import timber.log.Timber
  * follows that setting: pinned with lock task mode when kiosk mode is on and
  * LensDaemon is the device owner, unpinned when it is turned off. Someone at the
  * phone can leave kiosk mode by holding Volume Up + Volume Down (5 seconds by
- * default), then entering the exit PIN if one is set.
+ * default), then entering the exit PIN if one is set; the gesture and every PIN
+ * attempt go into the kiosk event log.
+ *
+ * It also owns the screen. FLAG_KEEP_SCREEN_ON is set, except while pinned with
+ * keepScreenOn off or screen mode OFF: then the phone's own screen timeout turns
+ * the display off. Nothing locks the phone, so Vol Up + Vol Down stays within
+ * reach once someone wakes it. While pinned, DIM and BLACK are applied through
+ * [ScreenController], also when the settings change while pinned; unpinning
+ * brings the normal preview back. The auto-off timer (autoOffTimeoutSec) is not
+ * used.
  */
 class KioskActivityController(
     private val activity: AppCompatActivity,
@@ -29,6 +39,10 @@ class KioskActivityController(
     private var security: SecurityConfig = kioskManager.getConfig().security
     private var exitGesture: ButtonOverrideHandler = newExitGesture(security)
     private val pinCheck = PinEntryHandler()
+    private val screen = ScreenController(activity.applicationContext)
+
+    /** The screen settings applied while pinned; null while not pinned. */
+    private var appliedScreen: ScreenConfig? = null
 
     /** Follow the kiosk setting whenever the activity is in the foreground. */
     fun attach() {
@@ -51,21 +65,50 @@ class KioskActivityController(
 
     fun release() {
         exitGesture.release()
+        screen.release()
     }
 
+    /** Runs on every resume and every settings change while resumed. */
     private fun follow(config: KioskConfig) {
         if (config.security != security) {
             security = config.security
             exitGesture.release()
             exitGesture = newExitGesture(security)
         }
-        val pinned = kioskManager.isLockTaskActive()
+        var pinned = kioskManager.isLockTaskActive()
         if (config.enabled && !pinned && kioskManager.isDeviceOwner()) {
             Timber.i("Kiosk mode is on: pinning LensDaemon to the screen")
-            kioskManager.enableKiosk(activity)
+            pinned = kioskManager.enableKiosk(activity)
         } else if (!config.enabled && pinned) {
             Timber.i("Kiosk mode is off: unpinning LensDaemon")
             kioskManager.disableKiosk(activity)
+            pinned = kioskManager.isLockTaskActive()
+        }
+        applyScreen(config, pinned)
+    }
+
+    /**
+     * The screen for [config]: its mode while [pinned] (when it changed since
+     * last applied), the normal preview once unpinned, and keep-screen-on.
+     * OFF shows the preview and lets the screen timeout turn the display off:
+     * ScreenController's OFF locks the phone, and since this runs on every
+     * resume, the phone would lock again before Vol Up + Vol Down could be held.
+     */
+    private fun applyScreen(config: KioskConfig, pinned: Boolean) {
+        if (pinned && config.screen != appliedScreen) {
+            screen.configure(config.screen.copy(autoOffTimeoutSec = 0))
+            screen.applyMode(activity, if (config.screen.mode == ScreenMode.OFF) ScreenMode.PREVIEW else config.screen.mode)
+            appliedScreen = config.screen
+        } else if (!pinned && appliedScreen != null) {
+            screen.applyMode(activity, ScreenMode.PREVIEW)
+            appliedScreen = null
+        }
+        // Last, because applyMode may have set the flag
+        val keepOn = !config.enabled || !pinned || (config.screen.keepScreenOn && config.screen.mode != ScreenMode.OFF)
+        if (keepOn) {
+            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        } else {
+            activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         }
     }
 
@@ -79,6 +122,11 @@ class KioskActivityController(
 
     private fun onExitRequested() {
         val pin = kioskManager.getConfig().security.exitPin
+        kioskManager.recordEvent(
+            KioskEventType.EXIT_GESTURE_DETECTED,
+            "Exit gesture held at the phone",
+            mapOf("pinRequired" to pin.isNotEmpty())
+        )
         if (pin.isEmpty()) {
             leaveKiosk()
         } else {
@@ -103,7 +151,13 @@ class KioskActivityController(
                 pinCheck.setPin(pin)
                 pinCheck.clear()
                 input.text.forEach { pinCheck.addDigit(it) }
-                if (pinCheck.submit()) {
+                val correct = pinCheck.submit()
+                kioskManager.recordEvent(
+                    KioskEventType.EXIT_PIN_ENTERED,
+                    if (correct) "Correct exit PIN entered at the phone" else "Wrong exit PIN entered at the phone",
+                    mapOf("correct" to correct)
+                )
+                if (correct) {
                     leaveKiosk()
                 } else {
                     Toast.makeText(activity, "Wrong PIN", Toast.LENGTH_SHORT).show()
@@ -113,9 +167,11 @@ class KioskActivityController(
             .show()
     }
 
+    /** Unpin and turn kiosk mode off; the screen comes back to normal at once. */
     private fun leaveKiosk() {
         Timber.i("Leaving kiosk mode from the phone")
         kioskManager.disableKiosk(activity)
+        applyScreen(kioskManager.getConfig(), kioskManager.isLockTaskActive())
     }
 
     private companion object {

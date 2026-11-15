@@ -1,9 +1,7 @@
 package com.lensdaemon.camera
 
-import android.graphics.PointF
 import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.params.MeteringRectangle
@@ -11,17 +9,20 @@ import android.util.Size
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import timber.log.Timber
-import kotlin.math.roundToInt
 
 /**
  * Controls camera focus including tap-to-focus, continuous autofocus,
  * and manual focus distance.
+ *
+ * Tap-to-focus keeps continuous video autofocus running and points it at the
+ * tapped region; nothing reports the camera's focus state back yet (no
+ * capture callback), so [focusState] does not follow a tap.
  */
 class FocusController {
 
     companion object {
-        // Metering region size as percentage of sensor area
-        private const val DEFAULT_METERING_WEIGHT = 1000
+        // Metering region size as a share of the picture's width and height
+        private const val DEFAULT_METERING_WEIGHT = MeteringRectangle.METERING_WEIGHT_MAX
         private const val TAP_REGION_SIZE_PERCENT = 0.1f
         private const val FOCUS_LOCK_TIMEOUT_MS = 3000L
     }
@@ -59,6 +60,8 @@ class FocusController {
      */
     fun initialize(characteristics: CameraCharacteristics) {
         sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        // A tap region of the previous lens is in that lens's coordinates
+        currentAfRegions = null
 
         val afModes = characteristics.get(CameraCharacteristics.CONTROL_AF_AVAILABLE_MODES)
             ?: intArrayOf()
@@ -89,11 +92,17 @@ class FocusController {
     }
 
     /**
-     * Trigger tap-to-focus at the specified normalized coordinates.
+     * Tap-to-focus at the specified normalized coordinates: continuous video
+     * autofocus stays on and looks at the tapped region, mapped onto the
+     * sensor's 16:9 picture band by [MeteringRegions.tapRect]. Lenses without
+     * continuous video autofocus get no tap-to-focus (an AUTO-only lens would
+     * need a one-shot AF trigger, which is not wired), so autofocus is left as
+     * it is.
      * @param x Normalized X coordinate (0.0 to 1.0, left to right)
      * @param y Normalized Y coordinate (0.0 to 1.0, top to bottom)
-     * @param previewSize The size of the preview for coordinate conversion
-     * @return The focus mode to apply, or null if not supported
+     * @param previewSize Not used: the picture is taken to be the stream's 16:9 view
+     * @return CONTINUOUS_VIDEO with the AF region to apply (trigger IDLE), or
+     *   null if not supported
      */
     fun triggerTapToFocus(x: Float, y: Float, previewSize: Size): FocusTriggerResult? {
         val sensor = sensorArraySize ?: run {
@@ -101,39 +110,24 @@ class FocusController {
             return null
         }
 
-        if (FocusMode.AUTO !in supportedFocusModes) {
-            Timber.w("Auto focus not supported")
+        if (FocusMode.CONTINUOUS_VIDEO !in supportedFocusModes) {
+            Timber.w("Tap-to-focus needs continuous video autofocus, which this lens lacks")
             return null
         }
 
-        // Convert normalized coordinates to sensor coordinates
-        val sensorX = (x * sensor.width()).roundToInt()
-        val sensorY = (y * sensor.height()).roundToInt()
+        val rect = MeteringRegions.tapRect(x, y, sensor.width(), sensor.height(), sizeFraction = TAP_REGION_SIZE_PERCENT)
+        val region = MeteringRectangle(rect.toRect(), DEFAULT_METERING_WEIGHT)
 
-        // Calculate metering region
-        val regionWidth = (sensor.width() * TAP_REGION_SIZE_PERCENT).roundToInt()
-        val regionHeight = (sensor.height() * TAP_REGION_SIZE_PERCENT).roundToInt()
+        currentAfRegions = arrayOf(region)
+        _focusMode.value = FocusMode.CONTINUOUS_VIDEO
+        _focusLocked.value = false
 
-        val left = (sensorX - regionWidth / 2).coerceIn(0, sensor.width() - regionWidth)
-        val top = (sensorY - regionHeight / 2).coerceIn(0, sensor.height() - regionHeight)
-        val right = left + regionWidth
-        val bottom = top + regionHeight
-
-        val meteringRect = MeteringRectangle(
-            Rect(left, top, right, bottom),
-            DEFAULT_METERING_WEIGHT
-        )
-
-        currentAfRegions = arrayOf(meteringRect)
-        _focusState.value = FocusState.SCANNING
-        _focusMode.value = FocusMode.AUTO
-
-        Timber.i("Tap-to-focus at ($x, $y) -> sensor ($sensorX, $sensorY)")
+        Timber.i("Tap-to-focus at ($x, $y) -> sensor region ${rect.joinToString()}")
 
         return FocusTriggerResult(
-            mode = FocusMode.AUTO,
-            regions = currentAfRegions!!,
-            triggerAction = CaptureRequest.CONTROL_AF_TRIGGER_START
+            mode = FocusMode.CONTINUOUS_VIDEO,
+            regions = arrayOf(region),
+            triggerAction = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
         )
     }
 
@@ -242,9 +236,10 @@ class FocusController {
     fun getAfRegions(): Array<MeteringRectangle>? = currentAfRegions
 
     /**
-     * Check if tap-to-focus is supported.
+     * Check if tap-to-focus is supported: the lens offers continuous video
+     * autofocus, which follows the tapped region.
      */
-    fun isTapToFocusSupported(): Boolean = FocusMode.AUTO in supportedFocusModes
+    fun isTapToFocusSupported(): Boolean = FocusMode.CONTINUOUS_VIDEO in supportedFocusModes
 
     /**
      * Check if manual focus is supported.

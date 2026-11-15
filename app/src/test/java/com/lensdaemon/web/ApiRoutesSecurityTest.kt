@@ -1,6 +1,8 @@
 package com.lensdaemon.web
 
 import com.lensdaemon.web.handlers.ApiHandlerUtils
+import fi.iki.elonen.NanoHTTPD.Response.Status
+import org.json.JSONObject
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.File
@@ -124,5 +126,25 @@ class ApiRoutesSecurityTest {
     fun `unicode normalization attack is blocked`() {
         // Various unicode tricks that could bypass path validation
         assertNull(callSanitize("\u2025/etc/passwd"))  // TWO DOT LEADER
+    }
+
+    // ==================== Error bodies ====================
+
+    @Test
+    fun `errorJson stays valid JSON whatever the message holds`() {
+        val message = "Invalid destination: \"S3\", \\\\server\\share\nnext line </script> café"
+        val response = ApiHandlerUtils.errorJson(Status.BAD_REQUEST, message)
+        assertEquals(Status.BAD_REQUEST, response.status)
+        val body = JSONObject(response.data.readBytes().toString(Charsets.UTF_8))
+        assertEquals(message, body.getString("error"))
+        assertEquals(1, body.length())
+    }
+
+    @Test
+    fun `serviceUnavailable names the service`() {
+        val response = ApiHandlerUtils.serviceUnavailable("Camera service")
+        assertEquals(Status.SERVICE_UNAVAILABLE, response.status)
+        val body = JSONObject(response.data.readBytes().toString(Charsets.UTF_8))
+        assertEquals("Camera service not available", body.getString("error"))
     }
 }

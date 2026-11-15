@@ -19,6 +19,8 @@ internal object StatusReport {
         put("previewActive", camera?.isPreviewActive() ?: false)
         put("streamingActive", camera?.isStreaming() ?: false)
         put("currentLens", camera?.getCurrentLens()?.value?.lensType?.name ?: "none")
+        // The phone got too hot: the outputs it stopped come back once it has cooled down
+        put("thermalPaused", camera?.isThermalPaused() ?: false)
         put("zoom", camera?.currentZoom?.value ?: 1.0f)
         if (camera != null) {
             put("maxZoom", camera.getMaxZoom())
@@ -66,9 +68,13 @@ internal object StatusReport {
         }
     }
 
-    fun recording(camera: CameraService?): JSONObject = JSONObject().apply {
-        put("active", camera?.isRecording() ?: false)
-        put("paused", camera?.isRecordingPaused() ?: false)
+    /** "active" while a recording is open, running or paused; "paused" while it is paused. */
+    fun recording(camera: CameraService?): JSONObject {
+        val paused = camera?.isRecordingPaused() ?: false
+        return JSONObject().apply {
+            put("active", (camera?.isRecording() ?: false) || paused)
+            put("paused", paused)
+        }
     }
 
     /** Temperatures and throttling at a glance; GET /api/thermal/status has the detail. */

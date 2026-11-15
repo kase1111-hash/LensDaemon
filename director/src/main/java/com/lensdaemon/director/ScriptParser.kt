@@ -18,9 +18,11 @@ import java.util.regex.Pattern
  * - [TAKE: {number}]
  * - [CUT TO: shot]
  *
- * One cue per line. [parseScript] reports what it could not use in [ParsedScript.errors]:
- * bracketed lines that are not cues, unknown shot names (which become MEDIUM) and lines
- * with more than one cue (only the first is used). Lines of plain prose are narration.
+ * One cue per line, and the text inside a cue's brackets holds no other bracket. A scene
+ * marker without a label is "Untitled". [parseScript] reports what it could not use in
+ * [ParsedScript.errors]: bracketed lines that are not cues, unknown shot names (which become
+ * MEDIUM) and lines with more than one cue (only the first is used). Lines of plain prose
+ * are narration. Parsing takes time in proportion to the script's length.
  */
 class ScriptParser(
     config: DirectorConfig = DirectorConfig.DEFAULT
@@ -31,20 +33,23 @@ class ScriptParser(
         /** At most this many problems are listed one by one; the rest are counted. */
         private const val MAX_LISTED_PROBLEMS = 10
 
-        // Regex patterns for cue detection
+        // Regex patterns for cue detection. Patterns with free text in the brackets read it
+        // with possessive quantifiers that stop at the next bracket, so matching a line takes
+        // time in proportion to its length: an unclosed cue followed by a long run of text or
+        // spaces can't make the matcher retry every way of splitting it.
         private val SCENE_PATTERN = Pattern.compile(
-            """\[SCENE[:\s]+(.+?)\]""",
+            """\[SCENE[:\s]++([^\[\]]*+)\]""",
             Pattern.CASE_INSENSITIVE
         )
 
-        // Any shot name: unknown ones are reported and become MEDIUM
+        // Any shot name (the text up to the bracket, trimmed): unknown ones are reported and become MEDIUM
         private val SHOT_PATTERN = Pattern.compile(
-            """\[SHOT[:\s]+([^\]\s][^\]]*?)\s*\]""",
+            """\[SHOT[:\s]++([^\[\]\s][^\[\]]*+)\]""",
             Pattern.CASE_INSENSITIVE
         )
 
         private val TRANSITION_PATTERN = Pattern.compile(
-            """\[TRANSITION[:\s]+(PUSH[_\s]?IN|PULL[_\s]?BACK|RACK[_\s]?FOCUS|CUT|HOLD)\](?:\s*-?\s*(\d+(?:\.\d+)?)\s*s?)?""",
+            """\[TRANSITION[:\s]+(PUSH[_\s]?IN|PULL[_\s]?BACK|RACK[_\s]?FOCUS|CUT|HOLD)\](?:\s*+-?\s*+(\d+(?:\.\d+)?)\s*s?)?""",
             Pattern.CASE_INSENSITIVE
         )
 
@@ -68,8 +73,9 @@ class ScriptParser(
             Pattern.CASE_INSENSITIVE
         )
 
+        // Any shot name, as for SHOT
         private val CUT_TO_PATTERN = Pattern.compile(
-            """\[CUT\s+TO[:\s]+(WIDE|MEDIUM|CLOSE[_\s]?UP|ESTABLISHING|.+?)\]""",
+            """\[CUT\s++TO[:\s]++([^\[\]\s][^\[\]]*+)\]""",
             Pattern.CASE_INSENSITIVE
         )
 
@@ -139,7 +145,7 @@ class ScriptParser(
 
                 // Start new scene
                 currentScene = DirectorScene(
-                    label = sceneMatcher.group(1)?.trim() ?: "Untitled",
+                    label = sceneMatcher.group(1)?.trim().orEmpty().ifEmpty { "Untitled" },
                     description = extractDescription(trimmedLine, sceneMatcher.end()),
                     startLine = lineNumber
                 )

@@ -6,6 +6,7 @@ import android.content.Context
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.lensdaemon.kiosk.KioskConfig
+import com.lensdaemon.kiosk.KioskEventType
 import com.lensdaemon.kiosk.KioskManager
 import com.lensdaemon.kiosk.KioskState
 import org.junit.Assert.*
@@ -76,5 +77,29 @@ class KioskModeSmokeTest {
 
         val interactiveConfig = KioskConfig.INTERACTIVE
         assertNotNull("Interactive preset should load", interactiveConfig)
+    }
+
+    /** Applying a preset (the setup wizard does on every activation) must not remove the exit PIN. */
+    @Test
+    fun presetsKeepTheExitPin() {
+        val original = kioskManager.getConfig()
+        try {
+            kioskManager.updateConfig(original.copy(security = original.security.copy(exitPin = "2468")))
+
+            kioskManager.applyAppliancePreset()
+            assertEquals("2468", kioskManager.getConfig().security.exitPin)
+            assertEquals(original.enabled, kioskManager.getConfig().enabled)
+            assertEquals(KioskConfig.APPLIANCE.screen, kioskManager.getConfig().screen)
+
+            kioskManager.applyInteractivePreset()
+            assertEquals("2468", kioskManager.getConfig().security.exitPin)
+            assertEquals(original.enabled, kioskManager.getConfig().enabled)
+            assertEquals(KioskConfig.INTERACTIVE.screen, kioskManager.getConfig().screen)
+
+            // Both preset changes are in the event log
+            assertTrue(kioskManager.getEventLog().count { it.type == KioskEventType.PRESET_APPLIED } >= 2)
+        } finally {
+            kioskManager.updateConfig(original)
+        }
     }
 }

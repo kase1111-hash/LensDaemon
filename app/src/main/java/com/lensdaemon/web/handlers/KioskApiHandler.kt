@@ -6,8 +6,9 @@ import com.lensdaemon.kiosk.KioskConfig
 import com.lensdaemon.kiosk.KioskManager
 import com.lensdaemon.kiosk.NetworkRecoveryConfig
 import com.lensdaemon.kiosk.ScreenConfig
-import com.lensdaemon.kiosk.ScreenMode
 import com.lensdaemon.kiosk.SecurityConfig
+import com.lensdaemon.kiosk.exitPinError
+import com.lensdaemon.kiosk.parseScreenMode
 import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
@@ -22,6 +23,13 @@ import org.json.JSONObject
 class KioskApiHandler(
     var kioskManager: KioskManager? = null
 ) {
+
+    private companion object {
+        const val MAX_BRIGHTNESS = 255
+        const val NO_DEVICE_OWNER_MESSAGE = "Kiosk mode is on, but without Device Owner LensDaemon can't lock the " +
+            "screen, and Android won't open its screen or (Android 11+) its camera by itself after a reboot: " +
+            "adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver"
+    }
 
     /**
      * Handle a kiosk API request.
@@ -45,6 +53,11 @@ class KioskApiHandler(
         }
     }
 
+    /**
+     * State and a summary of the settings. restartCount and lastRestartTime
+     * count the automatic restarts after a crash, kept across restarts;
+     * isScreenLocked is always false (kiosk mode never locks the screen).
+     */
     private fun getKioskStatus(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         val status = kiosk.getStatus()
@@ -60,13 +73,15 @@ class KioskApiHandler(
             put("autoStartEnabled", status.config.autoStart.enabled)
             put("screenMode", status.config.screen.mode.name)
         }
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        return ok(json)
     }
 
     /**
      * Turn kiosk mode on: LensDaemon starts on boot and, when it is the device
      * owner, pins itself to the screen at once. Without Device Owner the screen
-     * cannot be locked, which the answer says (lockTask: false).
+     * cannot be locked, and Android won't let LensDaemon open its screen (or on
+     * Android 11+ its camera) by itself at boot, which the answer says
+     * (lockTask: false).
      */
     private fun enableKiosk(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
@@ -80,22 +95,18 @@ class KioskApiHandler(
                 if (deviceOwner) {
                     "Kiosk mode on: LensDaemon is pinned to the screen and starts on boot"
                 } else {
-                    "LensDaemon will start on boot, but it cannot lock the screen until it is the device owner: " +
-                        "adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver"
+                    NO_DEVICE_OWNER_MESSAGE
                 }
             )
         }
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        return ok(json)
     }
 
     /** Turn kiosk mode off: LensDaemon unpins itself and no longer starts on boot. */
     private fun disableKiosk(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         kiosk.requestKioskMode(false)
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Kiosk mode off: LensDaemon is unpinned and no longer starts on boot"}"""
-        )
+        return success("Kiosk mode off: LensDaemon is unpinned and no longer starts on boot")
     }
 
     private fun getKioskConfig(): NanoHTTPD.Response {
@@ -139,104 +150,125 @@ class KioskApiHandler(
                 put("restartWindowMinutes", config.crashRecovery.restartWindowMinutes)
             })
         }
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        return ok(json)
     }
 
+    /**
+     * Change some settings: every section and field is optional, and what is
+     * left out stays as it is. Answers 400 for an exit PIN that is not 4-12
+     * digits (null or "" removes it), an unknown screen mode or a negative time.
+     */
     private fun updateKioskConfig(body: JSONObject?): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         body ?: return ApiHandlerUtils.bodyRequired()
-        val currentConfig = kiosk.getConfig()
-
-        val autoStartJson = body.optJSONObject("autoStart")
-        val autoStart = if (autoStartJson != null) {
-            AutoStartConfig(
-                enabled = autoStartJson.optBoolean("enabled", currentConfig.autoStart.enabled),
-                delaySeconds = autoStartJson.optInt("delaySeconds", currentConfig.autoStart.delaySeconds),
-                startStreaming = autoStartJson.optBoolean("startStreaming", currentConfig.autoStart.startStreaming),
-                startRtsp = autoStartJson.optBoolean("startRtsp", currentConfig.autoStart.startRtsp),
-                startRecording = autoStartJson.optBoolean("startRecording", currentConfig.autoStart.startRecording)
+        val current = kiosk.getConfig()
+        val newConfig = try {
+            KioskConfig(
+                enabled = body.optBoolean("enabled", current.enabled),
+                autoStart = body.optJSONObject("autoStart")?.let { parseAutoStart(it, current.autoStart) }
+                    ?: current.autoStart,
+                screen = body.optJSONObject("screen")?.let { parseScreen(it, current.screen) } ?: current.screen,
+                security = body.optJSONObject("security")?.let { parseSecurity(it, current.security) }
+                    ?: current.security,
+                networkRecovery = body.optJSONObject("networkRecovery")?.let { parseNetwork(it, current.networkRecovery) }
+                    ?: current.networkRecovery,
+                crashRecovery = body.optJSONObject("crashRecovery")?.let { parseCrash(it, current.crashRecovery) }
+                    ?: current.crashRecovery
             )
-        } else currentConfig.autoStart
-
-        val screenJson = body.optJSONObject("screen")
-        val screen = if (screenJson != null) {
-            val modeStr = screenJson.optString("mode", currentConfig.screen.mode.name)
-            val mode = try { ScreenMode.valueOf(modeStr) } catch (e: Exception) { currentConfig.screen.mode }
-            ScreenConfig(
-                mode = mode,
-                dimBrightness = screenJson.optInt("dimBrightness", currentConfig.screen.dimBrightness),
-                autoOffTimeoutSec = screenJson.optInt("autoOffTimeoutSec", currentConfig.screen.autoOffTimeoutSec),
-                wakeOnMotion = screenJson.optBoolean("wakeOnMotion", currentConfig.screen.wakeOnMotion),
-                keepScreenOn = screenJson.optBoolean("keepScreenOn", currentConfig.screen.keepScreenOn)
-            )
-        } else currentConfig.screen
-
-        val securityJson = body.optJSONObject("security")
-        val security = if (securityJson != null) {
-            SecurityConfig(
-                exitPin = securityJson.optString("exitPin", currentConfig.security.exitPin),
-                allowedExitGesture = securityJson.optBoolean("allowedExitGesture", currentConfig.security.allowedExitGesture),
-                exitGestureTimeoutMs = securityJson.optLong("exitGestureTimeoutMs", currentConfig.security.exitGestureTimeoutMs),
-                lockStatusBar = securityJson.optBoolean("lockStatusBar", currentConfig.security.lockStatusBar),
-                lockNavigationBar = securityJson.optBoolean("lockNavigationBar", currentConfig.security.lockNavigationBar),
-                lockNotifications = securityJson.optBoolean("lockNotifications", currentConfig.security.lockNotifications),
-                blockScreenshots = securityJson.optBoolean("blockScreenshots", currentConfig.security.blockScreenshots)
-            )
-        } else currentConfig.security
-
-        val networkJson = body.optJSONObject("networkRecovery")
-        val networkRecovery = if (networkJson != null) {
-            NetworkRecoveryConfig(
-                autoReconnect = networkJson.optBoolean("autoReconnect", currentConfig.networkRecovery.autoReconnect),
-                reconnectIntervalSec = networkJson.optInt("reconnectIntervalSec", currentConfig.networkRecovery.reconnectIntervalSec),
-                maxReconnectAttempts = networkJson.optInt("maxReconnectAttempts", currentConfig.networkRecovery.maxReconnectAttempts),
-                restartStreamOnReconnect = networkJson.optBoolean("restartStreamOnReconnect", currentConfig.networkRecovery.restartStreamOnReconnect)
-            )
-        } else currentConfig.networkRecovery
-
-        val crashJson = body.optJSONObject("crashRecovery")
-        val crashRecovery = if (crashJson != null) {
-            CrashRecoveryConfig(
-                autoRestart = crashJson.optBoolean("autoRestart", currentConfig.crashRecovery.autoRestart),
-                restartDelayMs = crashJson.optLong("restartDelayMs", currentConfig.crashRecovery.restartDelayMs),
-                maxRestartAttempts = crashJson.optInt("maxRestartAttempts", currentConfig.crashRecovery.maxRestartAttempts),
-                restartWindowMinutes = crashJson.optInt("restartWindowMinutes", currentConfig.crashRecovery.restartWindowMinutes)
-            )
-        } else currentConfig.crashRecovery
-
-        val newConfig = KioskConfig(
-            enabled = body.optBoolean("enabled", currentConfig.enabled),
-            autoStart = autoStart,
-            screen = screen,
-            security = security,
-            networkRecovery = networkRecovery,
-            crashRecovery = crashRecovery
-        )
+        } catch (e: IllegalArgumentException) {
+            return badRequest(e.message ?: "Invalid kiosk configuration")
+        }
         kiosk.updateConfig(newConfig)
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Kiosk configuration updated"}"""
+        return success("Kiosk configuration updated")
+    }
+
+    private fun parseAutoStart(json: JSONObject, current: AutoStartConfig): AutoStartConfig =
+        AutoStartConfig(
+            enabled = json.optBoolean("enabled", current.enabled),
+            delaySeconds = notNegative(json, "delaySeconds", current.delaySeconds, "autoStart"),
+            startStreaming = json.optBoolean("startStreaming", current.startStreaming),
+            startRtsp = json.optBoolean("startRtsp", current.startRtsp),
+            startRecording = json.optBoolean("startRecording", current.startRecording)
+        )
+
+    private fun parseScreen(json: JSONObject, current: ScreenConfig): ScreenConfig {
+        val mode = if (json.has("mode")) {
+            requireNotNull(parseScreenMode(json.optString("mode"))) { "screen.mode must be PREVIEW, OFF, DIM or BLACK" }
+        } else {
+            current.mode
+        }
+        return ScreenConfig(
+            mode = mode,
+            dimBrightness = json.optInt("dimBrightness", current.dimBrightness).coerceIn(0, MAX_BRIGHTNESS),
+            autoOffTimeoutSec = notNegative(json, "autoOffTimeoutSec", current.autoOffTimeoutSec, "screen"),
+            wakeOnMotion = json.optBoolean("wakeOnMotion", current.wakeOnMotion),
+            keepScreenOn = json.optBoolean("keepScreenOn", current.keepScreenOn)
         )
     }
 
+    /** The exit PIN: absent keeps it, null or "" removes it, anything else must be 4-12 digits. */
+    private fun parseSecurity(json: JSONObject, current: SecurityConfig): SecurityConfig {
+        val pin = when {
+            !json.has("exitPin") -> current.exitPin
+            json.isNull("exitPin") -> ""
+            else -> json.opt("exitPin").toString().trim()
+        }
+        val pinError = exitPinError(pin)
+        require(pinError == null) { pinError.orEmpty() }
+        val gestureMs = json.optLong("exitGestureTimeoutMs", current.exitGestureTimeoutMs)
+        require(gestureMs >= 0) { "security.exitGestureTimeoutMs must not be negative" }
+        return SecurityConfig(
+            exitPin = pin,
+            allowedExitGesture = json.optBoolean("allowedExitGesture", current.allowedExitGesture),
+            exitGestureTimeoutMs = gestureMs,
+            lockStatusBar = json.optBoolean("lockStatusBar", current.lockStatusBar),
+            lockNavigationBar = json.optBoolean("lockNavigationBar", current.lockNavigationBar),
+            lockNotifications = json.optBoolean("lockNotifications", current.lockNotifications),
+            blockScreenshots = json.optBoolean("blockScreenshots", current.blockScreenshots)
+        )
+    }
+
+    private fun parseNetwork(json: JSONObject, current: NetworkRecoveryConfig): NetworkRecoveryConfig =
+        NetworkRecoveryConfig(
+            autoReconnect = json.optBoolean("autoReconnect", current.autoReconnect),
+            reconnectIntervalSec = notNegative(json, "reconnectIntervalSec", current.reconnectIntervalSec, "networkRecovery"),
+            maxReconnectAttempts = json.optInt("maxReconnectAttempts", current.maxReconnectAttempts),
+            restartStreamOnReconnect = json.optBoolean("restartStreamOnReconnect", current.restartStreamOnReconnect)
+        )
+
+    private fun parseCrash(json: JSONObject, current: CrashRecoveryConfig): CrashRecoveryConfig {
+        val delayMs = json.optLong("restartDelayMs", current.restartDelayMs)
+        require(delayMs >= 0) { "crashRecovery.restartDelayMs must not be negative" }
+        return CrashRecoveryConfig(
+            autoRestart = json.optBoolean("autoRestart", current.autoRestart),
+            restartDelayMs = delayMs,
+            maxRestartAttempts = json.optInt("maxRestartAttempts", current.maxRestartAttempts),
+            restartWindowMinutes = notNegative(json, "restartWindowMinutes", current.restartWindowMinutes, "crashRecovery")
+        )
+    }
+
+    /** The whole number [key] of [json] ([current] when absent); a negative one is refused, naming [section].[key]. */
+    private fun notNegative(json: JSONObject, key: String, current: Int, section: String): Int {
+        val value = json.optInt(key, current)
+        require(value >= 0) { "$section.$key must not be negative" }
+        return value
+    }
+
+    /** The appliance preset; the exit PIN and kiosk on/off are kept, and the event log notes it. */
     private fun applyAppliancePreset(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         kiosk.applyAppliancePreset()
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Appliance preset applied (24/7 unattended operation)"}"""
-        )
+        return success("Appliance preset applied (24/7 unattended operation)")
     }
 
+    /** The interactive preset; the exit PIN and kiosk on/off are kept, and the event log notes it. */
     private fun applyInteractivePreset(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         kiosk.applyInteractivePreset()
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Interactive preset applied (kiosk with preview)"}"""
-        )
+        return success("Interactive preset applied (kiosk with preview)")
     }
 
+    /** The in-memory event log, emptied when the app restarts. */
     private fun getKioskEvents(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         val events = kiosk.getEventLog()
@@ -253,6 +285,16 @@ class KioskApiHandler(
                 }
             })
         }
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        return ok(json)
     }
+
+    private fun ok(json: JSONObject): NanoHTTPD.Response =
+        NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+
+    private fun success(message: String): NanoHTTPD.Response =
+        ok(JSONObject().put("success", true).put("message", message))
+
+    private fun badRequest(error: String): NanoHTTPD.Response = NanoHTTPD.newFixedLengthResponse(
+        Status.BAD_REQUEST, WebServer.MIME_JSON, JSONObject().put("success", false).put("error", error).toString()
+    )
 }

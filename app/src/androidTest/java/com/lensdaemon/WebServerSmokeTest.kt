@@ -12,6 +12,7 @@ import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.net.HttpURLConnection
+import java.net.Socket
 import java.net.URL
 
 /**
@@ -100,6 +101,44 @@ class WebServerSmokeTest {
             assertEquals(404, connection.responseCode)
         } finally {
             connection.disconnect()
+        }
+    }
+
+    @Test
+    fun crossSitePostIsRefused() {
+        webServer.startServer()
+
+        // A page of another site: refused before the handler runs
+        val refused = post("/api/stream/stop", origin = "http://evil.example")
+        assertEquals(403, refused.first)
+        assertEquals("Cross-site request refused", JSONObject(refused.second).getString("error"))
+
+        // No Origin (curl, scripts) or the phone's own page: on to the handler, which has no camera here
+        assertEquals(503, post("/api/stream/stop", origin = null).first)
+        assertEquals(503, post("/api/stream/stop", origin = "http://localhost:$testPort").first)
+    }
+
+    /**
+     * Status code and body of a bodyless POST, sent as raw HTTP so that the
+     * Origin header goes out exactly as given.
+     */
+    private fun post(path: String, origin: String?): Pair<Int, String> {
+        Socket("localhost", testPort).use { socket ->
+            socket.soTimeout = 5000
+            val request = buildString {
+                append("POST $path HTTP/1.1\r\n")
+                append("Host: localhost:$testPort\r\n")
+                if (origin != null) append("Origin: $origin\r\n")
+                append("Content-Length: 0\r\n")
+                append("Connection: close\r\n\r\n")
+            }
+            socket.getOutputStream().apply {
+                write(request.toByteArray(Charsets.US_ASCII))
+                flush()
+            }
+            val response = socket.getInputStream().readBytes().toString(Charsets.UTF_8)
+            val status = response.substringBefore("\r\n").split(" ")[1].toInt()
+            return status to response.substringAfter("\r\n\r\n")
         }
     }
 }

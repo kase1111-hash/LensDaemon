@@ -4,7 +4,6 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
-import java.util.concurrent.ConcurrentLinkedQueue
 import kotlin.math.max
 
 /**
@@ -22,9 +21,12 @@ import kotlin.math.max
  * - Cue timing accuracy (did script cues hit their marks? left out when no script cue ran)
  * - Audio levels (was audio in acceptable range?)
  *
- * The samples come from QualityMetricsCollector while a take runs; samples outside a take
- * are ignored. On the phone the exposure and motion inputs are placeholders: the exposure
- * is the configured compensation, not a measurement, and the shake is a constant per
+ * The samples come from QualityMetricsCollector while a take runs; samples outside a take,
+ * or while the director is paused, are ignored. Each sample is added to the take's running
+ * totals as it arrives, so a take uses the same little memory however long it runs.
+ *
+ * On the phone the exposure and motion inputs are placeholders: the exposure is the
+ * configured compensation, not a measurement, and the shake is a constant per
  * stabilisation mode, so those two factors say little until they come from capture results
  * or motion sensors. Audio isn't sampled, which leaves the audio factor at "OK".
  */
@@ -58,27 +60,50 @@ class TakeManager(
 
         /** The best take of a scene is suggested (and listed as a best take) from this score. */
         const val SUGGESTED_MIN_SCORE = 5f
+
+        private const val NANOS_PER_MS = 1_000_000L
+
+        /**
+         * Now, in ms on a monotonic clock, which setting the phone's time doesn't move: the
+         * clock of the expected times given to [recordCueExecution].
+         */
+        fun monotonicNowMs(): Long = System.nanoTime() / NANOS_PER_MS
     }
 
     /**
-     * Active take state
+     * Active take state. Its quality samples are kept as running totals ([samples]).
      */
     data class ActiveTake(
         val takeNumber: Int,
         val sceneId: String,
         val sceneLabel: String,
         val startTimeMs: Long,
-        var focusSamples: MutableList<Boolean> = mutableListOf(),
-        var exposureSamples: MutableList<Float> = mutableListOf(),
-        var motionSamples: MutableList<Float> = mutableListOf(),
         var cueTimings: MutableList<CueTiming> = mutableListOf(),
-        var audioLevelSamples: MutableList<Float> = mutableListOf(),
         var cuesExecuted: Int = 0,
         var cuesFailed: Int = 0
-    )
+    ) {
+        /** The quality samples of the take so far (under the take manager's lock). */
+        internal val samples = SampleTotals()
+    }
 
     /**
-     * Cue timing data for accuracy scoring
+     * Quality samples summed as they arrive: how many there were of each kind, and the
+     * totals the take's quality factors are worked out from when it ends.
+     */
+    internal class SampleTotals {
+        var focus = 0L
+        var focusLocked = 0L
+        var exposure = 0L
+        var exposureSum = 0.0
+        var exposureSquareSum = 0.0
+        var motion = 0L
+        var motionSum = 0.0
+        var audio = 0L
+        var audioOutOfRange = 0L
+    }
+
+    /**
+     * Cue timing data for accuracy scoring; both times are in ms on [monotonicNowMs]'s clock
      */
     data class CueTiming(
         val cueId: String,
@@ -107,6 +132,13 @@ class TakeManager(
     @Volatile
     internal var config: DirectorConfig = config
 
+    /**
+     * True while quality samples are to be ignored although a take is open. [DirectorManager]
+     * makes it "while the director is paused", so a pause doesn't count in the take's score.
+     */
+    @Volatile
+    internal var samplingPaused: () -> Boolean = { false }
+
     private val _currentTake = MutableStateFlow<ActiveTake?>(null)
 
     /** The take in progress, or null between takes: quality samples count only while it is set. */
@@ -121,18 +153,6 @@ class TakeManager(
     /** Guards the take in progress and the recorded takes (script, HTTP and sampling threads). */
     private val lock = Any()
     private var takeCounter = 0
-    private val qualityMetricsQueue = ConcurrentLinkedQueue<QualityMetricSample>()
-
-    /**
-     * Quality metric sample for async processing
-     */
-    private data class QualityMetricSample(
-        val timestamp: Long,
-        val focusLocked: Boolean? = null,
-        val exposureValue: Float? = null,
-        val motionValue: Float? = null,
-        val audioLevel: Float? = null
-    )
 
     /**
      * Start a new take. Callers end the take in progress first (and announce it); one still
@@ -140,8 +160,6 @@ class TakeManager(
      */
     fun startTake(sceneId: String, sceneLabel: String): RecordedTake = synchronized(lock) {
         _currentTake.value?.let { endTakeLocked(null) }
-        // Samples queued before this take belong to no take
-        qualityMetricsQueue.clear()
 
         takeCounter++
         val take = ActiveTake(
@@ -170,9 +188,6 @@ class TakeManager(
     private fun endTakeLocked(filePath: String?): RecordedTake? {
         val active = _currentTake.value ?: return null
         val endTimeMs = System.currentTimeMillis()
-
-        // Process any pending quality metrics
-        processQueuedMetrics(active)
 
         // Calculate quality factors
         val qualityFactors = calculateQualityFactors(active)
@@ -211,60 +226,71 @@ class TakeManager(
     }
 
     /**
-     * Record a focus state sample (ignored outside a take)
+     * Record a focus state sample (ignored outside a take and while paused)
      */
     fun recordFocusSample(locked: Boolean) {
-        if (_currentTake.value == null) return
-        qualityMetricsQueue.add(
-            QualityMetricSample(
-                timestamp = System.currentTimeMillis(),
-                focusLocked = locked
-            )
-        )
+        addSample { totals ->
+            totals.focus++
+            if (locked) totals.focusLocked++
+        }
     }
 
     /**
-     * Record an exposure value sample (normalized 0-1; ignored outside a take)
+     * Record an exposure value sample (normalized 0-1; ignored outside a take and while paused)
      */
     fun recordExposureSample(value: Float) {
-        if (_currentTake.value == null) return
-        qualityMetricsQueue.add(
-            QualityMetricSample(
-                timestamp = System.currentTimeMillis(),
-                exposureValue = value.coerceIn(0f, 1f)
-            )
-        )
+        val exposure = value.coerceIn(0f, 1f).toDouble()
+        addSample { totals ->
+            totals.exposure++
+            totals.exposureSum += exposure
+            totals.exposureSquareSum += exposure * exposure
+        }
     }
 
     /**
-     * Record a motion/stability sample (0 = perfectly stable, 1 = very shaky; ignored outside a take)
+     * Record a motion/stability sample (0 = perfectly stable, 1 = very shaky; ignored outside a take and while paused)
      */
     fun recordMotionSample(shakiness: Float) {
-        if (_currentTake.value == null) return
-        qualityMetricsQueue.add(
-            QualityMetricSample(
-                timestamp = System.currentTimeMillis(),
-                motionValue = shakiness.coerceIn(0f, 1f)
-            )
-        )
+        val motion = shakiness.coerceIn(0f, 1f).toDouble()
+        addSample { totals ->
+            totals.motion++
+            totals.motionSum += motion
+        }
     }
 
     /**
-     * Record an audio level sample (dB normalized to 0-1; ignored outside a take)
+     * Record an audio level sample (dB normalized to 0-1; ignored outside a take and while paused).
+     * Levels below 0.1 or above 0.9 are out of range.
      */
     fun recordAudioSample(level: Float) {
-        if (_currentTake.value == null) return
-        qualityMetricsQueue.add(
-            QualityMetricSample(
-                timestamp = System.currentTimeMillis(),
-                audioLevel = level.coerceIn(0f, 1f)
-            )
-        )
+        val audio = level.coerceIn(0f, 1f)
+        addSample { totals ->
+            totals.audio++
+            if (audio < 0.1f || audio > 0.9f) totals.audioOutOfRange++
+        }
+    }
+
+    /** Adds a sample to the running totals of the take in progress: none outside a take or while paused. */
+    private inline fun addSample(add: (SampleTotals) -> Unit) {
+        synchronized(lock) {
+            val take = _currentTake.value ?: return
+            if (samplingPaused()) return
+            add(take.samples)
+        }
+    }
+
+    /**
+     * True when the take in progress belongs to [sceneId] and no cue has run in it yet
+     */
+    fun isUnusedTakeOf(sceneId: String): Boolean = synchronized(lock) {
+        val take = _currentTake.value
+        take != null && take.sceneId == sceneId && take.cuesExecuted + take.cuesFailed == 0
     }
 
     /**
      * Record a cue execution in the take in progress. [expectedTimeMs] is when a script
-     * meant the cue to run; with null (a cue run by hand) only the success or failure counts.
+     * meant the cue to run, on [monotonicNowMs]'s clock; with null (a cue run by hand) only
+     * the success or failure counts.
      */
     fun recordCueExecution(cueId: String, expectedTimeMs: Long?, success: Boolean) {
         synchronized(lock) {
@@ -274,7 +300,7 @@ class TakeManager(
                     CueTiming(
                         cueId = cueId,
                         expectedTimeMs = expectedTimeMs,
-                        actualTimeMs = System.currentTimeMillis(),
+                        actualTimeMs = monotonicNowMs(),
                         success = success
                     )
                 )
@@ -288,40 +314,28 @@ class TakeManager(
     }
 
     /**
-     * Process queued quality metrics into [take]
-     */
-    private fun processQueuedMetrics(take: ActiveTake) {
-        while (qualityMetricsQueue.isNotEmpty()) {
-            val sample = qualityMetricsQueue.poll() ?: break
-
-            sample.focusLocked?.let { take.focusSamples.add(it) }
-            sample.exposureValue?.let { take.exposureSamples.add(it) }
-            sample.motionValue?.let { take.motionSamples.add(it) }
-            sample.audioLevel?.let { take.audioLevelSamples.add(it) }
-        }
-    }
-
-    /**
-     * Calculate quality factors from collected samples
+     * Calculate quality factors from the take's sample totals
      */
     private fun calculateQualityFactors(take: ActiveTake): TakeQualityFactors {
+        val samples = take.samples
+
         // Focus lock percentage
-        val focusLockPercent = if (take.focusSamples.isNotEmpty()) {
-            (take.focusSamples.count { it } * 100 / take.focusSamples.size)
+        val focusLockPercent = if (samples.focus > 0) {
+            (samples.focusLocked * 100 / samples.focus).toInt()
         } else 0
 
         // Exposure stability (low variance = stable)
-        val exposureStability = if (take.exposureSamples.size >= 2) {
-            val mean = take.exposureSamples.average().toFloat()
-            val variance = take.exposureSamples.map { (it - mean) * (it - mean) }.average().toFloat()
+        val exposureStability = if (samples.exposure >= 2) {
+            val mean = samples.exposureSum / samples.exposure
+            val variance = (samples.exposureSquareSum / samples.exposure - mean * mean).coerceAtLeast(0.0)
             // Convert variance to stability score (lower variance = higher stability)
-            max(0f, 1f - (variance * 4))
+            max(0f, 1f - (variance * 4).toFloat())
         } else 0f
 
         // Motion stability (low shakiness = stable)
-        val motionStability = if (take.motionSamples.isNotEmpty()) {
+        val motionStability = if (samples.motion > 0) {
             // Average inverse of shakiness
-            1f - take.motionSamples.average().toFloat()
+            (1.0 - samples.motionSum / samples.motion).toFloat()
         } else 0f
 
         // Cue timing accuracy (0 when no script cue ran; the score then leaves it out)
@@ -330,9 +344,8 @@ class TakeManager(
         } else 0f
 
         // Audio levels OK (should be between 0.1 and 0.9)
-        val audioLevelOk = if (take.audioLevelSamples.isNotEmpty()) {
-            val outOfRange = take.audioLevelSamples.count { it < 0.1f || it > 0.9f }
-            outOfRange < take.audioLevelSamples.size * 0.2 // Less than 20% out of range
+        val audioLevelOk = if (samples.audio > 0) {
+            samples.audioOutOfRange < samples.audio * 0.2 // Less than 20% out of range
         } else true
 
         return TakeQualityFactors(
@@ -533,7 +546,6 @@ class TakeManager(
             _currentTake.value = null
             _recordedTakes.value = emptyList()
             _bestTakeSuggestion.value = null
-            qualityMetricsQueue.clear()
         }
         Timber.tag(TAG).i("Take manager session reset")
     }

@@ -1,25 +1,44 @@
 package com.lensdaemon.camera
 
-import android.animation.ValueAnimator
-import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CaptureRequest
 import android.os.Build
-import android.view.animation.DecelerateInterpolator
+import android.os.SystemClock
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.roundToInt
 
 /**
  * Controls camera zoom with smooth animations and pinch-to-zoom support.
- * Supports both CONTROL_ZOOM_RATIO (Android 11+) and SCALER_CROP_REGION (legacy).
+ *
+ * The zoom reaches the camera through the zoom-changed listener, which
+ * CameraService turns into the capture request: CONTROL_ZOOM_RATIO on Android
+ * 11+, a centred SCALER_CROP_REGION on Android 10 (see CaptureRequestExtras.kt).
+ *
+ * Every method may be called from any thread: the web API's request threads,
+ * the director's worker threads, the phone's gestures. Animations run as a
+ * coroutine on [scope] (the main thread by default), and a later zoom change,
+ * whether set, animated or pinched, always replaces an earlier animation: a
+ * generation counter keeps a late animation step from overwriting it. Values
+ * that are not finite numbers are ignored.
  */
-class ZoomController {
+class ZoomController(
+    private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+) {
 
     companion object {
         private const val ZOOM_ANIMATION_DURATION_MS = 200L
         private const val MIN_ZOOM = 1.0f
+
+        /** Time between animation steps, about one display frame. */
+        private const val FRAME_MS = 16L
     }
 
     // Zoom state
@@ -30,22 +49,26 @@ class ZoomController {
     val zoomRange: StateFlow<ClosedFloatingPointRange<Float>> = _zoomRange
 
     // Camera characteristics
-    private var sensorArraySize: Rect? = null
     private var maxZoom: Float = 1.0f
     private var supportsZoomRatio = false
 
-    // Animation
-    private var zoomAnimator: ValueAnimator? = null
-    private var onZoomChanged: ((Float) -> Unit)? = null
+    /** Makes each zoom change and its listener call one step, against changes from other threads. */
+    private val lock = Any()
 
-    // Pinch-to-zoom state
-    private var baseZoomForPinch: Float = 1.0f
+    // Animation
+    @Volatile private var animationJob: Job? = null
+
+    /** Bumped by every change that replaces an animation; a step of an older generation is dropped. */
+    private val generation = AtomicInteger()
+
+    @Volatile private var onZoomChanged: ((Float) -> Unit)? = null
 
     /**
      * Initialize zoom controller with camera characteristics.
      */
     fun initialize(characteristics: CameraCharacteristics) {
-        sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        // An animation for the previous lens must not run on into this one
+        cancelZoomAnimation()
 
         maxZoom = characteristics.get(CameraCharacteristics.SCALER_AVAILABLE_MAX_DIGITAL_ZOOM)
             ?: 1.0f
@@ -70,46 +93,77 @@ class ZoomController {
     }
 
     /**
-     * Set zoom change callback for real-time updates.
+     * Set zoom change callback for real-time updates. It is called on the
+     * thread that made the change (the main thread for animation steps).
      */
     fun setOnZoomChangedListener(listener: (Float) -> Unit) {
         onZoomChanged = listener
     }
 
     /**
-     * Set zoom level immediately (no animation).
+     * Set zoom level immediately (no animation), stopping any animation.
+     * @return the zoom applied: [zoomLevel] clamped to the zoom range, or the
+     *   current zoom, unchanged, when [zoomLevel] is not a finite number
      */
     fun setZoom(zoomLevel: Float): Float {
-        cancelZoomAnimation()
-        val clamped = zoomLevel.coerceIn(_zoomRange.value)
-        _currentZoom.value = clamped
-        onZoomChanged?.invoke(clamped)
-        return clamped
+        if (!zoomLevel.isFinite()) {
+            Timber.w("Ignoring zoom $zoomLevel")
+            return _currentZoom.value
+        }
+        return synchronized(lock) {
+            cancelZoomAnimation()
+            val clamped = zoomLevel.coerceIn(_zoomRange.value)
+            _currentZoom.value = clamped
+            onZoomChanged?.invoke(clamped)
+            clamped
+        }
     }
 
     /**
-     * Animate zoom to target level.
+     * Animate zoom to target level over [durationMs], easing into it. Callable
+     * from any thread: the steps run on [scope]. A target that is not a finite
+     * number is ignored; a duration of 0 or less sets the zoom at once.
      */
     fun animateZoomTo(targetZoom: Float, durationMs: Long = ZOOM_ANIMATION_DURATION_MS) {
-        cancelZoomAnimation()
-
-        val startZoom = _currentZoom.value
-        val endZoom = targetZoom.coerceIn(_zoomRange.value)
-
-        if (startZoom == endZoom) return
-
-        zoomAnimator = ValueAnimator.ofFloat(startZoom, endZoom).apply {
-            duration = durationMs
-            interpolator = DecelerateInterpolator()
-            addUpdateListener { animator ->
-                val zoom = animator.animatedValue as Float
-                _currentZoom.value = zoom
-                onZoomChanged?.invoke(zoom)
-            }
-            start()
+        if (!targetZoom.isFinite()) {
+            Timber.w("Ignoring a zoom animation to $targetZoom")
+            return
         }
+        if (durationMs <= 0) {
+            setZoom(targetZoom)
+            return
+        }
+        synchronized(lock) {
+            cancelZoomAnimation()
 
-        Timber.d("Animating zoom from $startZoom to $endZoom")
+            val startZoom = _currentZoom.value
+            val endZoom = targetZoom.coerceIn(_zoomRange.value)
+            if (startZoom == endZoom) return
+
+            val gen = generation.incrementAndGet()
+            animationJob = scope.launch {
+                val startedAt = SystemClock.uptimeMillis()
+                var running = true
+                while (running) {
+                    val t = ((SystemClock.uptimeMillis() - startedAt) / durationMs.toFloat()).coerceIn(0f, 1f)
+                    // Decelerate: quick at first, easing into the target
+                    val zoom = startZoom + (endZoom - startZoom) * (1f - (1f - t) * (1f - t))
+                    running = publishStep(gen, zoom) && t < 1f
+                    if (running) delay(FRAME_MS)
+                }
+            }
+            Timber.d("Animating zoom from $startZoom to $endZoom")
+        }
+    }
+
+    /** Apply one animation step, unless a later change has replaced the animation. */
+    private fun publishStep(stepGeneration: Int, zoom: Float): Boolean = synchronized(lock) {
+        val current = generation.get() == stepGeneration
+        if (current) {
+            _currentZoom.value = zoom
+            onZoomChanged?.invoke(zoom)
+        }
+        current
     }
 
     /**
@@ -117,6 +171,7 @@ class ZoomController {
      */
     fun zoomIn(step: Float = 0.5f, animated: Boolean = true): Float {
         val targetZoom = (_currentZoom.value + step).coerceIn(_zoomRange.value)
+        if (!targetZoom.isFinite()) return _currentZoom.value
         if (animated) {
             animateZoomTo(targetZoom)
         } else {
@@ -130,6 +185,7 @@ class ZoomController {
      */
     fun zoomOut(step: Float = 0.5f, animated: Boolean = true): Float {
         val targetZoom = (_currentZoom.value - step).coerceIn(_zoomRange.value)
+        if (!targetZoom.isFinite()) return _currentZoom.value
         if (animated) {
             animateZoomTo(targetZoom)
         } else {
@@ -150,37 +206,38 @@ class ZoomController {
     }
 
     /**
-     * Cancel any ongoing zoom animation.
+     * Cancel any ongoing zoom animation, where it is. Callable from any thread.
      */
     fun cancelZoomAnimation() {
-        zoomAnimator?.cancel()
-        zoomAnimator = null
+        generation.incrementAndGet()
+        animationJob?.cancel()
+        animationJob = null
     }
 
     /**
      * Check if zoom animation is in progress.
      */
-    fun isAnimating(): Boolean = zoomAnimator?.isRunning == true
+    fun isAnimating(): Boolean = animationJob?.isActive == true
 
     // ==================== Pinch-to-zoom support ====================
 
     /**
-     * Called when pinch gesture starts.
+     * Called when pinch gesture starts: an animation in progress stops.
      */
     fun onPinchStart() {
         cancelZoomAnimation()
-        baseZoomForPinch = _currentZoom.value
     }
 
     /**
      * Called during pinch gesture with scale factor.
-     * @param scaleFactor The scale factor from pinch gesture (1.0 = no change)
+     * @param scaleFactor the change since the previous call (ScaleGestureDetector's
+     *   scaleFactor when onScale returns true; 1.0 = no change), applied to the
+     *   current zoom. One that is not a finite number is ignored.
+     * @return the zoom applied
      */
     fun onPinchScale(scaleFactor: Float): Float {
-        val newZoom = (baseZoomForPinch * scaleFactor).coerceIn(_zoomRange.value)
-        _currentZoom.value = newZoom
-        onZoomChanged?.invoke(newZoom)
-        return newZoom
+        if (!scaleFactor.isFinite()) return _currentZoom.value
+        return synchronized(lock) { setZoom(_currentZoom.value * scaleFactor) }
     }
 
     /**
@@ -188,71 +245,6 @@ class ZoomController {
      */
     fun onPinchEnd() {
         // Optional: snap to preset zoom levels
-    }
-
-    // ==================== Apply to capture request ====================
-
-    /**
-     * Apply zoom to capture request builder.
-     */
-    fun applyToRequest(builder: CaptureRequest.Builder) {
-        val zoom = _currentZoom.value
-
-        if (supportsZoomRatio && Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-            // Use CONTROL_ZOOM_RATIO on Android 11+
-            builder.set(CaptureRequest.CONTROL_ZOOM_RATIO, zoom)
-        } else {
-            // Use SCALER_CROP_REGION on older devices
-            applyCropRegion(builder, zoom)
-        }
-    }
-
-    /**
-     * Apply crop region for legacy zoom implementation.
-     */
-    private fun applyCropRegion(builder: CaptureRequest.Builder, zoomLevel: Float) {
-        val sensor = sensorArraySize ?: return
-
-        if (zoomLevel <= 1.0f) {
-            builder.set(CaptureRequest.SCALER_CROP_REGION, sensor)
-            return
-        }
-
-        val centerX = sensor.width() / 2
-        val centerY = sensor.height() / 2
-
-        val cropWidth = (sensor.width() / zoomLevel).roundToInt()
-        val cropHeight = (sensor.height() / zoomLevel).roundToInt()
-
-        val cropLeft = centerX - cropWidth / 2
-        val cropTop = centerY - cropHeight / 2
-        val cropRight = cropLeft + cropWidth
-        val cropBottom = cropTop + cropHeight
-
-        val cropRegion = Rect(cropLeft, cropTop, cropRight, cropBottom)
-        builder.set(CaptureRequest.SCALER_CROP_REGION, cropRegion)
-    }
-
-    /**
-     * Get the current crop region for the zoom level (legacy devices).
-     */
-    fun getCropRegion(): Rect? {
-        val sensor = sensorArraySize ?: return null
-        val zoom = _currentZoom.value
-
-        if (zoom <= 1.0f) return sensor
-
-        val centerX = sensor.width() / 2
-        val centerY = sensor.height() / 2
-        val cropWidth = (sensor.width() / zoom).roundToInt()
-        val cropHeight = (sensor.height() / zoom).roundToInt()
-
-        return Rect(
-            centerX - cropWidth / 2,
-            centerY - cropHeight / 2,
-            centerX + cropWidth / 2,
-            centerY + cropHeight / 2
-        )
     }
 
     /**
@@ -294,9 +286,10 @@ class ZoomController {
      * Reset controller state.
      */
     fun reset() {
-        cancelZoomAnimation()
-        _currentZoom.value = MIN_ZOOM
-        baseZoomForPinch = MIN_ZOOM
+        synchronized(lock) {
+            cancelZoomAnimation()
+            _currentZoom.value = MIN_ZOOM
+        }
     }
 
     /**

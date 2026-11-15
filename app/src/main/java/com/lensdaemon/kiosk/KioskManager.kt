@@ -22,7 +22,6 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.launch
 import timber.log.Timber
 
 /**
@@ -32,7 +31,12 @@ import timber.log.Timber
  * - Lock Task Mode (prevents home/recents escape)
  * - System UI hiding (status bar, navigation bar)
  * - Package allowlist management
- * - Kiosk state tracking
+ * - User restrictions while kiosk mode is on (no safe boot, factory reset or
+ *   USB file transfer), cleared when it is turned off
+ * - Kiosk state tracking, the event log and the restart counter
+ *
+ * The screen modes (DIM, BLACK, keep-screen-on) belong to
+ * [KioskActivityController], which applies them while the phone is pinned.
  *
  * Requirements:
  * - Device must be set as Device Owner via:
@@ -43,6 +47,12 @@ class KioskManager(
 ) {
     companion object {
         private const val TAG = "KioskManager"
+
+        /** Where [recordRestart] keeps the restart count and time, across restarts. */
+        private const val RESTART_PREFS = "lensdaemon_kiosk_restarts"
+        private const val KEY_RESTART_COUNT = "restart_count"
+        private const val KEY_LAST_RESTART_TIME = "last_restart_time"
+        private const val MAX_EVENTS = 100
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -72,15 +82,17 @@ class KioskManager(
     private val _config = MutableStateFlow(KioskConfig.DEFAULT)
     val config: StateFlow<KioskConfig> = _config.asStateFlow()
 
-    // Tracking
-    private var startTime: Long = 0
-    private var restartCount: Int = 0
-    private var lastRestartTime: Long = 0
+    // Tracking (read from the web API's threads)
+    @Volatile private var startTime: Long = 0
+    @Volatile private var restartCount: Int = 0
+    @Volatile private var lastRestartTime: Long = 0
+
+    private val restartPrefs by lazy { context.getSharedPreferences(RESTART_PREFS, Context.MODE_PRIVATE) }
 
     // Event listeners
     private val listeners = mutableListOf<KioskEventListener>()
 
-    // Event log
+    // Event log, in memory: emptied when the app restarts
     private val eventLog = mutableListOf<KioskEvent>()
 
     /**
@@ -93,6 +105,8 @@ class KioskManager(
 
     init {
         loadConfig()
+        restartCount = restartPrefs.getInt(KEY_RESTART_COUNT, 0)
+        lastRestartTime = restartPrefs.getLong(KEY_LAST_RESTART_TIME, 0)
         updateState()
     }
 
@@ -116,7 +130,8 @@ class KioskManager(
      * setting is saved, and also decides whether LensDaemon starts on boot; the
      * activity on screen applies it, pinning or unpinning itself. Turning it on
      * brings LensDaemon to the front when it is the device owner, which can
-     * start activities from the background.
+     * start activities from the background; turning it off lifts the kiosk
+     * restrictions at once.
      */
     fun requestKioskMode(enabled: Boolean) {
         updateConfig(_config.value.copy(enabled = enabled))
@@ -134,7 +149,9 @@ class KioskManager(
     }
 
     /**
-     * Enable kiosk mode
+     * Enable kiosk mode: pin [activity] (lock task mode), hide the system bars
+     * and apply the kiosk restrictions. The screen mode is applied by
+     * [KioskActivityController].
      */
     fun enableKiosk(activity: Activity): Boolean {
         if (!isDeviceOwner()) {
@@ -154,9 +171,6 @@ class KioskManager(
             // Configure system UI
             configureSystemUI(activity)
 
-            // Apply screen configuration
-            applyScreenConfig(activity)
-
             // Update state
             startTime = System.currentTimeMillis()
             _kioskState.value = KioskState.ENABLED
@@ -165,6 +179,10 @@ class KioskManager(
             val newConfig = _config.value.copy(enabled = true)
             _config.value = newConfig
             configStore.saveConfig(newConfig)
+
+            // No safe boot (which would start the phone without LensDaemon),
+            // factory reset or USB file transfer while kiosk mode is on
+            setKioskRestrictions()
 
             updateStatus()
             logEvent(KioskEventType.KIOSK_ENABLED, "Kiosk mode enabled")
@@ -180,7 +198,8 @@ class KioskManager(
     }
 
     /**
-     * Disable kiosk mode
+     * Disable kiosk mode: unpin [activity], restore the system bars and the
+     * screen brightness, and lift the kiosk restrictions.
      */
     fun disableKiosk(activity: Activity): Boolean {
         try {
@@ -189,6 +208,8 @@ class KioskManager(
 
             // Restore system UI
             restoreSystemUI(activity)
+
+            clearKioskRestrictions()
 
             // Update state
             _kioskState.value = KioskState.DISABLED
@@ -326,10 +347,7 @@ class KioskManager(
             activity.window.decorView.systemUiVisibility = flags
         }
 
-        // Keep screen on during kiosk mode
-        if (_config.value.screen.keepScreenOn) {
-            activity.window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
-        }
+        // Keep-screen-on and the screen mode are KioskActivityController's
 
         // Block screenshots if configured
         if (security.blockScreenshots) {
@@ -340,7 +358,9 @@ class KioskManager(
     }
 
     /**
-     * Restore system UI to normal
+     * Restore system UI to normal: system bars, screenshots and the phone's
+     * own brightness (a DIM or BLACK kiosk lowered it). Keep-screen-on is
+     * [KioskActivityController]'s, which turns it back on once unpinned.
      */
     private fun restoreSystemUI(activity: Activity) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
@@ -353,50 +373,26 @@ class KioskManager(
             activity.window.decorView.systemUiVisibility = View.SYSTEM_UI_FLAG_VISIBLE
         }
 
-        activity.window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         activity.window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+        val params = activity.window.attributes
+        params.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
+        activity.window.attributes = params
 
         Timber.tag(TAG).d("System UI restored")
     }
 
     /**
-     * Apply screen configuration
-     */
-    private fun applyScreenConfig(activity: Activity) {
-        val screenConfig = _config.value.screen
-
-        when (screenConfig.mode) {
-            ScreenMode.OFF -> {
-                // Turn off screen - requires additional permissions
-                Timber.tag(TAG).d("Screen mode: OFF (requires ScreenController)")
-            }
-            ScreenMode.DIM -> {
-                // Set minimum brightness
-                val params = activity.window.attributes
-                params.screenBrightness = screenConfig.dimBrightness / 255f
-                activity.window.attributes = params
-                Timber.tag(TAG).d("Screen mode: DIM (${screenConfig.dimBrightness}/255)")
-            }
-            ScreenMode.BLACK -> {
-                // Black overlay - handled by ScreenController
-                Timber.tag(TAG).d("Screen mode: BLACK (requires ScreenController)")
-            }
-            ScreenMode.PREVIEW -> {
-                // Normal preview mode
-                val params = activity.window.attributes
-                params.screenBrightness = WindowManager.LayoutParams.BRIGHTNESS_OVERRIDE_NONE
-                activity.window.attributes = params
-                Timber.tag(TAG).d("Screen mode: PREVIEW")
-            }
-        }
-    }
-
-    /**
-     * Update configuration
+     * Update configuration. Turning kiosk mode off here (the web API, or
+     * [requestKioskMode]) also lifts the kiosk restrictions, even when the
+     * phone is not pinned at the moment.
      */
     fun updateConfig(newConfig: KioskConfig) {
+        val wasEnabled = _config.value.enabled
         _config.value = newConfig
         configStore.saveConfig(newConfig)
+        if (wasEnabled && !newConfig.enabled) {
+            clearKioskRestrictions()
+        }
         updateState()
         Timber.tag(TAG).d("Configuration updated")
     }
@@ -435,7 +431,7 @@ class KioskManager(
             state = _kioskState.value,
             isDeviceOwner = isDeviceOwner(),
             isLockTaskActive = isLockTaskActive(),
-            isScreenLocked = false, // Updated by ScreenController
+            isScreenLocked = false, // Kiosk mode never locks the screen; the screen timeout turns it off
             config = _config.value,
             uptimeMs = if (startTime > 0) System.currentTimeMillis() - startTime else 0,
             lastRestartTime = lastRestartTime,
@@ -460,8 +456,8 @@ class KioskManager(
         synchronized(eventLog) {
             eventLog.add(event)
 
-            // Keep last 100 events
-            while (eventLog.size > 100) {
+            // Keep the last MAX_EVENTS events
+            while (eventLog.size > MAX_EVENTS) {
                 eventLog.removeAt(0)
             }
         }
@@ -471,16 +467,32 @@ class KioskManager(
     }
 
     /**
+     * Add an event to the kiosk event log (GET /api/kiosk/events) from outside
+     * the manager: boot and auto-start, the exit gesture and exit PIN attempts
+     * at the phone.
+     */
+    fun recordEvent(type: KioskEventType, message: String, details: Map<String, Any> = emptyMap()) {
+        logEvent(type, message, details)
+    }
+
+    /**
      * Get event log
      */
     fun getEventLog(): List<KioskEvent> = synchronized(eventLog) { eventLog.toList() }
 
     /**
-     * Record a restart (called by crash recovery)
+     * Record an automatic restart after the app stopped (CameraService, when
+     * Android restarts it after a crash or kill). The count and time are saved
+     * at once (commit), so GET /api/kiosk/status shows them across restarts.
      */
     fun recordRestart() {
         restartCount++
         lastRestartTime = System.currentTimeMillis()
+        val saved = restartPrefs.edit()
+            .putInt(KEY_RESTART_COUNT, restartCount)
+            .putLong(KEY_LAST_RESTART_TIME, lastRestartTime)
+            .commit()
+        if (!saved) Timber.tag(TAG).w("Could not save the restart count")
         logEvent(KioskEventType.CRASH_RECOVERY, "App restarted (count: $restartCount)")
         updateStatus()
     }
@@ -531,24 +543,30 @@ class KioskManager(
     }
 
     /**
-     * Apply appliance preset. Kiosk mode stays on or off as it was: turning it
-     * on pins the screen, which is for [requestKioskMode] or [enableKiosk].
+     * Apply appliance preset. Kiosk mode stays on or off as it was (turning it
+     * on pins the screen, which is for [requestKioskMode] or [enableKiosk]),
+     * and the exit PIN is kept.
      */
     fun applyAppliancePreset() {
-        updateConfig(KioskConfig.APPLIANCE.copy(enabled = _config.value.enabled))
+        updateConfig(_config.value.withPreset(KioskConfig.APPLIANCE))
+        logEvent(KioskEventType.PRESET_APPLIED, "Appliance preset applied", mapOf("preset" to "APPLIANCE"))
         Timber.tag(TAG).i("Applied APPLIANCE preset")
     }
 
     /**
-     * Apply interactive preset, leaving kiosk mode on or off as it was.
+     * Apply interactive preset, leaving kiosk mode on or off as it was and
+     * keeping the exit PIN.
      */
     fun applyInteractivePreset() {
-        updateConfig(KioskConfig.INTERACTIVE.copy(enabled = _config.value.enabled))
+        updateConfig(_config.value.withPreset(KioskConfig.INTERACTIVE))
+        logEvent(KioskEventType.PRESET_APPLIED, "Interactive preset applied", mapOf("preset" to "INTERACTIVE"))
         Timber.tag(TAG).i("Applied INTERACTIVE preset")
     }
 
     /**
-     * Set user restrictions for kiosk mode
+     * Set the user restrictions for kiosk mode, as device owner: no factory
+     * reset, no safe boot (it would start the phone without LensDaemon, out of
+     * kiosk mode) and no USB file transfer. [enableKiosk] applies them.
      */
     fun setKioskRestrictions() {
         if (!isDeviceOwner()) return
@@ -581,7 +599,8 @@ class KioskManager(
     }
 
     /**
-     * Clear user restrictions
+     * Clear the kiosk user restrictions, as device owner: when kiosk mode is
+     * turned off ([disableKiosk], [updateConfig]).
      */
     fun clearKioskRestrictions() {
         if (!isDeviceOwner()) return

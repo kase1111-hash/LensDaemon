@@ -8,8 +8,8 @@ import org.junit.Before
 import org.junit.Test
 
 /**
- * Unit tests for TakeManager: the 0-10 score, samples outside takes, cue timing,
- * suggested takes and linking takes to files.
+ * Unit tests for TakeManager: the 0-10 score, sample totals, samples outside takes or
+ * while paused, cue timing, suggested takes and linking takes to files.
  */
 class TakeManagerTest {
 
@@ -59,6 +59,46 @@ class TakeManagerTest {
 
         assertTrue(take.qualityScore >= 0f)
         assertTrue("score ${take.qualityScore} is low", take.qualityScore < TakeManager.SUGGESTED_MIN_SCORE)
+    }
+
+    @Test
+    fun `quality factors are worked out from the sample totals`() {
+        takes.startTake("scene-1", "Opening")
+        listOf(true, true, true, false).forEach { takes.recordFocusSample(it) }
+        listOf(0.2f, 0.4f, 0.6f, 0.8f).forEach { takes.recordExposureSample(it) }
+        listOf(0.1f, 0.3f).forEach { takes.recordMotionSample(it) }
+        listOf(0.5f, 0.5f, 0.5f, 0.95f).forEach { takes.recordAudioSample(it) }
+
+        val factors = takes.endTake()!!.qualityFactors
+
+        assertEquals(75, factors.focusLockPercent)
+        // Exposure variance 0.05, so 1 - 4 x 0.05
+        assertEquals(0.8f, factors.exposureStability, 0.0001f)
+        assertEquals(0.8f, factors.motionStability, 0.0001f)
+        // A quarter of the audio samples out of range: more than the fifth allowed
+        assertFalse(factors.audioLevelOk)
+    }
+
+    @Test
+    fun `a long take is scored from all of its samples`() {
+        takes.startTake("scene-1", "Opening")
+        repeat(400_000) { i -> takes.recordFocusSample(i % 4 != 0) }
+
+        assertEquals(75, takes.endTake()!!.qualityFactors.focusLockPercent)
+    }
+
+    @Test
+    fun `samples are ignored while sampling is paused`() {
+        var paused = false
+        takes.samplingPaused = { paused }
+        takes.startTake("scene-1", "Opening")
+        recordGoodSamples()
+
+        paused = true
+        recordPoorSamples()
+        paused = false
+
+        assertEquals(10f, takes.endTake()!!.qualityScore, 0.01f)
     }
 
     @Test
@@ -178,7 +218,7 @@ class TakeManagerTest {
     fun `cue timing on time keeps a full score`() {
         takes.startTake("scene-1", "Opening")
         recordGoodSamples()
-        takes.recordCueExecution("cue-1", expectedTimeMs = System.currentTimeMillis(), success = true)
+        takes.recordCueExecution("cue-1", expectedTimeMs = TakeManager.monotonicNowMs(), success = true)
 
         val take = takes.endTake()!!
 
@@ -190,7 +230,7 @@ class TakeManagerTest {
     fun `cue far behind its time lowers the score`() {
         takes.startTake("scene-1", "Opening")
         recordGoodSamples()
-        takes.recordCueExecution("cue-1", expectedTimeMs = System.currentTimeMillis() - 5_000, success = true)
+        takes.recordCueExecution("cue-1", expectedTimeMs = TakeManager.monotonicNowMs() - 5_000, success = true)
 
         val take = takes.endTake()!!
 
@@ -225,6 +265,18 @@ class TakeManagerTest {
 
         assertEquals(1, comparison.bestTake?.takeNumber)
         assertTrue(comparison.recommendation, comparison.recommendation.contains("excellent"))
+    }
+
+    @Test
+    fun `a take is unused until a cue runs in it`() {
+        assertFalse(takes.isUnusedTakeOf("scene-1"))
+        takes.startTake("scene-1", "Opening")
+        assertTrue(takes.isUnusedTakeOf("scene-1"))
+        assertFalse(takes.isUnusedTakeOf("scene-2"))
+
+        takes.recordCueExecution("cue-1", expectedTimeMs = null, success = false)
+
+        assertFalse(takes.isUnusedTakeOf("scene-1"))
     }
 
     @Test

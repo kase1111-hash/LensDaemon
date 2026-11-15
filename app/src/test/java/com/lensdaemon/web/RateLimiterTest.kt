@@ -131,4 +131,26 @@ class RateLimiterTest {
         }
         assertEquals(60, allowed)
     }
+
+    @Test
+    fun `past the cap the clients idle longest are forgotten`() {
+        val capped = RateLimiter(maxTokens = 5, refillPerSecond = 1.0, cleanupIntervalMs = 60_000L, maxBuckets = 3)
+        for (client in listOf("a", "b", "c", "d")) {
+            assertTrue(capped.tryAcquire(client))
+            Thread.sleep(5)
+        }
+        assertEquals(3, capped.trackedClients())
+        // "a" was idle longest: forgotten, so it starts again with a full bucket
+        assertEquals(5, capped.remainingTokens("a"))
+        // The client that just asked keeps its bucket
+        assertEquals(4, capped.remainingTokens("d"))
+    }
+
+    @Test
+    fun `a client cycling through addresses cannot grow the map without bound`() {
+        val capped = RateLimiter(maxBuckets = 16)
+        repeat(1000) { capped.tryAcquire("10.0.${it / 256}.${it % 256}") }
+        assertTrue(capped.trackedClients() <= 16)
+        assertEquals(1024, RateLimiter.MAX_BUCKETS)
+    }
 }
