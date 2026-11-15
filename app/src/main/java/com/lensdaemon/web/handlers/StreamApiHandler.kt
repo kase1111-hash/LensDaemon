@@ -333,11 +333,12 @@ class StreamApiHandler {
     // ==================== Recording Control ====================
 
     /**
-     * POST /api/recording/start. While a recording is open (running or
-     * paused) it is left as it is and the reply says so, so a double click or
-     * a retry does no harm. Starts run one at a time: a second one waits for
-     * the first and then finds its recording open, instead of reaching the
-     * camera service while the first is still starting the encoder.
+     * POST /api/recording/start. While a recording runs or is paused it is
+     * left as it is and the reply says so, so a double click or a retry does
+     * no harm; a recorder left in an error is replaced by the new recording.
+     * Starts run one at a time: a second one waits for the first and then
+     * finds its recording running, instead of reaching the camera service
+     * while the first is still starting the encoder.
      */
     private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
@@ -433,15 +434,21 @@ class StreamApiHandler {
         return ApiHandlerUtils.jsonResponse(if (success) Status.OK else Status.BAD_REQUEST, json.toString())
     }
 
-    /** GET /api/recording/status: "recording" is true while a recording is open, running or paused. */
+    /**
+     * GET /api/recording/status: "recording" is true while a recording is open
+     * (running, paused, or a recorder that reported an error but still holds
+     * its file, see [CameraService.isRecordingOpen]); "lastError" is the last
+     * error the recorder reported since the last recording start, else null.
+     */
     private fun getRecordingStatus(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
         val stats = camera.getRecordingStats()
 
         val json = JSONObject().apply {
-            put("recording", camera.isRecording() || camera.isRecordingPaused())
+            put("recording", camera.isRecordingOpen())
             put("paused", camera.isRecordingPaused())
+            put("lastError", camera.getLastRecordingError() ?: JSONObject.NULL)
             put("state", stats.state.name)
             put("currentFile", stats.currentFilePath ?: "")
             put("framesInSegment", stats.framesInSegment)

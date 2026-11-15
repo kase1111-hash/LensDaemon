@@ -167,7 +167,9 @@ seconds. It needs no token.
   },
   "recording": {
     "active": true,
-    "paused": false
+    "paused": false,
+    "error": false,
+    "lastError": null
   },
   "thermal": {
     "cpuTemperatureC": 41.5,
@@ -200,20 +202,31 @@ seconds. It needs no token.
 ```
 
 - `camera.thermalPaused`: the phone got too hot (thermal EMERGENCY) and
-  LensDaemon stopped the outputs that ran. They start again by themselves once
-  it has cooled (see [How throttling works](#how-throttling-works)).
+  LensDaemon stopped the outputs that ran, or holds back the outputs kiosk mode
+  was about to start by itself (at boot, or after a crash). They start by
+  themselves once it has cooled (see [How throttling works](#how-throttling-works)).
 - `camera.exposure` is in the camera's compensation steps: `value * step` is
   the compensation in EV. `maxZoom` and `exposure` are present while the camera
   service is connected.
 - `encoder.state` is `IDLE`, `CONFIGURING`, `READY`, `ENCODING`, `STOPPING` or
-  `ERROR`. `currentBitrate` and `currentFps` are measured over the last two
+  `ERROR`. While `camera.streamingActive` is true and the state is not
+  `ENCODING` (usually `ERROR`), a failed encoder is being rebuilt with the
+  outputs kept (see [When the encoder fails](#when-the-encoder-fails)).
+  `currentBitrate` and `currentFps` are measured over the last two
   seconds, and read 0 once nothing has been encoded for two seconds. `width`,
   `height` and `frameRate` are what the encoder runs at (lower while the thermal
   CRITICAL limits are on); `bitrate` is its configured bitrate (a thermal
   bitrate cut shows in `currentBitrate` only). They are missing while no
   encoder runs.
-- `recording.active` is true while a recording is open, running or paused;
-  `paused` is true while it is paused.
+- `recording.active` is true while a recording is open: running, paused, or
+  held by a recorder that reported an error but still has its file open (Stop
+  Recording closes it). `paused` is true while it is paused. `error` is true
+  from an error the recorder reports until the recording is stopped or a new
+  one starts.
+- `recording.lastError` is the last error the recorder reported since the last
+  recording start, such as `Storage full - recording stopped` (see
+  [Retention policy](#retention-policy)), kept after the stop that follows it
+  and cleared when a recording starts; `null` when there was none.
 - `thermal` is present once the web server is connected to thermal monitoring,
   which it starts; the temperatures read 0 until the first reading.
   `GET /api/thermal/status` has the detail.
@@ -273,7 +286,9 @@ thermal limit) as the phone's stream defaults, together with the RTSP port for
 `/api/rtsp/start` and the file length for `/api/recording/start`: the settings
 the request asked for when it started (or, with `/api/stream/start`,
 restarted) the encoder, else those of the encoder it joined. A start without
-settings uses the saved defaults, so it leaves them as they were.
+settings uses the saved defaults, so it leaves them as they were. The restart
+after a thermal pause (see [How throttling works](#how-throttling-works)) is no
+new start: it saves nothing.
 
 The camera's auto-exposure is held at the stream's frame rate, so the stream
 does not drop frames in dim light; if the camera cannot reach the requested
@@ -284,10 +299,18 @@ rate it runs at its fastest fixed rate instead.
 Start the encoder only, with the given settings (see above), and keep it
 running until `/api/stream/stop`, whether or not any output is attached. RTSP,
 MPEG-TS and recording are started by their own endpoints and share this
-encoder. If the encoder is already running with different settings it is
-restarted: RTSP and MPEG-TS viewers stay connected and continue from the new
-stream's first keyframe, and an open recording continues in a new file (a
-paused one stays paused).
+encoder.
+
+If the encoder is already running with different settings it is restarted.
+RTSP and MPEG-TS viewers stay connected and continue from the new stream's
+first keyframe, except after a change of codec (H.264 to H.265 or back): then
+every RTSP viewer is disconnected, because the stream no longer matches the
+SDP it was given, and has to connect again to get the new one. Players such as
+OBS do that by themselves; others, such as VLC, stop and have to be started
+again. The RTSP server keeps running. MPEG-TS receivers keep receiving, and a
+new PMT announces the new stream type. An open recording continues in a new
+file (a paused one stays paused). If the encoder does not start with the new
+settings, every output stops and the answer is `500`.
 
 **Response:**
 ```json
@@ -323,8 +346,10 @@ The encoder's state and counters.
 }
 ```
 
-`active` is true while the encoder runs; `duration` is in seconds. The counters
-and `config` are missing while no encoder runs.
+`active` is true while the encoder runs, and also while a failed encoder is
+being rebuilt (then `encoderState` is not `ENCODING`, see
+[When the encoder fails](#when-the-encoder-fails)); `duration` is in seconds.
+The counters and `config` are missing while no encoder runs.
 
 ### POST /api/stream/stop
 
@@ -338,6 +363,32 @@ the encoder.
   "message": "Streaming stopped"
 }
 ```
+
+### When the encoder fails
+
+When the encoder fails while outputs run (a codec error, or a thermal CRITICAL
+restart whose new encoder did not start), the outputs are kept and the encoder
+is rebuilt with the same settings, within the thermal limits then in force,
+after 1, 2, 5, 10 and 30 seconds, until one rebuild runs. A rebuilt encoder
+that fails again within a minute goes on with the next wait instead of
+starting over.
+
+While a rebuild is pending:
+- `camera.streamingActive` (`/api/status`) and `active`
+  (`/api/stream/status`) stay true while `encoder.state` / `encoderState` is
+  not `ENCODING` (usually `ERROR`).
+- `rtsp.running` and `mpegts.running` stay true. Viewers stay connected but
+  receive nothing, and continue from the next keyframe once the encoder runs.
+- An open recording's file is closed at the first attempt, so
+  `recording.active` reads false until a rebuild works; the recording then
+  continues in a new file, still paused if it was paused.
+  `POST /api/recording/stop` in the meantime drops it.
+
+Stopping everything that uses the encoder, or `POST /api/stream/stop`, ends
+the rebuilding. If no rebuild works (about 48 seconds after the failure),
+every output and the encoder stop, as with `POST /api/stream/stop`, also an
+encoder started with `/api/stream/start`. Nothing restarts them, and no error
+is reported.
 
 ### GET /api/audio, POST /api/audio
 
@@ -369,6 +420,20 @@ Switch the active camera lens.
 A family takes the nearest lens of it the phone has: `wide` uses the
 ultra-wide on a phone without a plain wide lens, `tele` a 5x periscope on a
 phone without a 3x.
+
+Switching to a different lens (here, with the phone's lens buttons or by a
+director cue) resets these as soon as the request is answered, before the new
+lens has opened:
+- zoom 1x and exposure compensation 0;
+- continuous video autofocus, or, on a lens without it, the first of one-shot
+  autofocus (`AUTO`) and manual focus it has (a fixed-focus lens stays fixed);
+- no tap-to-focus or spot-metering regions.
+
+`/api/status` then reports the new lens's `maxZoom` and exposure range, and
+zoom, exposure and focus requests sent after the switch apply to the new lens.
+Asking for the lens already in use reopens it and keeps the zoom, exposure and
+focus (except a focus hold from the director's `[FOCUS: MANUAL]`, which goes
+back to continuous autofocus).
 
 **Response:**
 ```json
@@ -539,10 +604,12 @@ encoder, which may support less or more. (`1080p60` is a name only: its size is
 
 ## RTSP
 
-The RTSP server runs on port 8554 and supports up to 10 concurrent clients,
-over UDP or TCP (interleaved). Any path is accepted;
-`rtsp://<device-ip>:8554/stream` is the advertised one. It has no
-authentication.
+The RTSP server runs on the port its start request gives, else on the saved
+stream default `rtspPort` (8554 until another is saved with
+`PUT /api/config` `defaults`), and supports up to 10 concurrent clients, over
+UDP or TCP (interleaved). Any path is accepted;
+`rtsp://<device-ip>:<port>/stream` is the advertised one, the `url` that the
+start response and `GET /api/rtsp/status` give. It has no authentication.
 
 With audio on, the SDP offers a second track, `trackID=1`: AAC as
 `MPEG4-GENERIC` (RFC 3640, AAC-hbr). Each track sends RTCP sender reports
@@ -559,8 +626,11 @@ rather than decoding a damaged picture.
 
 Start the RTSP server, starting the encoder too if it is not running.
 
-**Request (all optional):** the encoder fields above, plus `port` (default
-`8554`). A server that already runs keeps its port.
+**Request (all optional):** the encoder fields above, plus `port` (default:
+the saved `rtspPort`, 8554 until another is saved). A server that already runs
+keeps its port. A successful start saves the port the server listens on as the
+new default (see
+[Encoder settings in start requests](#encoder-settings-in-start-requests)).
 
 **Response:**
 ```json
@@ -690,7 +760,8 @@ Stop the publisher. The encoder keeps running if another output still uses it.
 ### POST /api/zoom
 
 Set the zoom of the lens in use, from 1x to its `maxZoom` (see `/api/status`).
-The lens does not change: switch lenses with `/api/lens/{lens}`.
+The lens does not change: switch lenses with `/api/lens/{lens}`. The zoom
+applies to the lens in use; a lens change goes back to 1x.
 
 **Request:**
 ```json
@@ -720,7 +791,8 @@ clamped). The camera stays in continuous video autofocus and is given a focus
 region there; the exposure is not metered on it. A lens without continuous
 video autofocus (fixed focus, or one-shot autofocus only) has no tap-to-focus:
 the request is refused with `409` and nothing changes, so a success means the
-region was set. The answer does not report a focus state.
+region was set. The answer does not report a focus state. A lens change drops
+the region.
 
 **Request:**
 ```json
@@ -754,7 +826,8 @@ continuous autofocus, answering `{"success": true, "reset": true}`.
 Set exposure compensation, in the camera's compensation steps: a whole number
 within `camera.exposure.min`..`max` from `GET /api/status` (values beyond are
 clamped). One step is `camera.exposure.step` EV (often 1/6 or 1/3), so `-6` is
--1 EV at 1/6 EV steps.
+-1 EV at 1/6 EV steps. The compensation applies to the lens in use; a lens
+change goes back to 0.
 
 **Request:**
 ```json
@@ -790,7 +863,10 @@ its own.
 
 **Request (all optional):** the encoder fields above, plus `segmentMinutes`:
 a new file every `1`, `5`, `15`, `30` or `60` minutes, or `0` for one
-continuous file (default `5`; other values count as `5`).
+continuous file (default: the saved `segmentMinutes`, `5` until another is
+saved; other values count as `5`). A successful start saves the file length it
+records with as the new default (see
+[Encoder settings in start requests](#encoder-settings-in-start-requests)).
 
 **Response:**
 ```json
@@ -816,10 +892,13 @@ answer says so, so a double click or a retry does no harm:
 ```
 
 When it is paused, `"paused": true` and the message is
-`Recording is paused: resume it with POST /api/recording/resume`.
+`Recording is paused: resume it with POST /api/recording/resume`. A recorder
+left in an error (`recording.error` in `/api/status`), even one that still has
+its file open, does not count: the start replaces it with a new recording.
 
 `500` when it could not start (the encoder did not start, or there is less
-than 500 MB free after the clean-up, see [Storage](#storage)):
+than 500 MB free after the clean-up, see [Storage](#storage); then `lastError`
+in `GET /api/recording/status` is `Critically low storage space`):
 
 ```json
 {"success": false, "message": "Failed to start recording", "error": "Failed to start recording"}
@@ -880,6 +959,7 @@ when the recording is not paused.
 {
   "recording": true,
   "paused": false,
+  "lastError": null,
   "state": "RECORDING",
   "currentFile": "/storage/emulated/0/Android/data/com.lensdaemon/files/recordings/LensDaemon_Pixel_7_Pro_20261114_090500_seg001.mp4",
   "framesInSegment": 1800,
@@ -895,8 +975,14 @@ when the recording is not paused.
 }
 ```
 
-- `recording` is true while a recording is open, running or paused; `paused`
-  while it is paused.
+- `recording` is true while a recording is open: running, paused, or held by a
+  recorder that reported an error but still has its file open (`currentFile`
+  set), which `POST /api/recording/stop` closes. `paused` is true while it is
+  paused.
+- `lastError` is the last error the recorder reported since the last recording
+  start (`Storage full - recording stopped`, `Critically low storage space`,
+  `Failed to start muxer`, ...), kept after the stop that follows it; `null`
+  when there was none.
 - `state` is `IDLE`, `STARTING`, `RECORDING`, `PAUSED`, `STOPPING` or `ERROR`.
 - `currentFile` is the file being written (`""` when none), which download,
   delete and upload refuse with 409 until it closes.
@@ -986,9 +1072,12 @@ It runs:
 - on `POST /api/storage/cleanup`.
 
 A recording does not start with less than 500 MB free after the clean-up. A
-recording whose clean-up cannot bring free space back over 500 MB is stopped,
-with the error `Storage full - recording stopped`, while there is still room to
-close its file.
+recording whose clean-up cannot bring free space back over 500 MB is stopped
+while there is still room to close its file: `recording.active` turns false,
+and `recording.lastError` in `GET /api/status` (`lastError` in
+`GET /api/recording/status`) reads `Storage full - recording stopped` until the
+next recording starts. The dashboard shows it as the reason the recording
+stopped.
 
 ### GET /api/storage/status
 
@@ -1445,7 +1534,9 @@ override saved with `PUT /api/thermal/profile`. With the generic profile:
 - At `CRITICAL` the outputs stay connected while the encoder restarts: viewers
   continue from the next keyframe and a recording continues in a new file (a
   paused one stays paused). The requested settings come back once the CPU has
-  cooled.
+  cooled. An encoder that does not start with the limited settings is rebuilt
+  with the outputs kept, as after a failure (see
+  [When the encoder fails](#when-the-encoder-fails)).
 - At `EMERGENCY` LensDaemon remembers what ran (RTSP with its port, MPEG-TS
   with its settings, the recording with its file length and whether it was
   paused, the encoder settings) and stops it all; `/api/status` reports
@@ -1455,6 +1546,11 @@ override saved with `PUT /api/thermal/profile`. With the generic profile:
   datagram again. Starting or stopping an output during the pause cancels the
   automatic restart. The CPU is kept awake during the pause, so the cool-down is noticed
   with the screen off.
+- During an `EMERGENCY` (also one that found nothing running to stop), the
+  outputs kiosk mode starts by itself (at boot, or after a crash) wait for the
+  same cool-down and start then, with `camera.thermalPaused` true meanwhile; a
+  start or stop from the user drops them. The restart after the cool-down
+  leaves the saved stream defaults as they were.
 - "Charging held" stops charging only on phones whose charging switch the app
   can write (`chargeControl.available`). Elsewhere the phone keeps charging and
   `chargeControl.recommendation` says to unplug the charger.
@@ -1785,6 +1881,12 @@ the device owner:
 adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 ```
 
+For a normal install this cannot be undone over ADB or from the app: only a
+factory reset removes Device Owner again (turn kiosk mode off first, since it
+blocks factory reset in the phone's settings). `adb shell dpm
+remove-active-admin` works only for a test-only build that was already
+installed when `set-device-owner` ran (see CONTRIBUTING.md).
+
 What kiosk mode does, with Device Owner:
 - **Pinned** (lock task mode): Home and Recents are blocked, the status bar is
   hidden; the power menu stays available while the exit gesture is allowed.
@@ -1815,6 +1917,8 @@ What kiosk mode does, with Device Owner:
   `GET /api/config`). `startStreaming` alone starts nothing. The settings are
   read again at that point, so turning kiosk mode or its auto-start off during
   the wait (from the dashboard, which is already up) starts nothing more.
+  During a thermal `EMERGENCY` the outputs wait until the phone has cooled (see
+  [How throttling works](#how-throttling-works)).
 - Without Device Owner, Android 10+ does not let LensDaemon open its screen by
   itself, and Android 11+ gives it no camera when started at boot: on Android
   11+ the camera is therefore not started, and only the web server and thermal
@@ -1823,7 +1927,8 @@ What kiosk mode does, with Device Owner:
 **After a crash or when Android kills the app**, Android restarts LensDaemon's
 camera service. With kiosk mode, `autoStart.enabled` and
 `crashRecovery.autoRestart` on, it brings back the auto-start outputs (with the
-stream defaults), thermal monitoring and, as device owner, the pinned screen.
+stream defaults; during a thermal `EMERGENCY`, once the phone has cooled),
+thermal monitoring and, as device owner, the pinned screen.
 At most `crashRecovery.maxRestartAttempts` restarts happen within
 `crashRecovery.restartWindowMinutes` (0 attempts means no limit); each is
 counted in `restartCount`. `restartDelayMs` is not used: Android chooses when
@@ -2090,13 +2195,27 @@ Start and Resume read the temperature again and refuse while it is too hot.
 **Takes:** each scene a run enters gets its own take (`autoTakeSeparation`).
 Pause keeps the take open and Resume continues it; Stop and the end of the
 script end it, and go back to the first scene. Takes score 0 to 10 from samples
-taken while they run: focus lock (30%), exposure stability (20%), steadiness
-(25%), cue timing (15%, left out when no script cue ran) and audio (10%). On
-the phone, exposure and steadiness are placeholders (the configured
-compensation, and a constant per stabilisation mode) and audio is not
-measured, so takes differ mostly in focus lock and cue timing. The best take of each
-scene scoring at least 5 is `suggested`. With `qualityScoring` off, takes
-score 0.
+taken 10 times a second while they run: focus lock (30%), exposure stability
+(20%), steadiness (25%), cue timing (15%, left out when no script cue ran) and
+audio (10%).
+- Focus lock is the share of samples in which the picture counts as in focus:
+  with continuous autofocus, while the camera reports it has focused (the
+  autofocus state of its latest frame); with focus that does not move by
+  itself (a fixed-focus lens, or a focus set by `[FOCUS: BACKGROUND]` or held
+  by `[FOCUS: MANUAL]`), always.
+- Exposure stability is a placeholder: it follows the exposure compensation
+  set, not a measurement, so it is 1 unless the compensation changes during the
+  take.
+- Steadiness is a placeholder too: a constant 0.7, the value for stabilisation
+  off, which LensDaemon never switches on.
+- Audio is not measured and counts as OK.
+
+So takes differ in focus lock and cue timing (and in exposure stability when
+the compensation changes during a take), and score at most about 9.25 (about
+9.1 without script cues). `GET /api/director/takes/compare` notes "focus
+issues" when the best take was in focus less than 80% of the time. The best
+take of each scene scoring at least 5 is `suggested`. With `qualityScoring`
+off, takes score 0.
 
 ### GET /api/director/status
 
@@ -2274,7 +2393,10 @@ Run the loaded script from the current cue (from the first scene after Stop).
 ### POST /api/director/stop
 
 Stop the run; its take ends and the position goes back to the first scene. A
-thermal hold stays until the phone cools.
+thermal hold stays until the phone cools. Nothing on the camera changes: the
+exposure preset and focus target the run left stay in force for cues run by
+hand, and a new run from the top starts without the preset (see
+[Exposure](#script-cue-format-reference) in the cue reference).
 
 **Response:**
 ```json
@@ -2400,9 +2522,9 @@ All recorded takes.
       "filePath": "",
       "qualityScore": 7.8,
       "qualityFactors": {
-        "focusLockPercent": 92,
-        "exposureStability": 0.9,
-        "motionStability": 0.8,
+        "focusLockPercent": 54,
+        "exposureStability": 1.0,
+        "motionStability": 0.7,
         "audioLevelOk": true,
         "cueTimingAccuracy": 0.95
       },
@@ -2797,16 +2919,36 @@ are not case-sensitive.
   0.67 (not below 1x), animated over the duration (default 1 s); `RACK FOCUS`
   switches the focus between face and background; `CUT` and `HOLD` keep the
   framing.
+- `[TRANSITION]`, `[FOCUS]` and `[EXPOSURE]` cues start from the lens and zoom
+  the camera has (or is heading to, while a lens switch or zoom animation of
+  the director's is under way), also when they were changed on the phone or
+  the dashboard: `[FOCUS]` and `[EXPOSURE]` keep them, and a `PUSH IN` after a
+  zoom to 2x on the dashboard goes to 3x.
 - **Focus**: `AUTO` and `FACE` are continuous autofocus (there is no face
   priority yet); `HANDS` focuses on the lower middle of the frame and `OBJECT`
   on its centre; `BACKGROUND` focuses at infinity (lenses with manual focus
-  only); `MANUAL` locks the focus where it is.
+  only). `MANUAL` holds the focus where it is: on a lens with autofocus the
+  camera goes to one-shot autofocus (`AUTO` as `camera.focusMode` in
+  `GET /api/config`) without triggering it, so the lens stays where continuous
+  autofocus left it. The hold lasts until the focus is changed again (the next
+  `[SHOT]` or `[CUT TO]` goes back to continuous autofocus too) or the camera
+  reopens a lens, as on a lens change. A lens without autofocus is left as it
+  is.
 - **Exposure**: `AUTO` 0, `BRIGHT` +1, `DARK` -1, `BACKLIT` +2 and
-  `SILHOUETTE` -2 EV, in the lens's own steps and within its range. A preset
-  other than `AUTO` stays in force across shots and lens changes until another
+  `SILHOUETTE` -2 EV, in the lens's own steps and within its range. Every
+  `[EXPOSURE]` cue sets its preset, `AUTO` included, so `[EXPOSURE: AUTO]`
+  puts 0 EV back over an exposure set from the dashboard. A preset other than
+  `AUTO` stays in force across shots and lens changes until another
   `[EXPOSURE]` cue; while it does, an exposure set from the dashboard is
-  replaced at the next director command. Scripts without `[EXPOSURE]` cues
-  never touch the exposure.
+  replaced at the next director command. Stop keeps it for cues run by hand. A
+  run from the top starts without it: its first camera command puts 0 EV back,
+  unless that is an `[EXPOSURE]` cue. Loading or clearing a script and turning
+  the director off forget it without changing the camera's exposure.
+- Scripts without `[EXPOSURE]` cues send no exposure, but a `[SHOT]` or
+  `[CUT TO]` that changes the lens starts the new lens at 0 EV (see
+  [POST /api/lens/{lens}](#post-apilenslens)), so an exposure set from the
+  dashboard is lost at the first lens change. The shot's own zoom is applied
+  after the switch.
 - Plain lines that say "wide shot", "establishing shot", "master shot", "wide
   angle", "close-up", "tight shot", "detail shot", "medium shot", "waist shot"
   or "mid shot" are read as shot cues too.

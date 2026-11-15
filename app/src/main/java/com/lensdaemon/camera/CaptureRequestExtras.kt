@@ -2,15 +2,32 @@ package com.lensdaemon.camera
 
 import android.graphics.Rect
 import android.hardware.camera2.CameraAccessException
+import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.CaptureResult
+import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.MeteringRectangle
 import android.os.Build
 import timber.log.Timber
 
-// Zoom and tap regions for LensDaemonCameraManager's capture request, kept here
-// so that class stays small. The maths is in MeteringRegions (unit-tested).
+// Zoom and tap regions for LensDaemonCameraManager's capture request, and the
+// callback for its capture results, kept here so that class stays small. The
+// maths is in MeteringRegions (unit-tested).
+
+/**
+ * A capture callback that hands each completed frame's result (with the
+ * camera's autofocus and auto-exposure states) to [onResult], on the thread of
+ * the handler the request was sent with: the camera thread, so [onResult] must
+ * return quickly.
+ */
+internal fun captureResultCallback(onResult: (CaptureResult) -> Unit): CameraCaptureSession.CaptureCallback =
+    object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            onResult(result)
+        }
+    }
 
 /**
  * Zoom by [zoom]: CONTROL_ZOOM_RATIO where the camera supports it (Android 11+),

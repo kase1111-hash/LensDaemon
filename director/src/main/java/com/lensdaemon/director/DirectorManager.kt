@@ -79,9 +79,10 @@ class DirectorManager internal constructor(
 
         /**
          * Apply an exposure preset. The director sends the preset of every [EXPOSURE] cue,
-         * AUTO included, and a preset other than AUTO with every command while it is in force.
-         * The camera sets the preset wherever its exposure differs, including on a lens that
-         * opens after the call: a lens change starts the new lens at 0 EV.
+         * AUTO included, and a preset other than AUTO with every command while it is in force;
+         * a run from the top sends AUTO in place of such a preset. The camera sets the preset
+         * wherever its exposure differs, including on a lens that opens after the call: a lens
+         * change starts the new lens at 0 EV.
          */
         fun setExposurePreset(preset: ExposurePreset)
         fun getCurrentTemperature(): Int
@@ -167,7 +168,8 @@ class DirectorManager internal constructor(
      * director sent, so a script without [EXPOSURE] cues never undoes an exposure set on the
      * dashboard; any other preset goes with every command, and the camera puts it back where
      * it was lost: a lens change starts the new lens at 0 EV. Loading or clearing a script and
-     * turning the director off forget the preset, without sending anything.
+     * turning the director off forget the preset, without sending anything. A run from the top
+     * forgets the preset too, and its first command sends AUTO in its place.
      */
     private var lastAppliedExposure = ExposurePreset.AUTO
 
@@ -289,7 +291,9 @@ class DirectorManager internal constructor(
      * Start executing the loaded script, or resume a paused one, from the current cue (from
      * the next scene with cues when the current one has none). Refused without a script, in
      * other states, and while the phone is too hot, which is read now: a thermal hold clears
-     * here when the phone has cooled enough.
+     * here when the phone has cooled enough. A run from the top of the script (not a resume)
+     * starts without the exposure preset left in force; a run that goes on from a later cue
+     * keeps it.
      */
     fun startExecution(): Boolean {
         synchronized(controlLock) {
@@ -304,6 +308,12 @@ class DirectorManager internal constructor(
                 val session = _currentSession.value ?: return false
                 val start = runnablePosition(session)
                 if (start == null || _state.value != from) return false
+                // A run from the top starts without the preset a run or cue left on. [lastAppliedExposure]
+                // stays as it is, so the run's first command sends AUTO in its place (an [EXPOSURE]
+                // cue sends its own)
+                if (from == DirectorState.READY && session.currentSceneIndex == 0 && session.currentCueIndex == 0) {
+                    synchronized(cameraLock) { shotMapper.forgetExposure() }
+                }
                 _currentSession.value = session.copy(currentSceneIndex = start.scene, currentCueIndex = start.cue)
                 _state.value = DirectorState.RUNNING
                 emitEvent(DirectorEvent.StateChanged(DirectorState.RUNNING))
@@ -344,8 +354,8 @@ class DirectorManager internal constructor(
     /**
      * Stop execution: a running or paused script stops, its take ends, and the position goes
      * back to the first scene. A thermal hold stays until the phone cools. The camera keeps
-     * the framing, focus and exposure preset the script left, and the cues that follow start
-     * from them.
+     * the framing, focus and exposure preset the script left: cues run by hand start from
+     * them, and a run from the top starts without the exposure preset.
      */
     fun stopExecution() {
         val newState = synchronized(controlLock) {

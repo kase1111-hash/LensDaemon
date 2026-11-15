@@ -12,8 +12,12 @@ import timber.log.Timber
  * Setup command (via ADB):
  * adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
  *
- * Remove command:
- * adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
+ * Removing it again: `adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver`
+ * works only if the app was a test-only build when set-device-owner ran (Android
+ * records the flag then): Android Studio's Run, or a build with
+ * -Pandroid.injected.testOnly=true installed with `adb install -t`. A normal install
+ * can't be removed over ADB, and the app never gives device owner up, so only a
+ * factory reset frees the phone (turn kiosk mode off first: it blocks factory reset).
  */
 class AdminReceiver : DeviceAdminReceiver() {
 

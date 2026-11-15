@@ -115,6 +115,13 @@ class LensDaemonCameraManager(private val context: Context) {
     @Volatile
     var onImageAvailable: ((android.media.Image) -> Unit)? = null
 
+    /**
+     * Receives every frame's capture result from the repeating request, on the
+     * camera thread (see [captureResultCallback]); must return quickly. Takes
+     * effect with the next repeating request.
+     */
+    @Volatile var captureCallback: CameraCaptureSession.CaptureCallback? = null
+
     init {
         enumerateCameras()
         _availableLenses.firstOrNull()?.let { mediaClock = queryMediaClock(it.cameraId) }
@@ -673,6 +680,8 @@ class LensDaemonCameraManager(private val context: Context) {
     private fun startRepeatingRequest() {
         val device = cameraDevice ?: return
         val session = captureSession ?: return
+        // Capture results arrive on the camera thread; without it the camera is closing
+        val handler = cameraHandler ?: return
         val targets = activeSurfaces()
         if (targets.isEmpty()) return
 
@@ -718,8 +727,8 @@ class LensDaemonCameraManager(private val context: Context) {
 
         session.setRepeatingRequest(
             requestBuilder.build(),
-            null,
-            cameraHandler
+            captureCallback,
+            handler
         )
     }
 

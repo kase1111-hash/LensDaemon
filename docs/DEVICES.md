@@ -72,7 +72,7 @@ The following devices have been tested with LensDaemon by the community. Results
 ### Google Pixel
 
 - **USB camera switching.** When a USB camera or accessory is connected, some Pixel devices may re-enumerate camera IDs, causing LensDaemon to lose its reference to the active camera. Disconnect USB accessories before starting a streaming session, or restart the camera service after connecting.
-- **Tensor thermal behavior.** Pixel 6 and newer use Google Tensor chips, which run warmer than Qualcomm equivalents under sustained H.265 encoding. The bundled Pixel 6, 7 and 8 profiles (applied automatically) already set lower CPU thresholds than the generic ones; consider the `AGGRESSIVE` thresholds for 4K encoding sessions.
+- **Tensor thermal behavior.** Pixel 6 and newer use Google Tensor chips, which run warmer than Qualcomm equivalents under sustained H.265 encoding. The bundled Pixel 6, 7 and 8 profiles, applied automatically to those exact models (a Pro or `a` model may get another entry or the generic thresholds, see [Thermal Profiles](#thermal-profiles)), already set lower CPU thresholds than the generic ones; consider the `AGGRESSIVE` thresholds for 4K encoding sessions.
 - **Night Sight interference.** Pixel's computational photography pipeline is not used by LensDaemon (which accesses Camera2 directly), but some background camera processes may briefly interfere with session startup.
 
 ### OnePlus
@@ -86,9 +86,31 @@ LensDaemon reads the CPU and battery temperatures every 5 seconds and throttles
 in steps. The thresholds come from a thermal profile:
 
 - **Bundled profiles** for the Pixel 5, 6, 7 and 8, Galaxy S22, S23, S24+ and A54,
-  OnePlus 11 and Xiaomi 13 (`app/src/main/assets/thermal_profiles.json`). The one
-  for your phone is picked by its model name, device name or chip when the app
-  starts.
+  OnePlus 11 and Xiaomi 13 (`app/src/main/assets/thermal_profiles.json`). When
+  the app starts it takes the entry whose model name equals the phone's model
+  name (such as `Pixel 7`) or device name exactly; failing that, the first
+  entry for the phone's chip (`socModel`, which some phones leave empty);
+  failing that, the generic thresholds. So today:
+  - The Pixel 5, 6, 7 and 8 get their own entries by name. Their Pro and `a`
+    models have other names and are matched by chip, if at all: they may get
+    another phone's entry or the generic thresholds.
+  - Samsung model names carry a variant suffix (`SM-S911B` against the
+    entry's `SM-S911`), so Samsung phones are matched by chip only: the
+    Snapdragon Galaxy S22, S23 and S24+ get their entries, while the Exynos S22
+    (`SM-S901B`) and S24+ (`SM-S926B`) and the Galaxy A54 get the generic
+    thresholds.
+  - The OnePlus 11 and Xiaomi 13 report model names (`CPH2449`, `2211133G`)
+    other than their entries' (`OnePlus 11`, `Xiaomi 13`), and share the Galaxy
+    S23's chip, so both get the Galaxy S23 entry: the same thresholds as the
+    OnePlus 11's own, while its CPU thresholds are 1°C above the Xiaomi 13's
+    own.
+
+  Check which profile your phone got with `GET /api/thermal/profile`, and how it
+  identifies itself with `GET /api/thermal/profile/device`. To use another
+  entry's thresholds (`GET /api/thermal/profiles` lists them all), save them as
+  an override with `PUT /api/thermal/profile` (see below); for the Xiaomi 13:
+  `cpuWarnC` 47, `cpuCriticalC` 52, `cpuEmergencyC` 57, `batteryWarnC` 42,
+  `batteryCriticalC` 45, `batteryEmergencyC` 48.
 - **Generic** thresholds (the DEFAULT set below) on every other phone.
 - **Your own thresholds**, saved as an override with `PUT /api/thermal/profile`.
   They apply at once and after restarts, until `DELETE /api/thermal/profile`

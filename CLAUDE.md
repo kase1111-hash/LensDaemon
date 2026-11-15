@@ -165,6 +165,9 @@ app/src/main/java/com/lensdaemon/camera/
 │                                # - Multi-camera/physical camera support
 │                                # - Session management and frame capture
 │                                # - Zoom, focus, exposure, white balance control
+│                                # - captureCallback: every frame's capture result, on the
+│                                #   camera thread (CameraService feeds the focus and
+│                                #   exposure controllers' AF/AE state from it)
 ├── PreviewSurfaceProvider.kt    # Preview surface lifecycle management
 │                                # - SurfaceView and TextureView support
 │                                # - Optimal size calculation
@@ -187,10 +190,15 @@ app/src/main/java/com/lensdaemon/camera/
 ├── FocusController.kt           # Focus control and tap-to-focus
 │                                # - A tap keeps CONTINUOUS_VIDEO and sets an AF region;
 │                                #   a lens without continuous video AF gets no tap-to-focus
-│                                #   (isTapToFocusSupported; POST /api/focus answers 409)
-│                                # - No focus state reporting (no capture callback feeds it)
+│                                #   (isTapToFocusSupported; POST /api/focus answers 409;
+│                                #   a tap on the phone still meters exposure there)
+│                                # - focusState follows each frame's AF state
+│                                #   (updateFromCaptureResult); countsAsInFocus() for take
+│                                #   scores: continuous AF once focused, else always
 │                                # - Manual focus distance control
-│                                # - Focus lock/unlock operations
+│                                # - lockFocus holds the focus: AUTO, no AF trigger (the
+│                                #   director's [FOCUS: MANUAL]); none on a lens without
+│                                #   AUTO; a lens change or reopen goes back to continuous
 ├── ExposureController.kt        # Exposure and white balance control
 │                                # - AE lock/unlock with state tracking
 │                                # - Exposure compensation (EV adjustment, clamped)
@@ -203,7 +211,7 @@ app/src/main/java/com/lensdaemon/camera/
 │                                # 16:9 output band, mapped through the zoom crop
 ├── CaptureRequestExtras.kt      # LensGeometry; applyZoom (CONTROL_ZOOM_RATIO on
 │                                # Android 11+, centred SCALER_CROP_REGION on 10);
-│                                # applyMeteringRegions
+│                                # applyMeteringRegions; captureResultCallback
 └── CameraService.kt             # Updated with all controllers integrated
                                  # - Public APIs for touch interactions
                                  # - Controller lifecycle management
@@ -347,15 +355,17 @@ app/src/main/java/com/lensdaemon/web/
 app/src/main/assets/web/
 ├── index.html                   # Dashboard HTML (two columns, then full-width rows)
 │                                # - Left: live preview, Streaming (encoder + Stop All),
-│                                #   RTSP, MPEG-TS over UDP, Recording
+│                                #   RTSP, MPEG-TS over UDP, Recording (a recorder error,
+│                                #   and why the last recording stopped: lastError)
 │                                # - Right: Camera (the phone's own lenses, zoom up to the
 │                                #   camera's max, exposure in EV), Encoder settings (with
 │                                #   Save as phone default), Statistics, Temperature,
 │                                #   Kiosk mode (settings and exit PIN)
 │                                # - Full width: Recordings (storage space, download,
 │                                #   upload to S3/SMB, delete, clean-up), Network storage
-│                                #   (upload queue with failed uploads, S3 and SMB settings
-│                                #   with Test), AI Director
+│                                #   (upload queue with failed uploads, S3 settings with an
+│                                #   http:// endpoint for plain HTTP, SMB settings with the
+│                                #   port, each with Test), AI Director
 │                                # - Header link to the setup wizard (/setup)
 ├── styles.css                   # Dashboard styles (dark theme, 16px gutter on phones)
 ├── dashboard.js                 # Dashboard JavaScript
@@ -363,7 +373,9 @@ app/src/main/assets/web/
 │                                # - Polls /api/status (2s), thermal and upload (5s),
 │                                #   kiosk (10s), recordings (30s); stops while hidden
 │                                # - notify(): corner notices instead of alert()
-├── setup.html, setup.js         # Setup wizard: Device Owner check, preset, S3/SMB
+├── setup.html, setup.js         # Setup wizard: Device Owner check (warns that only a
+│                                # factory reset removes it from a normal install),
+│                                # preset, S3/SMB
 │                                # (tested as typed, saved on activation), RTSP test
 │                                # stream with preview and temperatures, an optional exit
 │                                # PIN (set before kiosk mode goes on), activation that
@@ -423,11 +435,16 @@ app/src/main/java/com/lensdaemon/storage/
 app/src/main/java/com/lensdaemon/camera/
 ├── RecordingCoordinator.kt      # Recording for CameraService: its own LocalStorage,
 │                                # so list, delete and storage status work before any
-│                                # recording; synchronous enforceRetention()
+│                                # recording; synchronous enforceRetention(); lastError
+│                                # (last RecordingEvent.Error since the last start, kept
+│                                # after the stop that follows it)
 └── CameraService.kt             # Updated with recording integration
                                  # - initializeRecording, startRecording, stopRecording
-                                 #   (a start while a recording is open changes nothing)
+                                 #   (a start while a recording runs or is paused changes
+                                 #   nothing; one left in ERROR is replaced)
                                  # - pauseRecording, resumeRecording
+                                 # - isRecordingOpen (also a failed recorder that still
+                                 #   holds its file), getLastRecordingError
                                  # - getRecordingStats, getStorageStatus
                                  # - listRecordings, deleteRecording
                                  # - startStreamingAndRecording convenience method
@@ -435,8 +452,10 @@ app/src/main/java/com/lensdaemon/camera/
 app/src/main/java/com/lensdaemon/web/
 └── ApiRoutes.kt                 # Updated with recording API endpoints
                                  # - POST /api/recording/start|stop|pause|resume
-                                 #   (start answers alreadyRecording while one is open)
-                                 # - GET /api/recording/status (recording true while paused)
+                                 #   (start answers alreadyRecording while one runs or
+                                 #   is paused)
+                                 # - GET /api/recording/status (recording = isRecordingOpen,
+                                 #   so true while paused; lastError)
                                  # - GET /api/recordings, GET|DELETE /api/recordings/{name}
                                  #   (409 for the file being written)
                                  # - GET /api/storage/status
@@ -675,9 +694,20 @@ adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 # Verify device owner status
 adb shell dumpsys device_policy | grep "Device Owner"
 
-# Remove device owner (to allow normal device use)
+# Remove device owner: only if the app was a test-only build when
+# set-device-owner ran (Android records the flag then)
 adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
 ```
+
+`dpm remove-active-admin` refuses a non-test admin ("Attempt to remove non-test
+admin"), and installing a test-only build later does not help. For an admin you
+want to remove, install a test-only build before `set-device-owner`: Android
+Studio's Run, or `./gradlew assembleCoreDebug -Pandroid.injected.testOnly=true`
+installed with `adb install -t`. A normal install (`adb install`, the CI APK,
+`./gradlew installCoreDebug`) stays device owner until a factory reset (turn
+kiosk mode off first: it sets DISALLOW_FACTORY_RESET); the app never calls
+`clearDeviceOwnerApp`. Don't put `android:testOnly` in the manifest: a plain
+`adb install` would refuse the APK.
 
 ## Kiosk Mode Wiring
 
@@ -697,6 +727,9 @@ a null intent after the process died and, with kiosk mode, `autoStart` and
 `crashRecovery.autoRestart` on and within `RestartBudget`, starts the auto-start
 outputs with the saved stream defaults, starts `ThermalService`, reopens
 `MainActivity` as device owner and calls `KioskManager.recordRestart()`.
+Unattended starts (boot auto-start and this restart, `autoStartOutputs`) wait
+out a thermal EMERGENCY (`ThermalHold` in CameraService.kt) and start when the
+governor resumes, unless a user start or stop drops them first.
 Network recovery is `UploadService` retrying failed uploads when the default
 network comes back. Unattended starts need Device Owner (activity start from the
 background, the camera on Android 11+) and a phone without a secure lock screen
@@ -725,10 +758,13 @@ Both presets keep the exit PIN and kiosk mode's on/off state, and are logged as
 The director lives in its own Gradle module, `:director` (plain Kotlin and
 coroutines, unit-tested on the JVM); `CameraControllerAdapter` in `:app` connects
 it to the camera. The `full` flavor enables it (`BuildConfig.ENABLE_DIRECTOR`);
-in `core` builds `/api/director/*` answers 503. Scripts are parsed on the phone:
-no language model is involved. `RemoteLlmClient.kt` (an Ollama-only client) and
-`TransitionAnimator.kt` are in the module but not used: `REMOTE` inference is
-refused, and animated zooms go through `CameraService.animateZoom`.
+in `core` builds `/api/director/*` answers 503, except the script file endpoints
+(list, save, open, delete), which work without it (opening a script answers
+`"loaded": false` with `loadError` "Director service not available"). Scripts
+are parsed on the phone: no language model is involved. `RemoteLlmClient.kt`
+(an Ollama-only client) and `TransitionAnimator.kt` are in the module but not
+used: `REMOTE` inference is refused, and animated zooms go through
+`CameraService.animateZoom`.
 
 ```
 director/src/main/java/com/lensdaemon/director/
@@ -765,13 +801,19 @@ director/src/main/java/com/lensdaemon/director/
 │                                # - selectLensAndZoom() for optimal hardware selection
 │                                # - Fallback handling when hardware unavailable
 │                                # - validateMapping() for capability validation
+│                                # - followCamera(Framing): TRANSITION, FOCUS and EXPOSURE
+│                                #   cues start from the camera's lens and zoom
+│                                # - forgetExposure(): preset back to AUTO, framing and
+│                                #   focus target kept
 ├── TakeManager.kt               # Take recording and quality scoring
 │                                # - ActiveTake with quality metric samples
 │                                # - CueTiming for timing accuracy tracking
 │                                # - Scores 0-10 (focus 30%, exposure 20%, motion 25%, cue
 │                                #   timing 15% when a script cue ran, audio 10%); 5/6/8 are
-│                                #   the suggested/good/excellent marks. Exposure and motion
-│                                #   inputs are placeholders; audio isn't sampled
+│                                #   the suggested/good/excellent marks. Focus lock comes
+│                                #   from the camera's AF state (CameraService.isFocusLocked);
+│                                #   exposure and motion inputs are placeholders (motion a
+│                                #   constant 0.7); audio isn't sampled. Top: ~9.25
 │                                # - startTake(), endTake() lifecycle; currentTake StateFlow
 │                                # - recordFocusSample(), recordExposureSample(), etc.
 │                                #   (ignored outside a take or while paused)
@@ -785,6 +827,8 @@ director/src/main/java/com/lensdaemon/director/
 │                                # - SessionStats for session overview
 └── DirectorManager.kt           # Main coordinator
                                  # - CameraController interface for hardware control
+                                 #   (getFraming(): where the camera points, read before
+                                 #   each TRANSITION, FOCUS and EXPOSURE cue)
                                  # - DirectorEvent sealed class for event emission
                                  # - enable(), disable() for inert state management
                                  # - loadScript() for script parsing
@@ -793,6 +837,11 @@ director/src/main/java/com/lensdaemon/director/
                                  # - nextCue(), goToScene() (act at once while running)
                                  # - Stop and the end of a script rewind to scene 0; pause
                                  #   keeps the take and position
+                                 # - Every [EXPOSURE] cue is sent (AUTO too); a preset
+                                 #   other than AUTO goes with every command. Stop keeps
+                                 #   the shot mapper; a run from the top forgets the
+                                 #   preset (its first command sends AUTO in its place);
+                                 #   load, clear and disable forget it and send nothing
                                  # - THERMAL_HOLD at thermalThresholdDisable: the run stops,
                                  #   the hold clears 5°C cooler without resuming
                                  # - Take management forwarding
@@ -858,15 +907,19 @@ app/src/main/java/com/lensdaemon/director/
                                  # - getCapabilities(): lenses as listed at startup, max
                                  #   zoom from the main lens
                                  # - FACE = continuous video AF (no face priority yet);
-                                 #   HANDS/OBJECT tap-to-focus; exposure presets in the
+                                 #   HANDS/OBJECT tap-to-focus; MANUAL = lockFocus (focus
+                                 #   held in AUTO, no trigger); exposure presets in the
                                  #   lens's own steps, kept across lens changes
-                                 # - State tracking for lens, zoom, focus
+                                 # - State tracking for lens, zoom, focus; getFraming() is
+                                 #   the lens family and zoom the camera has or is heading
+                                 #   to; an accepted lens switch drops our zoom animation
 
 director/src/main/java/com/lensdaemon/director/
 └── QualityMetricsCollector.kt   # Real-time quality metrics collection
                                  # - MetricsSource interface (from camera)
                                  # - MetricsSink interface (to TakeManager)
-                                 # - Collects focus lock, exposure, motion, audio
+                                 # - Collects focus lock (the camera's AF state),
+                                 #   exposure, motion, audio
                                  # - Configurable sample interval (default 100ms)
                                  # - CollectorStats for session analytics
                                  # - asMetricsSource(), asMetricsSink() extensions
@@ -877,7 +930,9 @@ app/src/main/java/com/lensdaemon/camera/
                                  # - setAutoFocus(), enableFaceDetectionFocus()
                                  # - setFocusDistance() for manual focus
                                  # - getMaxZoom(), supportsFaceDetection()
-                                 # - supportsManualFocus(), isFocusLocked()
+                                 # - supportsManualFocus(), isFocusLocked() (in focus:
+                                 #   continuous AF reports focused, or AF that doesn't move
+                                 #   the lens by itself), lockFocus() (focus hold)
                                  # - getNormalizedExposure(), getMotionShakiness()
                                  # - getCurrentCpuTemperature()
 
@@ -1157,7 +1212,9 @@ app/src/main/java/com/lensdaemon/output/
 One encoder feeds every output. `CameraService` starts it for the first
 output (RTSP, MPEG-TS or recording) and shares it with the rest; stopping an
 output stops the encoder only when nothing else uses it. `startStreaming(config)`
-holds the encoder on its own and restarts it if the settings change;
+holds the encoder on its own and restarts it if the settings change (outputs
+kept, but a codec change disconnects the RTSP viewers, whose SDP no longer
+matches; a restart that fails stops every output);
 `stopStreaming()` stops every output and the encoder. The phone's Start Stream
 button starts RTSP; kiosk boot auto-start starts RTSP and/or a recording, each
 on its own, as `autoStart.startRtsp` and `startRecording` say.
@@ -1168,21 +1225,29 @@ on its own, as `autoStart.startRtsp` and `startRecording` say.
   the phone's Start Stream, kiosk auto-start (`CameraService.autoStartIntent`)
   and the sticky restart use them, falling back once to 1080p30 on port 8554.
   API start requests take any setting they leave out (and the RTSP port and
-  file length) from them.
+  file length) from them. `StreamDefaults.BITRATE_RANGE` (100 kbps-50 Mbps) is
+  the one bitrate range for the defaults, PUT /api/config and
+  /api/encoder/capabilities.
 - Thermal (`pauseForThermal`, `resumeAfterThermal`, `setThermalEncoderLimits`,
   `setThermalBitrateReduction`): called by WebServerService on one background
   thread. The bitrate cut is state, applied to every encoder that starts; the
   CRITICAL limits (`camera/ThermalEncoderLimits.kt`) restart the encoder with
   the outputs kept; the EMERGENCY pause records what ran and restarts exactly
-  that after cooling, unless a user start or stop came in between.
-  `/api/status` reports `camera.thermalPaused`.
+  that after cooling, unless a user start or stop came in between. Until the
+  resume, unattended starts (kiosk boot auto-start, sticky restart) wait too
+  (`ThermalHold`), also when nothing ran to stop. The resume's starts leave the
+  saved stream defaults alone (`keepSavedDefaults`). `/api/status` reports
+  `camera.thermalPaused` (a pause or a waiting auto-start); the phone shows
+  "Paused: the phone is too hot; outputs restart when it cools", hides Start
+  and keeps Stop as "Stop all", which cancels the restart (`StreamControls.kt`).
 - `setEncoderBitrate` (PUT /api/config) makes a bitrate the configured one,
   kept across encoder restarts.
 - A partial wake lock and a Wi-Fi lock are held while the encoder runs (and the
   wake lock through a thermal pause).
-- A runtime encoder error rebuilds the encoder after 1, 2, 5, 10 and 30 s,
-  keeping the outputs (a cut-off recording continues in a new file); if no
-  rebuild works, every output stops.
+- A runtime encoder error (or a CRITICAL restart that did not start) rebuilds
+  the encoder after 1, 2, 5, 10 and 30 s, keeping the outputs (a cut-off
+  recording continues in a new file); if no rebuild works, every output stops.
+  docs/API.md "When the encoder fails" has what the API shows meanwhile.
 - After a crash or kill, Android's sticky restart reaches `onStartCommand` with a
   null intent; within `camera/RestartBudget.kt` the kiosk auto-start outputs come
   back (see Kiosk Mode Wiring).
@@ -1243,7 +1308,8 @@ app/src/main/java/com/lensdaemon/web/
 │                                # hands PUT bodies over as a temp file and decodes POST
 │                                # bodies as US-ASCII; reads exactly Content-Length bytes
 ├── StatusReport.kt              # Sections of GET /api/status (camera incl. maxZoom and
-│                                # exposure range/step, thermal, director progress)
+│                                # exposure range/step, recording incl. error and
+│                                # lastError, thermal, director progress)
 ├── RateLimiter.kt               # Token bucket per connection address (X-Forwarded-For
 │                                # ignored), at most 1024 clients tracked
 ├── WebServer.kt                 # NanoHTTPD HTTP server (no gzip for text/event-stream)

@@ -64,6 +64,16 @@ class RecordingCoordinator(
     private val _recordingState = MutableStateFlow(RecordingState.IDLE)
     val recordingState: StateFlow<RecordingState> = _recordingState.asStateFlow()
 
+    /**
+     * The last error the recorder reported since the last recording start (a
+     * file that would not open, "Storage full - recording stopped"), or null.
+     * Kept after the stop that follows it and across [release], so a recording
+     * that ended on an error still says why; cleared when a recording starts.
+     */
+    @Volatile
+    var lastError: String? = null
+        private set
+
     /** Frame listener that forwards encoded frames to the file writer */
     val frameListener: (EncodedFrame) -> Unit = { frame ->
         storageManager?.writeFrame(frame)
@@ -130,6 +140,7 @@ class RecordingCoordinator(
                         _recordingState.value = RecordingState.RECORDING
                     }
                     is RecordingEvent.Error -> {
+                        lastError = event.error
                         _recordingState.value = RecordingState.ERROR
                         Timber.e("Recording error: ${event.error}")
                     }
@@ -180,6 +191,8 @@ class RecordingCoordinator(
             return false
         }
 
+        // A new start: an error from an earlier recording no longer applies
+        lastError = null
         val success = storageManager?.startRecording() == true
         if (!success) {
             Timber.e("Failed to start recording")

@@ -437,6 +437,7 @@
             <div id="device-owner-help" style="display:none; margin-top: 16px;">
                 <p style="color: var(--warning-color);">Device Owner is not set. Without it, kiosk mode can't lock the screen, and Android won't open LensDaemon or (Android 11+) its camera by itself after a reboot. Run this ADB command on a factory-reset device (or one with no accounts):</p>
                 <div class="code-block">adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver</div>
+                <p id="device-owner-undo" style="color: var(--warning-color);">For a normal install this can't be undone, from the phone or over ADB: only a factory reset removes Device Owner again (turn kiosk mode off first, as it blocks factory reset). The exception is a test-only build, which Android Studio's Run installs, already on the phone when the command runs: adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver then removes it.</p>
                 <p>After running the command, tap "Re-check" below.</p>
                 <button class="btn btn-primary" onclick="runChecks()">Re-check</button>
             </div>
@@ -519,8 +520,8 @@
                 </div>
                 <div class="form-group">
                     <label for="s3-endpoint">Endpoint</label>
-                    <input type="text" id="s3-endpoint" placeholder="minio.local:9000 or &lt;account&gt;.r2.cloudflarestorage.com">
-                    <div class="form-hint">Leave empty for Amazon S3 and Backblaze B2: it follows from the region.</div>
+                    <input type="text" id="s3-endpoint" placeholder="http://minio.local:9000 or &lt;account&gt;.r2.cloudflarestorage.com">
+                    <div class="form-hint">Leave empty for Amazon S3 and Backblaze B2: it follows from the region. Start it with http:// for a server without HTTPS, such as a MinIO server on your network; without http://, the phone connects with HTTPS.</div>
                 </div>
                 <div class="form-group">
                     <label for="s3-bucket">Bucket Name</label>

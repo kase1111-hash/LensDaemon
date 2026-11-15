@@ -211,7 +211,8 @@ class ExposureController {
     }
 
     /**
-     * Update exposure state from capture result.
+     * Follow the camera's auto-exposure state (CONTROL_AE_STATE) in a frame's
+     * capture result. Called for every frame, on the camera thread.
      */
     fun updateFromCaptureResult(result: CaptureResult) {
         val aeState = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
@@ -228,13 +229,6 @@ class ExposureController {
 
         if (_exposureState.value != newState) {
             _exposureState.value = newState
-        }
-
-        // Capture current ISO and exposure time for display
-        result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { iso ->
-            if (_manualIso.value == null) {
-                // Store for reference but don't update state (auto mode)
-            }
         }
     }
 

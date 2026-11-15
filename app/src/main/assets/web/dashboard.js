@@ -33,6 +33,11 @@ let encoderFormEdited = false;
 
 // The phone's saved stream defaults (GET /api/config "defaults"), or null when unknown
 let streamDefaults = null;
+// GET /api/config has answered (older phones answer without defaults): until then the status poll asks again
+let streamDefaultsAnswered = false;
+let streamDefaultsPending = false;
+// Only the latest request's answer counts
+let streamDefaultsRequest = 0;
 
 // Camera controls
 let zoomDragging = false;
@@ -43,6 +48,10 @@ let availableLenses = [];
 // Recording: "active" while a recording is open, running or paused
 let recordingActive = false;
 let recordingPaused = false;
+// The recorder failed while it still holds its file open: Stop Recording closes it
+let recordingError = false;
+// Why the last recording failed ("lastError", kept until the next start); null before the first status
+let recordingLastError = null;
 let recordingStartPending = false;
 let currentRecordingFile = '';
 let recordingsCache = [];
@@ -167,6 +176,7 @@ const elements = {
     s3Result: $('s3-result'),
     smbSummary: $('smb-summary'),
     smbServer: $('smb-server'),
+    smbPort: $('smb-port'),
     smbShare: $('smb-share'),
     smbUsername: $('smb-username'),
     smbPassword: $('smb-password'),
@@ -480,6 +490,10 @@ async function fetchStatus() {
     if (reconnected && !deviceInfoLoaded) {
         fetchDeviceInfo();
     }
+    // The stream defaults could not be read yet (the phone was starting, or away): ask again
+    if (!streamDefaultsAnswered && !streamDefaultsPending) {
+        fetchStreamDefaults();
+    }
 
     updateStreamStatus(status);
     updateEncoderStats(status.encoder);
@@ -507,7 +521,12 @@ function updateStreamStatus(status) {
     const outputs = [];
     if (status.rtsp?.running) outputs.push(`RTSP (${status.rtsp.playing || 0} watching)`);
     if (status.mpegts?.running) outputs.push('MPEG-TS');
-    if (status.recording?.active) outputs.push(status.recording.paused ? 'recording (paused)' : 'recording');
+    if (status.recording?.active) {
+        let recording = 'recording';
+        if (status.recording.paused) recording = 'recording (paused)';
+        else if (status.recording.error) recording = 'recording (error)';
+        outputs.push(recording);
+    }
 
     isStreaming = encoderOn || outputs.length > 0;
     let text = 'Stopped';
@@ -577,10 +596,18 @@ function setSelectValue(select, value, label) {
  * The phone's saved stream defaults (GET /api/config "defaults"): what its
  * Start Stream button, kiosk boot and restarts use. While no encoder runs the
  * settings form starts from them. Older phones have none: nothing changes.
+ * Read at load and after each start; until the phone has answered, the status
+ * poll asks again. An answer to an earlier request that comes in late is dropped.
  */
 async function fetchStreamDefaults() {
+    const request = ++streamDefaultsRequest;
+    streamDefaultsPending = true;
     const r = await apiCall('/api/config');
-    if (!r || r.error || !r.defaults) return;
+    if (request !== streamDefaultsRequest) return;
+    streamDefaultsPending = false;
+    if (!r || r.error) return;
+    streamDefaultsAnswered = true;
+    if (!r.defaults) return;
     streamDefaults = r.defaults;
     showStreamDefaults();
     const encoderRunning = !!(runningEncoder || (r.encoder && r.encoder.width));
@@ -970,41 +997,58 @@ async function setExposure(ev) {
 
 // "active" means a recording is open, running or paused: a paused one keeps
 // Resume and Stop, and Start stays off (a second start would only answer
-// "Already recording")
+// "Already recording"). A recorder that reported an error while it still holds
+// its file ("error") is open too: Stop Recording closes that file. "lastError",
+// why the last recording failed (kept until the next start, e.g. a full disk
+// that stopped it), is shown with the status and announced once when it is new.
 function updateRecordingStatus(recording) {
     if (!recording) return;
     const wasActive = recordingActive;
     const wasPaused = recordingPaused;
+    const wasError = recordingError;
     recordingPaused = !!recording.paused;
     recordingActive = !!recording.active || recordingPaused;
+    recordingError = recordingActive && !!recording.error;
+    const lastError = typeof recording.lastError === 'string' ? recording.lastError : '';
+    // Not for a reason already there when the page opened: the status line shows it
+    if (recordingLastError !== null && lastError && lastError !== recordingLastError) {
+        notify(`Recording: ${lastError}`, 'error');
+    }
+    recordingLastError = lastError;
 
-    if (recordingActive) {
+    if (recordingError) {
+        elements.recordingStatus.textContent = `Error: ${lastError || 'the recorder failed'} (Stop Recording closes the file)`;
+        elements.recordingStatus.className = 'status-text error';
+        fetchRecordingDetail();
+    } else if (recordingActive) {
         elements.recordingStatus.textContent = recordingPaused ? 'Paused' : 'Recording';
         elements.recordingStatus.className = `status-text ${recordingPaused ? 'paused' : 'running'}`;
         fetchRecordingDetail();
     } else {
-        elements.recordingStatus.textContent = 'Stopped';
+        elements.recordingStatus.textContent = lastError ? `Stopped: ${lastError}` : 'Stopped';
         elements.recordingStatus.className = 'status-text stopped';
         elements.recordingDetail.textContent = '';
         currentRecordingFile = '';
     }
     elements.btnRecordStart.disabled = recordingActive || recordingStartPending;
-    elements.btnRecordPause.disabled = !recordingActive;
+    // A failed recorder has nothing to pause: Stop is the way out
+    elements.btnRecordPause.disabled = !recordingActive || recordingError;
     elements.btnRecordPause.textContent = recordingPaused ? 'Resume' : 'Pause';
     elements.btnRecordStop.disabled = !recordingActive;
 
     if (wasActive && !recordingActive) {
         // A recording that just ended has left new files
         refreshLibrary();
-    } else if (wasPaused !== recordingPaused) {
-        // The file being recorded is marked paused or recording
+    } else if (wasPaused !== recordingPaused || wasError !== recordingError) {
+        // The file being recorded is marked paused, failed or recording
         renderRecordings();
     }
 }
 
 async function fetchRecordingDetail() {
     const r = await apiCall('/api/recording/status');
-    if (!r || r.error || !(r.recording || r.paused)) return;
+    // The file the recorder holds counts as live whatever the state: the phone refuses it until it closes
+    if (!r || r.error || !(r.recording || r.paused || r.currentFile)) return;
     const previousFile = currentRecordingFile;
     currentRecordingFile = baseName(r.currentFile || '');
     const parts = [formatDuration(r.durationSec || 0), `file ${(r.segmentIndex || 0) + 1}`, formatFileSize(r.totalBytes || 0)];
@@ -1028,7 +1072,10 @@ async function startRecording() {
         notify(result.paused ? 'The recording is paused: press Resume to continue it' : 'Already recording', 'info');
     } else if (succeeded(result)) {
         encoderFormEdited = false;
-        notify(`Recording (new file every ${result.segmentDuration || 'segment'})`, 'success');
+        // 0 is one file for the whole recording (the phone calls that length "Continuous")
+        notify(body.segmentMinutes === 0
+            ? 'Recording (one file)'
+            : `Recording (new file every ${result.segmentDuration || 'segment'})`, 'success');
         fetchStreamDefaults();
     } else {
         elements.btnRecordStart.disabled = recordingActive;
@@ -1084,7 +1131,8 @@ function renderRecordings() {
         return;
     }
     recordingsCache.forEach(rec => {
-        // The file being recorded (also while paused) can't be downloaded, uploaded or deleted until it closes
+        // The file being recorded (also while paused, or held by a failed recorder) can't be
+        // downloaded, uploaded or deleted until it closes
         const live = recordingActive && rec.name === currentRecordingFile;
         const item = document.createElement('div');
         item.className = 'list-item';
@@ -1104,7 +1152,9 @@ function renderRecordings() {
         if (live) {
             const badge = document.createElement('span');
             badge.className = 'live-badge';
-            badge.textContent = recordingPaused ? ' · ● recording (paused)' : ' · ● recording';
+            badge.textContent = ' · ● recording';
+            if (recordingPaused) badge.textContent = ' · ● recording (paused)';
+            else if (recordingError) badge.textContent = ' · ● recording (error)';
             meta.appendChild(badge);
         }
         main.append(name, meta);
@@ -1293,6 +1343,8 @@ function showTemperature(meter, valueEl, chip, tempC, level, emergencyC) {
 // ==================== Network storage ====================
 
 const UPLOAD_STATES = { IDLE: 'Idle', UPLOADING: 'Uploading', PAUSED: 'Paused', ERROR: 'Error' };
+// The SMB port the phone uses when none is given
+const SMB_DEFAULT_PORT = 445;
 
 async function fetchUploadStatus() {
     const r = await apiCall('/api/upload/status');
@@ -1404,26 +1456,39 @@ async function fetchStorageConfig() {
     if (s3 && !s3.error) {
         if (s3.configured) {
             elements.s3Backend.value = s3.backend || 'S3';
-            elements.s3Endpoint.value = s3.endpoint || '';
+            elements.s3Endpoint.value = s3EndpointText(s3);
             elements.s3Region.value = s3.region || '';
             elements.s3Bucket.value = s3.bucket || '';
             elements.s3Prefix.value = s3.pathPrefix || '';
             elements.s3AccessKey.placeholder = `saved: ${s3.accessKeyId}`;
             elements.s3SecretKey.placeholder = 'saved: enter again to change';
         }
-        setSummary(elements.s3Summary, s3.configured ? `${s3.bucket} on ${s3.endpoint}` : 'Not set up', s3.configured);
+        setSummary(elements.s3Summary, s3.configured ? `${s3.bucket} on ${s3EndpointText(s3)}` : 'Not set up', s3.configured);
     }
     if (smb && !smb.error) {
         if (smb.configured) {
             elements.smbServer.value = smb.server || '';
+            elements.smbPort.value = smb.port || '';
             elements.smbShare.value = smb.share || '';
             elements.smbUsername.value = smb.username || '';
             elements.smbDomain.value = smb.domain || '';
             elements.smbPrefix.value = smb.pathPrefix || '';
             elements.smbPassword.placeholder = 'saved: enter again to change';
         }
-        setSummary(elements.smbSummary, smb.configured ? `\\\\${smb.server}\\${smb.share}` : 'Not set up', smb.configured);
+        const port = smb.port && smb.port !== SMB_DEFAULT_PORT ? ` (port ${smb.port})` : '';
+        setSummary(elements.smbSummary, smb.configured ? `\\\\${smb.server}\\${smb.share}${port}` : 'Not set up', smb.configured);
     }
+}
+
+/**
+ * The saved S3 endpoint as the form shows it. The phone keeps a bare host and
+ * a useHttps flag, and reads a host given without a scheme as HTTPS: a plain
+ * HTTP endpoint (a MinIO server without TLS) gets its http:// back, so saving
+ * or testing the form again keeps it on plain HTTP.
+ */
+function s3EndpointText(s3) {
+    if (!s3.endpoint) return '';
+    return (s3.useHttps === false ? 'http://' : '') + s3.endpoint;
 }
 
 function setSummary(el, text, configured) {
@@ -1443,8 +1508,9 @@ function s3FormValues() {
     };
 }
 
+/** The SMB form; the port only when one is typed (the phone uses 445 otherwise). */
 function smbFormValues() {
-    return {
+    const values = {
         server: elements.smbServer.value.trim(),
         share: elements.smbShare.value.trim(),
         username: elements.smbUsername.value.trim(),
@@ -1452,6 +1518,15 @@ function smbFormValues() {
         domain: elements.smbDomain.value.trim(),
         pathPrefix: elements.smbPrefix.value.trim()
     };
+    const port = elements.smbPort.value.trim();
+    if (port) values.port = Number(port);
+    return values;
+}
+
+/** Why the SMB form's port can't be used, or '' (none typed, or 1 to 65535). */
+function smbPortError(values) {
+    if (!('port' in values) || (Number.isInteger(values.port) && values.port >= 1 && values.port <= 65535)) return '';
+    return `The port must be a whole number from 1 to 65535, or empty for ${SMB_DEFAULT_PORT}`;
 }
 
 /** ok: true, false, or null while waiting for an answer. */
@@ -1493,6 +1568,10 @@ async function saveSmb() {
         showResult(elements.smbResult, false, 'Enter the server, share, username and password');
         return;
     }
+    if (smbPortError(values)) {
+        showResult(elements.smbResult, false, smbPortError(values));
+        return;
+    }
     const result = await apiCall('/api/upload/smb/config', 'POST', values);
     if (succeeded(result)) {
         showResult(elements.smbResult, true, `Saved: \\\\${result.server}\\${result.share}`);
@@ -1506,7 +1585,12 @@ async function saveSmb() {
 
 async function testSmb() {
     const values = smbFormValues();
+    // Test what is in the form when the password is typed in, else the saved settings
     const body = values.password ? values : null;
+    if (body && smbPortError(body)) {
+        showResult(elements.smbResult, false, smbPortError(body));
+        return;
+    }
     showResult(elements.smbResult, null, 'Testing…');
     const result = await apiCall('/api/upload/smb/test', 'POST', body);
     showResult(elements.smbResult, succeeded(result), succeeded(result) ? (result.message || 'Connection works') : errorText(result));

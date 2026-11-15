@@ -103,6 +103,11 @@ from the setup wizard or the dashboard. Android starts apps only after the phone
 first unlock, so for unattended restarts (after a power cut) use a phone without a
 PIN, pattern or password lock.
 
+**This can't be undone** for an APK installed this way: neither ADB nor the app can
+remove Device Owner again, only a factory reset (turn kiosk mode off first, since it
+blocks factory reset in the phone's settings). To try it on a phone you want back,
+install a test-only build first (see [CONTRIBUTING.md](CONTRIBUTING.md#removing-device-owner)).
+
 ### 3. Launch and Configure
 Open LensDaemon on the device. The phone shows the dashboard's address under its
 status, for example `Dashboard: http://192.168.1.50:8080`.
@@ -120,7 +125,9 @@ In kiosk mode, hold **Volume Up + Volume Down** for 5 seconds on the phone to le
 ### 4. Start the Stream
 Tap **Start Stream** on the phone, or **Start RTSP** in the web dashboard. The
 phone's overlay shows the RTSP URL, the resolution and frame rate, and how many
-viewers are watching. The phone's button (and kiosk auto-start) uses the phone's
+viewers are watching. If the phone gets too hot, the outputs pause and the
+overlay says so; they restart by themselves once it has cooled (**Stop all**
+cancels that). The phone's button (and kiosk auto-start) uses the phone's
 saved stream settings: 1080p30 H.264 at 4 Mbps until others are saved. Each start
 from the dashboard saves its settings, and the dashboard's encoder settings have
 **Save as phone default**.

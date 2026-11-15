@@ -15,8 +15,9 @@ import timber.log.Timber
  * and manual focus distance.
  *
  * Tap-to-focus keeps continuous video autofocus running and points it at the
- * tapped region; nothing reports the camera's focus state back yet (no
- * capture callback), so [focusState] does not follow a tap.
+ * tapped region. [focusState] follows the camera's autofocus state, which the
+ * camera service feeds from every frame's capture result
+ * ([updateFromCaptureResult]).
  */
 class FocusController {
 
@@ -133,20 +134,25 @@ class FocusController {
     }
 
     /**
-     * Lock focus at current position.
+     * Hold the focus where it is: AUTO mode with no AF trigger, in which the
+     * lens moves only on a trigger, so it stays where continuous autofocus
+     * left it (a CONTROL_AF_TRIGGER_START would run a new focus sweep first).
+     * Any tap region is dropped.
+     * @return AUTO without regions (trigger IDLE), or null on a lens without AUTO
      */
     fun lockFocus(): FocusTriggerResult? {
         if (FocusMode.AUTO !in supportedFocusModes) {
             return null
         }
 
+        _focusMode.value = FocusMode.AUTO
         _focusLocked.value = true
-        _focusState.value = FocusState.SCANNING
+        currentAfRegions = null
 
         return FocusTriggerResult(
             mode = FocusMode.AUTO,
-            regions = currentAfRegions,
-            triggerAction = CaptureRequest.CONTROL_AF_TRIGGER_START
+            regions = null,
+            triggerAction = CaptureRequest.CONTROL_AF_TRIGGER_IDLE
         )
     }
 
@@ -204,7 +210,8 @@ class FocusController {
     }
 
     /**
-     * Update focus state from capture result.
+     * Follow the camera's autofocus state (CONTROL_AF_STATE) in a frame's
+     * capture result. Called for every frame, on the camera thread.
      */
     fun updateFromCaptureResult(result: CaptureResult) {
         val afState = result.get(CaptureResult.CONTROL_AF_STATE) ?: return
@@ -291,6 +298,19 @@ enum class FocusState {
     FOCUSED,    // Successfully focused
     FAILED      // Failed to focus
 }
+
+/**
+ * Whether the picture counts as in focus with focus [mode] while the camera
+ * reports [state]: with continuous autofocus, once the camera reports it has
+ * focused; in every other mode autofocus does not move the lens by itself (a
+ * fixed-focus lens, a set distance, a held focus in AUTO with no trigger), so
+ * the camera reports no focus state and the lens counts as in focus where it is.
+ */
+internal fun countsAsInFocus(mode: FocusMode, state: FocusState): Boolean =
+    when (mode) {
+        FocusMode.CONTINUOUS_VIDEO, FocusMode.CONTINUOUS_PICTURE -> state == FocusState.FOCUSED
+        FocusMode.AUTO, FocusMode.MANUAL, FocusMode.MACRO -> true
+    }
 
 /**
  * Result of triggering focus operation.

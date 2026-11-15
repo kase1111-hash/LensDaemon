@@ -4,6 +4,7 @@ import com.lensdaemon.camera.CameraService
 import com.lensdaemon.director.DirectorManager
 import com.lensdaemon.director.TakeManager
 import com.lensdaemon.encoder.EncoderState
+import com.lensdaemon.output.RecordingState
 import com.lensdaemon.thermal.ThermalGovernor
 import org.json.JSONArray
 import org.json.JSONObject
@@ -20,7 +21,8 @@ internal object StatusReport {
         put("previewActive", camera?.isPreviewActive() ?: false)
         put("streamingActive", camera?.isStreaming() ?: false)
         put("currentLens", camera?.getCurrentLens()?.value?.lensType?.name ?: "none")
-        // The phone got too hot: the outputs it stopped come back once it has cooled down
+        // The phone got too hot: the outputs it stopped, or an auto-start it
+        // held back, come back once it has cooled down
         put("thermalPaused", camera?.isThermalPaused() ?: false)
         put("zoom", camera?.currentZoom?.value ?: 1.0f)
         if (camera != null) {
@@ -69,13 +71,18 @@ internal object StatusReport {
         }
     }
 
-    /** "active" while a recording is open, running or paused; "paused" while it is paused. */
-    fun recording(camera: CameraService?): JSONObject {
-        val paused = camera?.isRecordingPaused() ?: false
-        return JSONObject().apply {
-            put("active", (camera?.isRecording() ?: false) || paused)
-            put("paused", paused)
-        }
+    /**
+     * "active" while a recording is open: running, paused, or a recorder that
+     * reported an error but still holds its file ([CameraService.isRecordingOpen]);
+     * "paused" while it is paused; "error" while the recorder is in an error;
+     * "lastError" the last error it reported since the last recording start
+     * (such as a full disk that stopped it), kept after the stop, else null.
+     */
+    fun recording(camera: CameraService?): JSONObject = JSONObject().apply {
+        put("active", camera?.isRecordingOpen() ?: false)
+        put("paused", camera?.isRecordingPaused() ?: false)
+        put("error", camera?.recordingState?.value == RecordingState.ERROR)
+        put("lastError", camera?.getLastRecordingError() ?: JSONObject.NULL)
     }
 
     /** Temperatures and throttling at a glance; GET /api/thermal/status has the detail. */

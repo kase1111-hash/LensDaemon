@@ -342,6 +342,10 @@ a.btn {
     color: var(--warning-color);
 }
 
+.status-text.error {
+    color: var(--danger-color);
+}
+
 .rtsp-link {
     color: var(--primary-color);
     text-decoration: none;
@@ -448,6 +452,11 @@ input[type="range"]::-moz-range-thumb {
 
 .config-block .settings-form {
     margin-top: 12px;
+}
+
+/* A note under a settings form, before its buttons */
+.stream-hint.form-note {
+    margin: 10px 0 0;
 }
 
 .form-group {

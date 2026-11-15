@@ -51,7 +51,7 @@ class DirectorManagerTest {
         var exposure = ExposurePreset.AUTO
 
         @Volatile
-        var framing: ShotMapper.Framing? = null
+        var reportedFraming: ShotMapper.Framing? = null
 
         override fun switchLens(lens: String) {
             calls.add("lens $lens")
@@ -77,7 +77,7 @@ class DirectorManagerTest {
 
         override fun getCurrentTemperature(): Int = temperature
 
-        override fun getFraming(): ShotMapper.Framing? = framing
+        override fun getFraming(): ShotMapper.Framing? = reportedFraming
     }
 
     private lateinit var persistence: MemoryConfig
@@ -480,10 +480,63 @@ class DirectorManagerTest {
     }
 
     @Test
+    fun `a run from the top starts without the last run's preset`() {
+        director.loadScript("[SCENE: Hall]\n[SHOT: MEDIUM]\n[SCENE: Window]\n[EXPOSURE: BACKLIT]\n[SHOT: CLOSE-UP]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the end of take 1") { director.state.value == DirectorState.READY && cuesRun().size == 3 }
+        camera.exposures.clear()
+
+        assertTrue(director.startExecution())
+        await("the end of take 2") { director.state.value == DirectorState.READY && cuesRun().size == 6 }
+
+        // The hall goes back to 0 EV, as in take 1
+        val backlit = ExposurePreset.BACKLIT
+        assertEquals(listOf(ExposurePreset.AUTO, backlit, backlit), camera.exposures.toList())
+    }
+
+    @Test
+    fun `Start after Stop runs from the top without the preset`() {
+        director.loadScript(
+            "[SCENE: Hall]\n[SHOT: MEDIUM]\n[SCENE: Window]\n[EXPOSURE: BACKLIT]\n[SHOT: CLOSE-UP]\n[HOLD: 30]"
+        ).getOrThrow()
+        val atTheHold = { director.currentSession.value?.let { it.currentSceneIndex == 1 && it.currentCueIndex == 2 } == true }
+        assertTrue(director.startExecution())
+        await("the hold in the window scene", condition = atTheHold)
+        director.stopExecution()
+        camera.exposures.clear()
+
+        assertTrue(director.startExecution())
+        await("the hold in the window scene again", condition = atTheHold)
+
+        val backlit = ExposurePreset.BACKLIT
+        assertEquals(listOf(ExposurePreset.AUTO, backlit, backlit), camera.exposures.toList())
+        director.stopExecution()
+    }
+
+    @Test
+    fun `a run that goes on after a thermal hold keeps the preset`() {
+        director.loadScript("[SCENE: A]\n[EXPOSURE: DARK]\n[HOLD: 30]\n[SHOT: MEDIUM]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the hold") { cueIndex() == 1 }
+        camera.temperature = 60
+        await("the thermal hold") { director.state.value == DirectorState.THERMAL_HOLD }
+        camera.temperature = 40
+        await("the hold to clear") { director.state.value == DirectorState.READY }
+        camera.exposures.clear()
+
+        // Start goes on from the [HOLD], and the shot after it runs at once
+        assertTrue(director.startExecution())
+        assertEquals("[SHOT: MEDIUM]", director.nextCue()?.rawText)
+        await("the end") { director.state.value == DirectorState.READY }
+
+        assertEquals(listOf(ExposurePreset.DARK), camera.exposures.toList())
+    }
+
+    @Test
     fun `cues that keep the framing start from the camera's lens and zoom`() {
         // Put on the wide lens at 3x on the dashboard, before any shot
         camera.lens = "wide"
-        camera.framing = ShotMapper.Framing("wide", 3f)
+        camera.reportedFraming = ShotMapper.Framing("wide", 3f)
 
         assertTrue(director.executeCueText("[TRANSITION: PUSH IN]"))
         assertEquals(listOf("lens wide", "zoom 4.5", "focus AUTO"), camera.calls.toList())
@@ -491,7 +544,7 @@ class DirectorManagerTest {
         // Then on the tele lens at 2x: an exposure cue stays there too
         camera.calls.clear()
         camera.lens = "tele"
-        camera.framing = ShotMapper.Framing("tele", 2f)
+        camera.reportedFraming = ShotMapper.Framing("tele", 2f)
         assertTrue(director.executeCueText("[EXPOSURE: DARK]"))
         assertEquals(listOf("lens tele", "zoom 2.0", "focus AUTO"), camera.calls.toList())
         assertEquals(listOf(ExposurePreset.DARK), camera.exposures.toList())

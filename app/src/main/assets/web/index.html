@@ -362,7 +362,7 @@
                             </div>
                             <div class="form-group">
                                 <label for="s3-endpoint">Endpoint</label>
-                                <input type="text" id="s3-endpoint" placeholder="empty for AWS / B2" autocomplete="off">
+                                <input type="text" id="s3-endpoint" placeholder="empty for AWS / B2; http://host:9000 for plain HTTP" autocomplete="off">
                             </div>
                             <div class="form-group">
                                 <label for="s3-region">Region</label>
@@ -385,6 +385,7 @@
                                 <input type="text" id="s3-prefix" placeholder="optional" autocomplete="off">
                             </div>
                         </div>
+                        <p class="stream-hint form-note">Endpoint: leave it empty for Amazon S3 and Backblaze B2 (it follows from the region). Start it with http:// for a server without HTTPS, such as a MinIO server on your network (http://minio.local:9000); without http://, the phone connects with HTTPS.</p>
                         <div class="button-group">
                             <button id="btn-s3-save" class="btn btn-primary btn-sm">Save</button>
                             <button id="btn-s3-test" class="btn btn-secondary btn-sm">Test</button>
@@ -399,6 +400,10 @@
                             <div class="form-group">
                                 <label for="smb-server">Server</label>
                                 <input type="text" id="smb-server" placeholder="192.168.1.100" autocomplete="off">
+                            </div>
+                            <div class="form-group">
+                                <label for="smb-port">Port</label>
+                                <input type="number" id="smb-port" placeholder="445" min="1" max="65535" step="1">
                             </div>
                             <div class="form-group">
                                 <label for="smb-share">Share</label>

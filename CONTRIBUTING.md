@@ -152,12 +152,24 @@ adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 
 # Verify device owner status
 adb shell dumpsys device_policy | grep "Device Owner"
-
-# Remove device owner (to restore normal device use)
-adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
 ```
 
 **Important:** Setting device owner will fail if any accounts (Google, Samsung, etc.) are registered on the device. Either factory-reset or remove all accounts first.
+
+### Removing device owner
+
+Android lets `adb shell dpm remove-active-admin` remove only a test-only admin, and it records whether the app was test-only when `dpm set-device-owner` ran: installing a test-only build afterwards does not help. So decide before you set device owner.
+
+- **To be able to remove it**, install a test-only build first: deploy with Android Studio's Run, or build with `./gradlew assembleCoreDebug -Pandroid.injected.testOnly=true` (or `assembleFullDebug`) and install the APK with `adb install -t <apk>`. Then set device owner as above; later
+
+  ```bash
+  adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver
+  ```
+
+  removes it again.
+- **A normal install** (`adb install <apk>`, the CI APK, `./gradlew installCoreDebug` or `installFullDebug`) can't be removed over ADB (`SecurityException: Attempt to remove non-test admin`), and the app has no way to give device owner up. The only way back to normal use is a factory reset: turn kiosk mode off first, since it blocks factory reset in the phone's settings.
+
+Don't put `android:testOnly="true"` in the manifest: a plain `adb install` refuses such an APK (`INSTALL_FAILED_TEST_ONLY`).
 
 ## Questions?
 

@@ -54,7 +54,7 @@ class ShotMapper(
         val supportsManualFocus: Boolean = true
     )
 
-    /** Where the camera is pointed: a lens family ("wide", "main", "tele") and the zoom on that lens. */
+    /** Where the camera is pointed: its lens family as the controller names it ("wide", "main", "tele") and the zoom on that lens. */
     data class Framing(val lens: String, val zoom: Float)
 
     /**

@@ -215,7 +215,7 @@ class CameraService : Service() {
     /**
      * The thermal EMERGENCY itself, from [pauseForThermal] to [resumeAfterThermal],
      * whether or not anything ran to stop: unattended starts ([autoStartOutputs])
-     * wait for the resume. Used under the service's lock.
+     * wait for the resume. Changed under the service's lock.
      */
     private val thermalHold = ThermalHold()
 
@@ -552,7 +552,7 @@ class CameraService : Service() {
      */
     @Synchronized
     private fun autoStartOutputs(rtsp: Boolean, record: Boolean) {
-        if (thermalHold.hold(ThermalHold.AutoStart(rtsp, record))) {
+        if (thermalHold.defer(ThermalHold.AutoStart(rtsp, record))) {
             Timber.w("Phone too hot: the auto-start (RTSP: $rtsp, recording: $record) waits until it has cooled down")
             if (thermalHold.waiting != null && !streamWakeLock.isHeld) streamWakeLock.acquire()
             return
@@ -1507,15 +1507,16 @@ class CameraService : Service() {
 
     /**
      * Stop the encoder unless something still needs it: an explicit
-     * [startStreaming], an output other than [stopping], or a recording a
-     * failed encoder rebuild cut off.
+     * [startStreaming], an output other than [stopping] (a recording while it
+     * is open, see [isRecordingOpen]), or a recording a failed encoder rebuild
+     * cut off.
      */
     @Synchronized
     private fun stopEncoderIfUnused(stopping: Output) {
         val stillNeeded = encodingRequested || recordingInterrupted ||
             (stopping != Output.RTSP && rtspCoordinator.isRunning()) ||
             (stopping != Output.MPEGTS && mpegTsCoordinator.isRunning()) ||
-            (stopping != Output.RECORDING && isRecordingActive())
+            (stopping != Output.RECORDING && isRecordingOpen())
         if (stillNeeded) {
             Timber.i("Encoder kept running for the remaining outputs")
             return
@@ -1523,8 +1524,19 @@ class CameraService : Service() {
         stopEncoder()
     }
 
+    /** A recording runs or is paused: what a start finds already recording. */
     private fun isRecordingActive(): Boolean =
         recordingCoordinator.isRecording() || recordingCoordinator.isPaused()
+
+    /**
+     * Stop the recorder unless it is idle: a recording running or paused, or
+     * a recorder left in an error, which may still hold its file.
+     */
+    private fun stopRecorder() {
+        if (recordingCoordinator.recordingState.value == RecordingState.IDLE) return
+        detachRecorder()
+        recordingCoordinator.stopRecording()
+    }
 
     /** Stop the encoder: it is no longer requested, and the CPU and Wi-Fi may sleep again. */
     private fun stopEncoder() {
@@ -1600,17 +1612,21 @@ class CameraService : Service() {
      * encoder, remembering which ran and how (the requested encoder settings,
      * Start Streaming, the RTSP port, the MPEG-TS settings, the recording's
      * segment length and whether it was paused) for [resumeAfterThermal].
-     * Does nothing when nothing runs or a pause is already in effect. An
-     * encoder that runs with nothing to restart (say its only output, a
-     * recording, failed) is stopped all the same, with no pause to resume. The
-     * CPU is kept awake during the pause: the thermal monitor that calls for
-     * the resume only runs while it is, and with the screen off the phone
-     * would otherwise go to sleep and never bring the outputs back.
+     * Until that resume, unattended starts (kiosk auto-start at boot, the
+     * restart after Android stopped the app) wait for it too, also when
+     * nothing ran to stop (see [autoStartOutputs]). Stops nothing when nothing
+     * runs or a pause is already in effect. An encoder that runs with nothing
+     * to restart (say its only output, a recording, failed) is stopped all the
+     * same, with no pause to resume. The CPU is kept awake during the pause:
+     * the thermal monitor that calls for the resume only runs while it is, and
+     * with the screen off the phone would otherwise go to sleep and never
+     * bring the outputs back.
      *
      * Thread-safe; blocks while the outputs stop, so call it off the main thread.
      */
     @Synchronized
     fun pauseForThermal() {
+        thermalHold.begin()
         if (thermalPaused != null) return
         val encoder = requestedEncoderConfig ?: getEncoderConfig() ?: return
         val paused = PausedOutputs(
@@ -1618,7 +1634,7 @@ class CameraService : Service() {
             encodingRequested = encodingRequested,
             rtspPort = rtspCoordinator.port.takeIf { rtspCoordinator.isRunning() },
             mpegTs = mpegTsCoordinator.getConfig(),
-            recording = recordingCoordinator.segmentDuration.takeIf { isRecordingActive() || recordingInterrupted },
+            recording = recordingCoordinator.segmentDuration.takeIf { isRecordingOpen() || recordingInterrupted },
             recordingPaused = recordingToContinuePaused()
         )
         if (!paused.restartsAnything()) {
@@ -1637,17 +1653,34 @@ class CameraService : Service() {
     /**
      * The phone has cooled down: restart exactly the outputs [pauseForThermal]
      * stopped, sharing one encoder, within the thermal limits and bitrate cut
-     * then in effect (a recording continues in a new file). MPEG-TS receivers
-     * in listener mode have to reconnect. Does nothing without a pause, or
-     * after a user's start or stop cancelled it.
+     * then in effect (a recording continues in a new file), then make the
+     * unattended start that waited for the cool-down. MPEG-TS receivers in
+     * listener mode have to reconnect. An automatic restart is no new choice:
+     * the saved stream defaults stay as they are. Restarts nothing without a
+     * pause, or after a user's start or stop cancelled it.
      *
      * Thread-safe; blocks while the encoder starts, so call it off the main thread.
      */
     @Synchronized
     fun resumeAfterThermal() {
-        val paused = thermalPaused ?: return
+        val waiting = thermalHold.end()
+        val paused = thermalPaused
+        if (paused == null && waiting == null) return
         thermalPaused = null
-        Timber.i("Phone cooled down: restarting the outputs the thermal pause stopped")
+        Timber.i("Phone cooled down: restarting what the thermal pause stopped or held back")
+        keepSavedDefaults = true
+        try {
+            if (paused != null) restartPausedOutputs(paused)
+            if (waiting != null) autoStartOutputs(waiting.rtsp, waiting.record)
+        } finally {
+            keepSavedDefaults = false
+        }
+        // Nothing came back: the CPU, kept awake for the resume, may sleep again
+        if (!isStreamingActive) releaseStreamLocks()
+    }
+
+    /** Restart the outputs [paused] records, sharing one encoder (see [resumeAfterThermal]). */
+    private fun restartPausedOutputs(paused: PausedOutputs) {
         val encoder = paused.encoder
         if (paused.encodingRequested && !startStreaming(encoder)) {
             Timber.e("Thermal resume: the encoder did not start")
@@ -1665,20 +1698,24 @@ class CameraService : Service() {
                 pauseRecording()
             }
         }
-        // Nothing came back: the CPU, kept awake for the resume, may sleep again
-        if (!isStreamingActive) releaseStreamLocks()
     }
 
-    /** True while a thermal pause holds the outputs stopped, to restart them once the phone cools down. */
-    fun isThermalPaused(): Boolean = thermalPaused != null
+    /**
+     * True while a thermal pause holds the outputs stopped, or holds back an
+     * unattended start, until the phone cools down.
+     */
+    fun isThermalPaused(): Boolean = thermalPaused != null || thermalHold.waiting != null
 
     /**
      * A start or stop by the user ends a thermal pause: nothing is restarted
-     * automatically any more, and the CPU, kept awake for the resume, may
-     * sleep again unless the encoder runs.
+     * automatically any more, an unattended start waiting for the cool-down is
+     * dropped, and the CPU, kept awake for the resume, may sleep again unless
+     * the encoder runs. The EMERGENCY itself stays in effect for later
+     * unattended starts until the governor resumes.
      */
     private fun cancelThermalPause() {
-        if (thermalPaused == null) return
+        val droppedAutoStart = thermalHold.dropWaiting()
+        if (thermalPaused == null && !droppedAutoStart) return
         thermalPaused = null
         if (!isStreamingActive) releaseStreamLocks()
     }
@@ -1798,8 +1835,10 @@ class CameraService : Service() {
      * Make the start that just succeeded the stream defaults: the encoder
      * settings asked for (never the thermally limited ones the encoder may run
      * at), with [rtspPort] and [segment] when given and the saved ones otherwise.
+     * Not for the starts of [resumeAfterThermal] ([keepSavedDefaults]).
      */
     private fun rememberStreamDefaults(rtspPort: Int? = null, segment: SegmentDuration? = null) {
+        if (keepSavedDefaults) return
         val requested = requestedEncoderConfig ?: return
         val saved = streamDefaults()
         val updated = StreamDefaults.from(requested, rtspPort ?: saved.rtspPort, segment?.minutes ?: saved.segmentMinutes)
@@ -2250,9 +2289,10 @@ class CameraService : Service() {
     }
 
     /**
-     * Record from the running encoder. A recording already open (running or
-     * paused) is left as it is and counts as started, so a second start never
-     * detaches its listeners.
+     * Record from the running encoder. A recording already running or paused
+     * is left as it is and counts as started, so a second start never
+     * detaches its listeners; a recorder left in an error, even one still
+     * holding its file (see [isRecordingOpen]), is replaced by a new recording.
      */
     @Synchronized
     fun startRecording(): Boolean {
@@ -2289,7 +2329,7 @@ class CameraService : Service() {
     /**
      * Record locally. Uses the running encoder if there is one (recording
      * alongside a stream), otherwise starts one with [config]. A recording
-     * already open (running or paused) is left as it is, with its own segment
+     * already running or paused is left as it is, with its own segment
      * length, and counts as started: the encoder is neither started nor
      * stopped for it. A new recording's settings and segment length become the
      * stream defaults.
@@ -2363,6 +2403,22 @@ class CameraService : Service() {
     fun isRecording(): Boolean = recordingCoordinator.isRecording()
 
     fun isRecordingPaused(): Boolean = recordingCoordinator.isPaused()
+
+    /**
+     * Whether a recording is open: running or paused, or the recorder still
+     * holds its file after it reported an error (a segment whose muxer would
+     * not start keeps it, and a later keyframe can still write to it). Stop
+     * Recording, Stop All and an encoder restart close it; a new start replaces
+     * the recorder.
+     */
+    fun isRecordingOpen(): Boolean = isRecordingActive() || getRecordingStats().currentFilePath != null
+
+    /**
+     * The last error the recorder reported since the last recording start
+     * (such as "Storage full - recording stopped"), kept after the stop that
+     * follows it; null when there was none.
+     */
+    fun getLastRecordingError(): String? = recordingCoordinator.lastError
 
     fun getRecordingStats(): RecordingStats = recordingCoordinator.getStats()
 
@@ -2473,11 +2529,13 @@ class CameraService : Service() {
     }
 
     /**
-     * Check if focus is currently locked.
+     * Whether the picture counts as in focus, for the director's take scores
+     * (see [countsAsInFocus]): with continuous autofocus, once the camera
+     * reports it has focused (the AF state of the latest capture result);
+     * with autofocus that does not move the lens by itself (a fixed-focus
+     * lens, a set distance, a focus hold), always.
      */
-    fun isFocusLocked(): Boolean {
-        return _focusState.value == FocusState.FOCUSED
-    }
+    fun isFocusLocked(): Boolean = countsAsInFocus(currentConfig.focusMode, focusController.focusState.value)
 
     /**
      * Get normalized exposure value (0-1 range).
@@ -2550,5 +2608,54 @@ class CameraService : Service() {
         }
     }
 
+}
+
+/**
+ * The thermal EMERGENCY as [CameraService] follows it: in effect from the
+ * governor's pause ([begin]) to its resume ([end]), whether or not any output
+ * ran to stop, and the unattended start (kiosk auto-start at boot, the restart
+ * after Android stopped the app) that waits for it to end. Kept apart from the
+ * service so it is unit-tested; not thread-safe, the service changes it under
+ * its own lock, while [emergency] and [waiting] may be read from any thread.
+ */
+internal class ThermalHold {
+
+    /** An unattended start: RTSP and/or a recording, with the saved stream defaults. */
+    data class AutoStart(val rtsp: Boolean, val record: Boolean) {
+        /** Both starts in one: each output that either asks for. */
+        operator fun plus(other: AutoStart) = AutoStart(rtsp || other.rtsp, record || other.record)
+    }
+
+    /** True from [begin] to [end]: the governor has paused the outputs and not resumed them yet. */
+    @Volatile var emergency = false
+        private set
+
+    /** The unattended start waiting for the emergency to end, or null. */
+    @Volatile var waiting: AutoStart? = null
+        private set
+
+    /** The governor paused the outputs: the phone is too hot. */
+    fun begin() {
+        emergency = true
+    }
+
+    /** The governor resumed: the emergency is over. Returns the start that waited for it, to make now, and forgets it. */
+    fun end(): AutoStart? {
+        emergency = false
+        return waiting.also { waiting = null }
+    }
+
+    /**
+     * During an emergency, keep [start] (merged with one already waiting) for
+     * [end] and return true: it must not start now. Otherwise false.
+     */
+    fun defer(start: AutoStart): Boolean {
+        if (!emergency) return false
+        if (start.rtsp || start.record) waiting = waiting?.plus(start) ?: start
+        return true
+    }
+
+    /** A user's start or stop: the waiting start is dropped (true if there was one); the emergency stays. */
+    fun dropWaiting(): Boolean = (waiting != null).also { waiting = null }
 }
 

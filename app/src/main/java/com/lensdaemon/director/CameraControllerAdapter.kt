@@ -181,9 +181,10 @@ class CameraControllerAdapter(
      * Set the exposure compensation of a preset: AUTO 0, BRIGHT +1, DARK −1, BACKLIT +2 and
      * SILHOUETTE −2 EV, in the open lens's own steps and within its range, unless the camera
      * has it already. The director sends the preset of every [EXPOSURE] cue, AUTO included,
-     * and a preset other than AUTO with every command while it is in force. A preset other
-     * than AUTO also goes onto each lens that opens in the next [EXPOSURE_KEEP_MS]: a lens
-     * switch the same command asked for is still under way, and the new lens starts at 0 EV.
+     * and a preset other than AUTO with every command while it is in force; a run from the top
+     * sends AUTO in place of such a preset. A preset other than AUTO also goes onto each lens
+     * that opens in the next [EXPOSURE_KEEP_MS]: a lens switch the same command asked for is
+     * still under way, and the new lens starts at 0 EV.
      */
     override fun setExposurePreset(preset: ExposurePreset) {
         synchronized(exposureLock) {
@@ -232,9 +233,10 @@ class CameraControllerAdapter(
     override fun getCapabilities(): ShotMapper.CameraCapabilities = getCameraCapabilities()
 
     /**
-     * The lens family the camera is on or heading to (as [switchLens] counts it) and the zoom
-     * an animation of ours is heading to, else the camera's; null while the camera is closed
-     * and no lens switch is under way.
+     * The lens family the camera is on or heading to, as [switchLens] counts it ("other" for a
+     * lens of unknown focal length, which [switchLens] then leaves as it is), and the zoom an
+     * animation of ours is heading to, else the camera's. Null while no lens is open and the
+     * director has switched none.
      */
     override fun getFraming(): ShotMapper.Framing? {
         val now = SystemClock.elapsedRealtime()
