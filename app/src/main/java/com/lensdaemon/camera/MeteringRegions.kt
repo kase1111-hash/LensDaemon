@@ -64,7 +64,8 @@ internal object MeteringRegions {
     fun visibleBand(activeWidth: Int, activeHeight: Int, outputAspect: Float = OUTPUT_ASPECT): IntArray {
         val width = max(0, activeWidth)
         val height = max(0, activeHeight)
-        if (width == 0 || height == 0 || !outputAspect.isFinite() || outputAspect <= 0f) {
+        val usableAspect = outputAspect.isFinite() && outputAspect > 0f
+        if (width == 0 || height == 0 || !usableAspect) {
             return intArrayOf(0, 0, width, height)
         }
         val bandHeight = min(height, (width / outputAspect).roundToInt())

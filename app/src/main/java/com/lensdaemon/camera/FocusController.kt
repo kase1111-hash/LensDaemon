@@ -21,8 +21,9 @@ import timber.log.Timber
 class FocusController {
 
     companion object {
-        // Metering region size as a share of the picture's width and height
         private const val DEFAULT_METERING_WEIGHT = MeteringRectangle.METERING_WEIGHT_MAX
+
+        // Tap region size as a share of the picture's width and height
         private const val TAP_REGION_SIZE_PERCENT = 0.1f
         private const val FOCUS_LOCK_TIMEOUT_MS = 3000L
     }

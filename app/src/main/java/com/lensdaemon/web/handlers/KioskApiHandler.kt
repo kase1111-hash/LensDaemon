@@ -26,6 +26,9 @@ class KioskApiHandler(
 
     private companion object {
         const val MAX_BRIGHTNESS = 255
+        const val DEVICE_OWNER_MESSAGE = "Kiosk mode on: LensDaemon is pinned to the screen and starts on boot. " +
+            "Android starts it only after the phone's first unlock, so restarting unattended needs a phone " +
+            "without a PIN, pattern or password lock"
         const val NO_DEVICE_OWNER_MESSAGE = "Kiosk mode is on, but without Device Owner LensDaemon can't lock the " +
             "screen, and Android won't open its screen or (Android 11+) its camera by itself after a reboot: " +
             "adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver"
@@ -81,7 +84,8 @@ class KioskApiHandler(
      * owner, pins itself to the screen at once. Without Device Owner the screen
      * cannot be locked, and Android won't let LensDaemon open its screen (or on
      * Android 11+ its camera) by itself at boot, which the answer says
-     * (lockTask: false).
+     * (lockTask: false). Either way the boot start comes after the phone's
+     * first unlock, so unattended restarts need no secure screen lock.
      */
     private fun enableKiosk(): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
@@ -90,14 +94,7 @@ class KioskApiHandler(
         val json = JSONObject().apply {
             put("success", true)
             put("lockTask", deviceOwner)
-            put(
-                "message",
-                if (deviceOwner) {
-                    "Kiosk mode on: LensDaemon is pinned to the screen and starts on boot"
-                } else {
-                    NO_DEVICE_OWNER_MESSAGE
-                }
-            )
+            put("message", if (deviceOwner) DEVICE_OWNER_MESSAGE else NO_DEVICE_OWNER_MESSAGE)
         }
         return ok(json)
     }

@@ -9,60 +9,8 @@ import android.hardware.camera2.params.MeteringRectangle
 import android.os.Build
 import timber.log.Timber
 
-/**
- * What a capture request needs to know about the open camera to zoom and to
- * place AF/AE regions: the size of its active pixel array (regions and crops
- * are in its coordinates, (0, 0) at its top-left), how many AF and AE regions
- * it takes (0: none), and whether it zooms with CONTROL_ZOOM_RATIO (Android 11+).
- */
-internal data class LensGeometry(
-    val activeWidth: Int = 0,
-    val activeHeight: Int = 0,
-    val maxAfRegions: Int = 0,
-    val maxAeRegions: Int = 0,
-    val zoomRatio: Boolean = false
-) {
-    companion object {
-        /** Before a camera has opened, or when its characteristics can't be read: no zoom crop, no regions. */
-        val UNKNOWN = LensGeometry()
-    }
-}
-
-/** The [LensGeometry] of camera [cameraId], or [LensGeometry.UNKNOWN] when it can't be read. */
-internal fun CameraManager.lensGeometry(cameraId: String): LensGeometry = try {
-    val characteristics = getCameraCharacteristics(cameraId)
-    val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
-    val zoomRatio = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-        characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null
-    } else {
-        false
-    }
-    LensGeometry(
-        activeWidth = active?.width() ?: 0,
-        activeHeight = active?.height() ?: 0,
-        maxAfRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0,
-        maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,
-        zoomRatio = zoomRatio
-    )
-} catch (e: CameraAccessException) {
-    Timber.w(e, "Could not read the active array of camera $cameraId")
-    LensGeometry.UNKNOWN
-} catch (e: IllegalArgumentException) {
-    Timber.w(e, "Unknown camera $cameraId")
-    LensGeometry.UNKNOWN
-}
-
-/**
- * The SCALER_CROP_REGION that zooms by [zoom] on a camera that zooms by
- * cropping (Android 10, or a camera without CONTROL_ZOOM_RATIO), centred in the
- * active array (see [MeteringRegions.centredCrop]). Null at 1x and below, with
- * zoom ratio support, or when the active array is unknown.
- */
-internal fun zoomCrop(zoom: Float, lens: LensGeometry): Rect? {
-    val cropsToZoom = !lens.zoomRatio && zoom > 1f
-    if (!cropsToZoom || lens.activeWidth <= 0 || lens.activeHeight <= 0) return null
-    return MeteringRegions.centredCrop(lens.activeWidth, lens.activeHeight, zoom).toRect()
-}
+// Zoom and tap regions for LensDaemonCameraManager's capture request, kept here
+// so that class stays small. The maths is in MeteringRegions (unit-tested).
 
 /**
  * Zoom by [zoom]: CONTROL_ZOOM_RATIO where the camera supports it (Android 11+),
@@ -95,6 +43,18 @@ internal fun CaptureRequest.Builder.applyMeteringRegions(config: CaptureConfig, 
     }
 }
 
+/**
+ * The SCALER_CROP_REGION that zooms by [zoom] on a camera that zooms by
+ * cropping (Android 10, or a camera without CONTROL_ZOOM_RATIO), centred in the
+ * active array (see [MeteringRegions.centredCrop]). Null at 1x and below, with
+ * zoom ratio support, or when the active array is unknown.
+ */
+internal fun zoomCrop(zoom: Float, lens: LensGeometry): Rect? {
+    val cropsToZoom = !lens.zoomRatio && zoom > 1f
+    if (!cropsToZoom || lens.activeWidth <= 0 || lens.activeHeight <= 0) return null
+    return MeteringRegions.centredCrop(lens.activeWidth, lens.activeHeight, zoom).toRect()
+}
+
 /** This region moved into [crop] (see [MeteringRegions.mapIntoCrop]); unchanged without a crop. */
 private fun MeteringRectangle.inCrop(crop: Rect?, lens: LensGeometry): MeteringRectangle {
     crop ?: return this
@@ -105,6 +65,49 @@ private fun MeteringRectangle.inCrop(crop: Rect?, lens: LensGeometry): MeteringR
         intArrayOf(crop.left, crop.top, crop.right, crop.bottom)
     )
     return MeteringRectangle(mapped.toRect(), meteringWeight)
+}
+
+/** The [LensGeometry] of camera [cameraId], or [LensGeometry.UNKNOWN] when it can't be read. */
+internal fun CameraManager.lensGeometry(cameraId: String): LensGeometry = try {
+    val characteristics = getCameraCharacteristics(cameraId)
+    val active = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+    val zoomRatio = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+        characteristics.get(CameraCharacteristics.CONTROL_ZOOM_RATIO_RANGE) != null
+    } else {
+        false
+    }
+    LensGeometry(
+        activeWidth = active?.width() ?: 0,
+        activeHeight = active?.height() ?: 0,
+        maxAfRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0,
+        maxAeRegions = characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0,
+        zoomRatio = zoomRatio
+    )
+} catch (e: CameraAccessException) {
+    Timber.w(e, "Could not read the active array of camera $cameraId")
+    LensGeometry.UNKNOWN
+} catch (e: IllegalArgumentException) {
+    Timber.w(e, "Unknown camera $cameraId")
+    LensGeometry.UNKNOWN
+}
+
+/**
+ * What a capture request needs to know about the open camera to zoom and to
+ * place AF/AE regions: the size of its active pixel array (regions and crops
+ * are in its coordinates, (0, 0) at its top-left), how many AF and AE regions
+ * it takes (0: none), and whether it zooms with CONTROL_ZOOM_RATIO (Android 11+).
+ */
+internal data class LensGeometry(
+    val activeWidth: Int = 0,
+    val activeHeight: Int = 0,
+    val maxAfRegions: Int = 0,
+    val maxAeRegions: Int = 0,
+    val zoomRatio: Boolean = false
+) {
+    companion object {
+        /** Before a camera has opened, or when its characteristics can't be read: no zoom crop, no regions. */
+        val UNKNOWN = LensGeometry()
+    }
 }
 
 /** A (left, top, right, bottom) array as a [Rect]. */

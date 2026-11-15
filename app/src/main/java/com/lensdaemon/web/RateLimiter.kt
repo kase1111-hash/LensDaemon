@@ -117,7 +117,7 @@ class RateLimiter(
             .sortedBy { it.second }
             .take(excess)
             .forEach { buckets.remove(it.first) }
-        Timber.tag(TAG).w("Tracking too many clients: forgot the %d idle longest", excess)
+        Timber.tag(TAG).w("Tracking too many clients: forgot the $excess idle longest")
     }
 
     /**

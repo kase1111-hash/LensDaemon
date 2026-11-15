@@ -178,7 +178,7 @@ class WebServer(
         val routes = apiRoutes ?: return newFixedLengthResponse(
             Response.Status.SERVICE_UNAVAILABLE,
             MIME_JSON,
-            """{"error": "API not available"}"""
+            JSONObject().put("error", "API not available").toString()
         )
 
         return routes.handleRequest(session)
@@ -193,7 +193,7 @@ class WebServer(
         val streamer = mjpegStreamer ?: return newFixedLengthResponse(
             Response.Status.SERVICE_UNAVAILABLE,
             MIME_JSON,
-            """{"error": "MJPEG stream not available"}"""
+            JSONObject().put("error", "MJPEG stream not available").toString()
         )
 
         return streamer.createStreamResponse()
