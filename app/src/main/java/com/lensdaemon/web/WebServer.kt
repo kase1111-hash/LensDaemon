@@ -186,10 +186,12 @@ class WebServer(
 
     /**
      * Handle MJPEG stream request. The preview shows the camera, so it takes
-     * the same token as the API when one is set (Bearer or ?token=).
+     * the same token as the API when one is set (Bearer or ?token=), and
+     * counts against the same rate limit, checked first, so that it can't be
+     * used to guess the token at full speed.
      */
     private fun handleMjpegStream(session: IHTTPSession): Response {
-        apiRoutes?.authorize(session)?.let { return it }
+        apiRoutes?.admit(session)?.let { return it }
         val streamer = mjpegStreamer ?: return newFixedLengthResponse(
             Response.Status.SERVICE_UNAVAILABLE,
             MIME_JSON,

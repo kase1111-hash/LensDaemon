@@ -180,63 +180,19 @@ class ApiRoutes(
     private val directorHandler = DirectorApiHandler(context)
 
     /**
-     * The API token check, also used by the MJPEG preview (/mjpeg): null when
-     * the request may go ahead, else 401. Off while no token is set. The token
-     * comes as "Authorization: Bearer <token>" or, from clients that can't send
-     * headers (an <img>, an EventSource), as ?token=. GET /api/status and
-     * /api/device need none.
+     * What every API request and the MJPEG preview (/mjpeg) pass once their
+     * body is read: the rate limit, then the token, as [admission] describes,
+     * with this server's [rateLimiter] and [apiToken]. Null when the request
+     * may go ahead, else 429 or 401.
      */
-    internal fun authorize(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
-        val token = apiToken ?: return null  // Auth disabled
-
-        val uri = session.uri
-        // Allow public read-only endpoints without auth
-        if (uri in PUBLIC_ENDPOINTS && session.method == NanoHTTPD.Method.GET) {
-            return null
-        }
-
-        val authHeader = session.headers["authorization"] ?: ""
-        val providedToken = if (authHeader.startsWith(BEARER_PREFIX, ignoreCase = true)) {
-            authHeader.substring(BEARER_PREFIX.length).trim()
-        } else {
-            session.parms?.get("token") ?: ""
-        }
-
-        if (providedToken != token) {
-            val body = JSONObject()
-                .put("error", "Authentication required")
-                .put("hint", "Provide Bearer token in Authorization header")
-            return ApiHandlerUtils.jsonResponse(Status.UNAUTHORIZED, body.toString())
-        }
-        return null
-    }
+    internal fun admit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? = admission(session, rateLimiter, apiToken)
 
     /**
-     * Check rate limit for client, keyed on the connection's address: headers
-     * such as X-Forwarded-For are the client's to choose (LensDaemon is never
-     * behind a proxy), so they would let it dodge the limit or drain another
-     * client's bucket. Returns 429 response if rate-limited, null if allowed.
+     * The token check alone: null when the request may go ahead, else 401.
+     * Off while no token is set. Requests go through [admit] instead, which
+     * applies the rate limit first so that wrong tokens count against it.
      */
-    private fun checkRateLimit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
-        val limiter = rateLimiter ?: return null
-
-        val clientIp = session.remoteIpAddress ?: session.headers["remote-addr"] ?: "unknown"
-
-        if (!limiter.tryAcquire(clientIp)) {
-            val retryAfter = limiter.retryAfterSeconds(clientIp)
-            val body = JSONObject().put("error", "Rate limit exceeded").put("retryAfter", retryAfter).toString()
-            val response = NanoHTTPD.newFixedLengthResponse(
-                TOO_MANY_REQUESTS,
-                WebServer.MIME_JSON,
-                body
-            )
-            response.addHeader("Retry-After", retryAfter.toString())
-            response.addHeader("X-RateLimit-Remaining", "0")
-            return response
-        }
-
-        return null
-    }
+    internal fun authorize(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? = tokenRefusal(session, apiToken)
 
     /**
      * Handle API request - main dispatcher
@@ -255,11 +211,8 @@ class ApiRoutes(
         // Refuse writes sent by a page of another site (CSRF)
         CrossSiteGuard.refusal(method, session.headers)?.let { return ApiHandlerUtils.errorJson(Status.FORBIDDEN, it) }
 
-        // Check authentication
-        authorize(session)?.let { return it }
-
-        // Check rate limit
-        checkRateLimit(session)?.let { return it }
+        // Rate limit, then the token: wrong tokens count against the limit too
+        admit(session)?.let { return it }
 
         // Delegate to per-module handlers by URI prefix
         when {
@@ -425,7 +378,8 @@ class ApiRoutes(
      * POST /api/focus {"x": 0.5, "y": 0.4}, from the left and top edges as
      * shares of the frame (0 to 1, values beyond are clamped): focus there.
      * {"reset": true} goes back to continuous autofocus and the camera's own
-     * metering. 400 unless x and y are finite numbers.
+     * metering. 400 unless x and y are finite numbers; 409 when the focus
+     * region can't be set (see [tapToFocusRefusal]), so a success means it was.
      */
     private fun triggerFocus(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
@@ -437,10 +391,24 @@ class ApiRoutes(
         }
         val x = ApiInputs.finiteNumber(body, "x")?.coerceIn(0.0, 1.0) ?: return failure(Status.BAD_REQUEST, FOCUS_ERROR)
         val y = ApiInputs.finiteNumber(body, "y")?.coerceIn(0.0, 1.0) ?: return failure(Status.BAD_REQUEST, FOCUS_ERROR)
+        tapToFocusRefusal(camera)?.let { return it }
 
         camera.triggerTapToFocus(x.toFloat(), y.toFloat(), Size(DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT))
 
         return success(JSONObject().put("success", true).put("x", x).put("y", y))
+    }
+
+    /**
+     * 409 when a tap-to-focus would change nothing, else null.
+     * CameraService.triggerTapToFocus applies a region exactly when the lens
+     * the controllers are set up for has continuous video autofocus, and does
+     * nothing (silently) otherwise: before any lens has been opened, or on a
+     * lens without it (fixed focus, or one-shot autofocus only).
+     */
+    private fun tapToFocusRefusal(camera: CameraService): NanoHTTPD.Response? = when {
+        camera.isTapToFocusSupported() -> null
+        camera.getCurrentLens().value == null -> failure(Status.CONFLICT, NO_CAMERA_OPEN)
+        else -> failure(Status.CONFLICT, NO_TAP_FOCUS)
     }
 
     /**
