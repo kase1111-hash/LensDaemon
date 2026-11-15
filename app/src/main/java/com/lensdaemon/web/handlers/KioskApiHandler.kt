@@ -151,33 +151,40 @@ class KioskApiHandler(
     }
 
     /**
-     * Change some settings: every section and field is optional, and what is
-     * left out stays as it is. Answers 400 for an exit PIN that is not 4-12
-     * digits (null or "" removes it), an unknown screen mode or a negative time.
+     * Change some settings ([kioskConfigFrom]); answers 400 with the reason
+     * when the request has a value the phone can't use.
      */
     private fun updateKioskConfig(body: JSONObject?): NanoHTTPD.Response {
         val kiosk = kioskManager ?: return ApiHandlerUtils.serviceUnavailable("Kiosk service")
         body ?: return ApiHandlerUtils.bodyRequired()
-        val current = kiosk.getConfig()
         val newConfig = try {
-            KioskConfig(
-                enabled = body.optBoolean("enabled", current.enabled),
-                autoStart = body.optJSONObject("autoStart")?.let { parseAutoStart(it, current.autoStart) }
-                    ?: current.autoStart,
-                screen = body.optJSONObject("screen")?.let { parseScreen(it, current.screen) } ?: current.screen,
-                security = body.optJSONObject("security")?.let { parseSecurity(it, current.security) }
-                    ?: current.security,
-                networkRecovery = body.optJSONObject("networkRecovery")?.let { parseNetwork(it, current.networkRecovery) }
-                    ?: current.networkRecovery,
-                crashRecovery = body.optJSONObject("crashRecovery")?.let { parseCrash(it, current.crashRecovery) }
-                    ?: current.crashRecovery
-            )
+            kioskConfigFrom(body, kiosk.getConfig())
         } catch (e: IllegalArgumentException) {
             return badRequest(e.message ?: "Invalid kiosk configuration")
         }
         kiosk.updateConfig(newConfig)
         return success("Kiosk configuration updated")
     }
+
+    /**
+     * [current] changed by a PUT /api/kiosk/config [body]: every section and
+     * field is optional, and what is left out stays as it is. Throws
+     * IllegalArgumentException, naming the field, for an exit PIN that is not
+     * 4-12 digits (null or "" removes it), an unknown screen mode or a negative
+     * time in [body]. Only [body] is checked: a negative time an earlier
+     * version saved is kept as 0, and an exit PIN it saved is kept as it is, so
+     * a change to another field never fails over them.
+     */
+    internal fun kioskConfigFrom(body: JSONObject, current: KioskConfig): KioskConfig = KioskConfig(
+        enabled = body.optBoolean("enabled", current.enabled),
+        autoStart = body.optJSONObject("autoStart")?.let { parseAutoStart(it, current.autoStart) } ?: current.autoStart,
+        screen = body.optJSONObject("screen")?.let { parseScreen(it, current.screen) } ?: current.screen,
+        security = body.optJSONObject("security")?.let { parseSecurity(it, current.security) } ?: current.security,
+        networkRecovery = body.optJSONObject("networkRecovery")?.let { parseNetwork(it, current.networkRecovery) }
+            ?: current.networkRecovery,
+        crashRecovery = body.optJSONObject("crashRecovery")?.let { parseCrash(it, current.crashRecovery) }
+            ?: current.crashRecovery
+    )
 
     private fun parseAutoStart(json: JSONObject, current: AutoStartConfig): AutoStartConfig =
         AutoStartConfig(
@@ -208,16 +215,15 @@ class KioskApiHandler(
         val pin = when {
             !json.has("exitPin") -> current.exitPin
             json.isNull("exitPin") -> ""
-            else -> json.opt("exitPin").toString().trim()
+            else -> json.opt("exitPin").toString().trim().also { typed ->
+                val pinError = exitPinError(typed)
+                require(pinError == null) { pinError.orEmpty() }
+            }
         }
-        val pinError = exitPinError(pin)
-        require(pinError == null) { pinError.orEmpty() }
-        val gestureMs = json.optLong("exitGestureTimeoutMs", current.exitGestureTimeoutMs)
-        require(gestureMs >= 0) { "security.exitGestureTimeoutMs must not be negative" }
         return SecurityConfig(
             exitPin = pin,
             allowedExitGesture = json.optBoolean("allowedExitGesture", current.allowedExitGesture),
-            exitGestureTimeoutMs = gestureMs,
+            exitGestureTimeoutMs = notNegative(json, "exitGestureTimeoutMs", current.exitGestureTimeoutMs, "security"),
             lockStatusBar = json.optBoolean("lockStatusBar", current.lockStatusBar),
             lockNavigationBar = json.optBoolean("lockNavigationBar", current.lockNavigationBar),
             lockNotifications = json.optBoolean("lockNotifications", current.lockNotifications),
@@ -233,20 +239,29 @@ class KioskApiHandler(
             restartStreamOnReconnect = json.optBoolean("restartStreamOnReconnect", current.restartStreamOnReconnect)
         )
 
-    private fun parseCrash(json: JSONObject, current: CrashRecoveryConfig): CrashRecoveryConfig {
-        val delayMs = json.optLong("restartDelayMs", current.restartDelayMs)
-        require(delayMs >= 0) { "crashRecovery.restartDelayMs must not be negative" }
-        return CrashRecoveryConfig(
+    private fun parseCrash(json: JSONObject, current: CrashRecoveryConfig): CrashRecoveryConfig =
+        CrashRecoveryConfig(
             autoRestart = json.optBoolean("autoRestart", current.autoRestart),
-            restartDelayMs = delayMs,
+            restartDelayMs = notNegative(json, "restartDelayMs", current.restartDelayMs, "crashRecovery"),
             maxRestartAttempts = json.optInt("maxRestartAttempts", current.maxRestartAttempts),
             restartWindowMinutes = notNegative(json, "restartWindowMinutes", current.restartWindowMinutes, "crashRecovery")
         )
+
+    /**
+     * The whole number [key] of [json]; a negative one in the request is
+     * refused, naming [section].[key]. Left out (or not a number), it is
+     * [current], raised to 0: an earlier version saved negative times, and the
+     * request did not ask about them.
+     */
+    private fun notNegative(json: JSONObject, key: String, current: Int, section: String): Int {
+        val value = json.optInt(key, current.coerceAtLeast(0))
+        require(value >= 0) { "$section.$key must not be negative" }
+        return value
     }
 
-    /** The whole number [key] of [json] ([current] when absent); a negative one is refused, naming [section].[key]. */
-    private fun notNegative(json: JSONObject, key: String, current: Int, section: String): Int {
-        val value = json.optInt(key, current)
+    /** [notNegative] for a time in milliseconds. */
+    private fun notNegative(json: JSONObject, key: String, current: Long, section: String): Long {
+        val value = json.optLong(key, current.coerceAtLeast(0))
         require(value >= 0) { "$section.$key must not be negative" }
         return value
     }

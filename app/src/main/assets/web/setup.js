@@ -7,6 +7,12 @@ let thermalPollInterval = null;
 let isTestStreaming = false;
 let startedTestRtsp = false;
 
+// The thresholds the phone throttles at (GET /api/thermal/profile "config"); these until it answers
+const thermalThresholds = { cpuWarningC: 50, cpuEmergencyC: 60, batteryWarningC: 42, batteryEmergencyC: 48 };
+
+// Exit PINs are 4 to 12 digits: the phone's PIN pad takes nothing else
+const EXIT_PIN_PATTERN = /^\d{4,12}$/;
+
 /**
  * Fetch JSON from the API. Resolves to { ok, status, data }: ok only for a 2xx
  * answer that doesn't report success: false. Rejects when the phone can't be reached.
@@ -125,11 +131,13 @@ function checkKioskStatus() {
                 setCheckStatus('check-kiosk', 'pass', 'Device Owner is set. Kiosk mode available.');
                 document.getElementById('device-owner-help').style.display = 'none';
             } else {
-                setCheckStatus('check-kiosk', 'warn', 'Device Owner not set. Required to lock the phone to LensDaemon.');
+                setCheckStatus('check-kiosk', 'warn', 'Device Owner not set. Required to lock the phone to LensDaemon ' +
+                    'and to start it by itself after a reboot.');
                 document.getElementById('device-owner-help').style.display = 'block';
             }
-            // Proceeding is still possible: without Device Owner, kiosk mode starts
-            // LensDaemon on boot but cannot lock the screen
+            // Proceeding is still possible, but without Device Owner kiosk mode can't
+            // lock the screen, and Android won't open LensDaemon or (Android 11+) its
+            // camera by itself at boot: the web server starts, nothing more
             enableStep1Next();
         })
         .catch(function() {
@@ -162,11 +170,22 @@ function checkThermalProfile() {
                 setCheckStatus('check-thermal', 'warn', 'Thermal profile not available (using defaults)');
                 return;
             }
+            useThermalThresholds(result.data.config);
             setCheckStatus('check-thermal', 'pass', result.data.profile.displayName + ' (' + result.data.source + ')');
         })
         .catch(function() {
             setCheckStatus('check-thermal', 'warn', 'Thermal profile not available (using defaults)');
         });
+}
+
+/** Keep the thresholds in force, for colouring the temperature bars. */
+function useThermalThresholds(config) {
+    if (!config) return;
+    ['cpuWarningC', 'cpuEmergencyC', 'batteryWarningC', 'batteryEmergencyC'].forEach(function(key) {
+        if (typeof config[key] === 'number') {
+            thermalThresholds[key] = config[key];
+        }
+    });
 }
 
 function enableStep1Next() {
@@ -331,6 +350,12 @@ function stopTestStream() {
 
 function startThermalPolling() {
     stopThermalPolling();
+    // The thresholds in force now (step 1 may have run before thermal monitoring answered)
+    api('/api/thermal/profile')
+        .then(function(result) {
+            if (result.ok) useThermalThresholds(result.data.config);
+        })
+        .catch(function() {});
     pollThermal();
     thermalPollInterval = setInterval(pollThermal, 3000);
 }
@@ -370,8 +395,8 @@ function pollThermal() {
             cpuBar.style.width = cpuPct + '%';
             batteryBar.style.width = batteryPct + '%';
 
-            cpuBar.style.background = tempColor(cpuTemp, 50, 60);
-            batteryBar.style.background = tempColor(batteryTemp, 42, 48);
+            cpuBar.style.background = tempColor(cpuTemp, thermalThresholds.cpuWarningC, thermalThresholds.cpuEmergencyC);
+            batteryBar.style.background = tempColor(batteryTemp, thermalThresholds.batteryWarningC, thermalThresholds.batteryEmergencyC);
 
             // Overall thermal check
             const level = data.overallLevel || 'NORMAL';
@@ -388,8 +413,9 @@ function pollThermal() {
         });
 }
 
-function tempColor(temp, warnThreshold, critThreshold) {
-    if (temp >= critThreshold) return 'var(--danger-color)';
+// Red from the emergency threshold (outputs pause), orange from the warning one (throttling starts)
+function tempColor(temp, warnThreshold, emergencyThreshold) {
+    if (temp >= emergencyThreshold) return 'var(--danger-color)';
     if (temp >= warnThreshold) return 'var(--warning-color)';
     return 'var(--success-color)';
 }
@@ -434,9 +460,16 @@ function updateSummary() {
     document.getElementById('btn-activate').disabled = !selectedPreset;
 }
 
-// Each step must succeed before the next: a failure stops activation and says where
+// Each step must succeed before the next: a failure stops activation and says where.
+// The exit PIN, when one is typed, is set after the preset and before kiosk mode goes on.
 function activateKiosk() {
     const resultEl = document.getElementById('activation-result');
+    const exitPin = document.getElementById('exit-pin').value.trim();
+    if (exitPin && !EXIT_PIN_PATTERN.test(exitPin)) {
+        showBanner(resultEl, 'error', 'The exit PIN must be 4 to 12 digits, or empty to keep the current one');
+        document.getElementById('exit-pin').focus();
+        return;
+    }
     showBanner(resultEl, 'pending', null, '<span class="spinner"></span> Applying preset and activating kiosk mode...');
 
     const activateBtn = document.getElementById('btn-activate');
@@ -457,6 +490,11 @@ function activateKiosk() {
 
     step('Applying the preset', api(presetUrl, 'POST'))
         .then(function() {
+            return exitPin
+                ? step('Setting the exit PIN', api('/api/kiosk/config', 'PUT', { security: { exitPin: exitPin } }))
+                : null;
+        })
+        .then(function() {
             return saveStorageConfig(step);
         })
         .then(function() {
@@ -467,7 +505,9 @@ function activateKiosk() {
             showBanner(resultEl, lockTask === false ? 'pending' : 'success', null,
                 '<strong>' + (lockTask === false ? 'Kiosk settings saved' : 'Kiosk mode activated!') + '</strong><br>');
             resultEl.appendChild(document.createTextNode(
-                'Preset: ' + (selectedPreset === 'appliance' ? 'Appliance' : 'Interactive') + '. ' + (result.data.message || '')));
+                'Preset: ' + (selectedPreset === 'appliance' ? 'Appliance' : 'Interactive') + '. ' +
+                (exitPin ? 'Exit PIN set. ' : '') + activationNote(lockTask !== false)));
+            document.getElementById('exit-pin').value = '';
 
             const step5 = document.querySelector('.step[data-step="5"]');
             if (step5) {
@@ -479,6 +519,20 @@ function activateKiosk() {
             showBanner(resultEl, 'error', err.message);
             activateBtn.disabled = false;
         });
+}
+
+/**
+ * What kiosk mode does on this phone. Boot start comes after the phone's first
+ * unlock, and without Device Owner Android won't open LensDaemon's screen, or
+ * on Android 11+ its camera, from the background.
+ */
+function activationNote(deviceOwner) {
+    if (deviceOwner) {
+        return 'LensDaemon pins itself to the phone\'s screen and starts by itself after a reboot. Android starts it only ' +
+            'after the phone\'s first unlock, so unattended restarts need a phone without a PIN, pattern or password lock.';
+    }
+    return 'Without Device Owner, kiosk mode can\'t lock the screen, and Android won\'t open LensDaemon or ' +
+        '(Android 11+) its camera by itself after a reboot: adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver';
 }
 
 function saveStorageConfig(step) {

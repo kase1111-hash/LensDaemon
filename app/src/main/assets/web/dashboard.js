@@ -3,7 +3,8 @@
  *
  * Talks to the phone's REST API (docs/API.md). Every panel reads the fields the
  * API actually returns; the status, thermal, upload and kiosk panels poll while
- * the page is visible and stop while it is hidden, to spare the phone.
+ * the page is visible and stop while it is hidden, to spare the phone, and the
+ * live preview pauses with them.
  */
 'use strict';
 
@@ -16,11 +17,16 @@ const SLOW_POLL_MS = 5000;
 const KIOSK_POLL_MS = 10000;
 const LIBRARY_POLL_MS = 30000;
 
+// The RTSP port used when the phone has no saved default
+const DEFAULT_RTSP_PORT = 8554;
+
 // State
 let isStreaming = false;
 let isRtspRunning = false;
 let isMpegTsRunning = false;
 let isPreviewActive = false;
+// The preview was on when the page was hidden: it comes back when the page is shown
+let previewResumeOnShow = false;
 let pollTimers = [];
 let connected = false;
 let deviceInfoLoaded = false;
@@ -28,26 +34,39 @@ let deviceInfoLoaded = false;
 // Encoder settings form: follows the running encoder until edited
 let encoderFormEdited = false;
 
+// The phone's saved stream defaults (GET /api/config "defaults"), or null when unknown
+let streamDefaults = null;
+
 // Camera controls
 let zoomDragging = false;
 let exposureDragging = false;
 let exposureStep = 0;
 let availableLenses = [];
 
-// Recording
+// Recording: "active" while a recording is open, running or paused
 let recordingActive = false;
 let recordingPaused = false;
+let recordingStartPending = false;
 let currentRecordingFile = '';
 let recordingsCache = [];
 
 // Network storage
 const uploadConfigured = { S3: false, SMB: false };
+let failedUploadsKey = '';
 
 // Kiosk
 let kioskEnabled = false;
+let kioskDeviceOwner = false;
+let kioskConfig = null;
+// The settings form follows the phone's settings until edited
+let kioskFormEdited = false;
+const MAX_BOOT_DELAY_S = 120;
+const MAX_GESTURE_HOLD_S = 30;
 
-// Thermal thresholds (replaced by the active profile's)
+// Thermal thresholds in force (replaced by the governor's, from GET /api/thermal/profile)
 const thermalLimits = { cpuWarn: 50, cpuEmergency: 60, batteryWarn: 42, batteryEmergency: 48 };
+let thermalProfileLoaded = false;
+let thermalProfilePending = false;
 
 // Director state
 let directorEnabled = false;
@@ -93,6 +112,9 @@ const elements = {
     audioEnabled: $('audio-enabled'),
     audioState: $('audio-state'),
     encoderNote: $('encoder-note'),
+    btnSaveDefaults: $('btn-save-defaults'),
+    defaultsSummary: $('defaults-summary'),
+    defaultsResult: $('defaults-result'),
     statFrames: $('stat-frames'),
     statFps: $('stat-fps'),
     statBitrate: $('stat-bitrate'),
@@ -122,6 +144,7 @@ const elements = {
     batteryTemp: $('battery-temp'),
     batteryLevel: $('battery-level'),
     batteryDetail: $('battery-detail'),
+    chargeAdvice: $('charge-advice'),
     throttleDetail: $('throttle-detail'),
     thermalProfile: $('thermal-profile'),
 
@@ -130,6 +153,7 @@ const elements = {
     uploadBody: $('upload-body'),
     uploadState: $('upload-state'),
     uploadQueue: $('upload-queue'),
+    uploadFailed: $('upload-failed'),
     uploadCurrent: $('upload-current'),
     btnUploadStart: $('btn-upload-start'),
     btnUploadStop: $('btn-upload-stop'),
@@ -162,6 +186,18 @@ const elements = {
     kioskScreen: $('kiosk-screen'),
     kioskHint: $('kiosk-hint'),
     btnKioskToggle: $('btn-kiosk-toggle'),
+    kioskPinState: $('kiosk-pin-state'),
+    kioskExitPin: $('kiosk-exit-pin'),
+    btnKioskPinSet: $('btn-kiosk-pin-set'),
+    btnKioskPinRemove: $('btn-kiosk-pin-remove'),
+    kioskStartRtsp: $('kiosk-start-rtsp'),
+    kioskStartRecording: $('kiosk-start-recording'),
+    kioskDelay: $('kiosk-delay'),
+    kioskScreenMode: $('kiosk-screen-mode'),
+    kioskExitGesture: $('kiosk-exit-gesture'),
+    kioskGestureSeconds: $('kiosk-gesture-seconds'),
+    btnKioskSave: $('btn-kiosk-save'),
+    kioskResult: $('kiosk-result'),
 
     // Director elements
     directorSection: document.querySelector('.director-section'),
@@ -172,6 +208,7 @@ const elements = {
     directorCue: $('director-cue'),
     directorTake: $('director-take'),
     scriptTextarea: $('script-textarea'),
+    scriptProblems: $('script-problems'),
     btnLoadScript: $('btn-load-script'),
     btnClearScript: $('btn-clear-script'),
     btnDirectorStart: $('btn-director-start'),
@@ -202,16 +239,26 @@ document.addEventListener('DOMContentLoaded', () => {
     fetchLenses();
     fetchThermalProfile();
     fetchStorageConfig();
+    fetchStreamDefaults();
     refreshLibrary();
     startPolling();
 });
 
-// Poll only while the page is visible: every request costs the phone a little
+// Poll only while the page is visible: every request costs the phone a little.
+// The preview, a JPEG per frame, stops too and comes back when the page is shown.
 document.addEventListener('visibilitychange', () => {
     if (document.hidden) {
         stopPolling();
+        if (isPreviewActive) {
+            previewResumeOnShow = true;
+            stopPreview();
+        }
     } else {
         startPolling();
+        if (previewResumeOnShow) {
+            previewResumeOnShow = false;
+            startPreview();
+        }
     }
 });
 
@@ -263,6 +310,11 @@ function setupEventListeners() {
             updateEncoderNote();
         });
     });
+    elements.btnSaveDefaults.addEventListener('click', saveStreamDefaults);
+    // What "Save as phone default" last answered no longer applies once the settings change
+    [elements.resolution, elements.bitrate, elements.framerate, elements.codec, elements.segmentMinutes].forEach(el => {
+        el.addEventListener('change', () => showResult(elements.defaultsResult, null, ''));
+    });
 
     // Lens selection (the default buttons; replaced by the phone's own lenses once known)
     elements.lensButtons.querySelectorAll('.btn-lens').forEach(btn => {
@@ -299,7 +351,7 @@ function setupEventListeners() {
     // Network storage
     elements.btnUploadStart.addEventListener('click', () => uploadAction('/api/upload/start'));
     elements.btnUploadStop.addEventListener('click', () => uploadAction('/api/upload/stop'));
-    elements.btnUploadRetry.addEventListener('click', () => uploadAction('/api/upload/retry'));
+    elements.btnUploadRetry.addEventListener('click', retryFailedUploads);
     elements.btnUploadClear.addEventListener('click', () => uploadAction('/api/upload/clear'));
     $('btn-s3-save').addEventListener('click', saveS3);
     $('btn-s3-test').addEventListener('click', testS3);
@@ -310,6 +362,17 @@ function setupEventListeners() {
 
     // Kiosk
     elements.btnKioskToggle.addEventListener('click', toggleKiosk);
+    elements.btnKioskPinSet.addEventListener('click', setExitPin);
+    elements.btnKioskPinRemove.addEventListener('click', removeExitPin);
+    elements.btnKioskSave.addEventListener('click', saveKioskSettings);
+    [elements.kioskStartRtsp, elements.kioskStartRecording, elements.kioskDelay, elements.kioskScreenMode,
+        elements.kioskExitGesture, elements.kioskGestureSeconds].forEach(el => {
+        el.addEventListener('input', () => { kioskFormEdited = true; });
+        el.addEventListener('change', () => { kioskFormEdited = true; });
+    });
+    elements.kioskExitGesture.addEventListener('change', () => {
+        elements.kioskGestureSeconds.disabled = !elements.kioskExitGesture.checked;
+    });
 
     // Director controls
     elements.directorEnabled.addEventListener('change', toggleDirector);
@@ -331,8 +394,9 @@ function setupEventListeners() {
 // ==================== API ====================
 
 /**
- * Call the API. Returns the parsed JSON (with an `error` when the request
- * failed and the server said nothing), or null when the phone can't be reached.
+ * Call the API. Returns the parsed JSON, or null when the phone can't be
+ * reached. A failed request always carries an `error`: the server's own, else
+ * its `message` (older handlers put the reason there), else the HTTP status.
  */
 async function apiCall(endpoint, method = 'GET', body = null) {
     try {
@@ -352,7 +416,7 @@ async function apiCall(endpoint, method = 'GET', body = null) {
             data = {};
         }
         if (!response.ok && !data.error) {
-            data.error = `HTTP ${response.status}`;
+            data.error = data.message || `HTTP ${response.status}`;
         }
         Object.defineProperty(data, 'httpStatus', { value: response.status, enumerable: false });
         return data;
@@ -438,9 +502,11 @@ async function fetchStatus() {
     }
 }
 
-// Overall streaming status: the shared encoder and the outputs using it
+// Overall streaming status: the shared encoder and the outputs using it. A
+// thermal pause stops every output; the phone restarts them once it has cooled.
 function updateStreamStatus(status) {
     const encoderOn = !!status.camera?.streamingActive;
+    const thermalPaused = !!status.camera?.thermalPaused;
     const outputs = [];
     if (status.rtsp?.running) outputs.push(`RTSP (${status.rtsp.playing || 0} watching)`);
     if (status.mpegts?.running) outputs.push('MPEG-TS');
@@ -452,11 +518,15 @@ function updateStreamStatus(status) {
         text = `Live: ${outputs.join(', ')}`;
     } else if (encoderOn) {
         text = 'Encoder running, no outputs';
+    } else if (thermalPaused) {
+        text = 'Paused: the phone is too hot; outputs restart when it cools';
     }
     elements.streamStatus.textContent = text;
     elements.streamStatus.className = `status-text ${isStreaming ? 'running' : 'stopped'}`;
     elements.btnStreamStart.disabled = encoderOn;
-    elements.btnStreamStop.disabled = !isStreaming;
+    // During a thermal pause, Stop All cancels the restart after cool-down
+    elements.btnStreamStop.disabled = !isStreaming && !thermalPaused;
+    elements.btnStreamStop.title = !isStreaming && thermalPaused ? 'Cancel the restart after cool-down' : '';
     document.body.classList.toggle('streaming', isStreaming);
 }
 
@@ -502,6 +572,65 @@ function setSelectValue(select, value, label) {
         select.add(new Option(label, value));
     }
     select.value = value;
+}
+
+// ==================== Phone stream defaults ====================
+
+/**
+ * The phone's saved stream defaults (GET /api/config "defaults"): what its
+ * Start Stream button, kiosk boot and restarts use. While no encoder runs the
+ * settings form starts from them. Older phones have none: nothing changes.
+ */
+async function fetchStreamDefaults() {
+    const r = await apiCall('/api/config');
+    if (!r || r.error || !r.defaults) return;
+    streamDefaults = r.defaults;
+    showStreamDefaults();
+    const encoderRunning = !!(runningEncoder || (r.encoder && r.encoder.width));
+    if (!encoderRunning && !encoderFormEdited) {
+        applyDefaultsToForm(r.defaults);
+    }
+}
+
+function applyDefaultsToForm(d) {
+    if (d.width && d.height) setSelectValue(elements.resolution, `${d.width}x${d.height}`, `${d.width}x${d.height}`);
+    if (d.bitrate) elements.bitrate.value = +(d.bitrate / 1000000).toFixed(1);
+    if (d.frameRate) setSelectValue(elements.framerate, String(d.frameRate), `${d.frameRate} fps`);
+    if (d.codec) setSelectValue(elements.codec, d.codec, d.codec);
+    if (typeof d.segmentMinutes === 'number') {
+        setSelectValue(elements.segmentMinutes, String(d.segmentMinutes), `${d.segmentMinutes} minutes`);
+    }
+    updateEncoderNote();
+}
+
+function describeDefaults(d) {
+    const codec = d.codec === 'H265' ? 'H.265' : 'H.264';
+    const files = d.segmentMinutes === 0 ? 'one file per recording' : `new file every ${d.segmentMinutes} min`;
+    return `${d.width}x${d.height} ${d.frameRate} fps ${codec}, ${formatBitrate(d.bitrate)} · ${files} · RTSP port ${d.rtspPort}`;
+}
+
+function showStreamDefaults() {
+    elements.defaultsSummary.textContent = streamDefaults ? `Phone default: ${describeDefaults(streamDefaults)}` : '';
+}
+
+/** Save the settings form (and the recording's file length) as the phone's stream defaults. */
+async function saveStreamDefaults() {
+    const defaults = {
+        ...encoderSettings(),
+        rtspPort: streamDefaults?.rtspPort || DEFAULT_RTSP_PORT,
+        segmentMinutes: parseInt(elements.segmentMinutes.value, 10)
+    };
+    showResult(elements.defaultsResult, null, 'Saving…');
+    const result = await apiCall('/api/config', 'PUT', { defaults });
+    if (!succeeded(result)) {
+        showResult(elements.defaultsResult, false, 'Not saved: ' + errorText(result));
+    } else if (!result.defaults) {
+        showResult(elements.defaultsResult, false, 'Not saved: this version of LensDaemon keeps no stream defaults');
+    } else {
+        streamDefaults = result.defaults;
+        showStreamDefaults();
+        showResult(elements.defaultsResult, true, 'Saved: the phone starts with these settings from now on');
+    }
 }
 
 // Update RTSP status UI
@@ -593,9 +722,15 @@ function togglePreview() {
 }
 
 function startPreview() {
+    let framesShown = false;
+    elements.previewImage.onload = () => {
+        framesShown = true;
+    };
+    // An error before the first frame is usually the phone refusing another viewer (503)
     elements.previewImage.onerror = () => {
         if (isPreviewActive) {
-            notify('The preview stopped', 'error');
+            notify(framesShown ? 'The preview stopped'
+                : 'The preview could not start (the phone shows it to at most 8 viewers at a time)', 'error');
         }
         stopPreview();
     };
@@ -609,6 +744,7 @@ function startPreview() {
 function stopPreview() {
     isPreviewActive = false;
     elements.previewImage.onerror = null;
+    elements.previewImage.onload = null;
     elements.previewImage.removeAttribute('src');
     elements.previewImage.classList.remove('active');
     elements.previewOverlay.classList.remove('hidden');
@@ -648,6 +784,7 @@ async function startStream() {
     if (succeeded(result)) {
         encoderFormEdited = false;
         notify('Encoder started: start RTSP, MPEG-TS or a recording to send it somewhere', 'success');
+        fetchStreamDefaults();
     } else {
         notify('Failed to start the encoder: ' + errorText(result), 'error');
     }
@@ -664,11 +801,13 @@ async function stopStream() {
 }
 
 async function startRtsp() {
-    const config = { ...encoderSettings(), port: 8554 };
+    // On the phone's own RTSP port, so the address viewers know stays the same
+    const config = { ...encoderSettings(), port: streamDefaults?.rtspPort || DEFAULT_RTSP_PORT };
     const result = await apiCall('/api/rtsp/start', 'POST', config);
     if (succeeded(result)) {
         encoderFormEdited = false;
         updateRtspStatus({ running: true, url: result.url, playing: 0 });
+        fetchStreamDefaults();
     } else {
         notify('Failed to start RTSP: ' + errorText(result), 'error');
     }
@@ -703,6 +842,7 @@ async function startMpegTs() {
     const result = await apiCall('/api/mpegts/start', 'POST', config);
     if (succeeded(result)) {
         encoderFormEdited = false;
+        fetchStreamDefaults();
     } else {
         notify('Failed to start MPEG-TS: ' + errorText(result), 'error');
     }
@@ -827,11 +967,15 @@ async function setExposure(ev) {
 
 // ==================== Recording ====================
 
+// "active" means a recording is open, running or paused: a paused one keeps
+// Resume and Stop, and Start stays off (a second start would only answer
+// "Already recording")
 function updateRecordingStatus(recording) {
     if (!recording) return;
     const wasActive = recordingActive;
-    recordingActive = !!recording.active;
+    const wasPaused = recordingPaused;
     recordingPaused = !!recording.paused;
+    recordingActive = !!recording.active || recordingPaused;
 
     if (recordingActive) {
         elements.recordingStatus.textContent = recordingPaused ? 'Paused' : 'Recording';
@@ -843,20 +987,23 @@ function updateRecordingStatus(recording) {
         elements.recordingDetail.textContent = '';
         currentRecordingFile = '';
     }
-    elements.btnRecordStart.disabled = recordingActive;
+    elements.btnRecordStart.disabled = recordingActive || recordingStartPending;
     elements.btnRecordPause.disabled = !recordingActive;
     elements.btnRecordPause.textContent = recordingPaused ? 'Resume' : 'Pause';
     elements.btnRecordStop.disabled = !recordingActive;
 
-    // A recording that just ended has left new files
     if (wasActive && !recordingActive) {
+        // A recording that just ended has left new files
         refreshLibrary();
+    } else if (wasPaused !== recordingPaused) {
+        // The file being recorded is marked paused or recording
+        renderRecordings();
     }
 }
 
 async function fetchRecordingDetail() {
     const r = await apiCall('/api/recording/status');
-    if (!r || r.error || !r.recording) return;
+    if (!r || r.error || !(r.recording || r.paused)) return;
     const previousFile = currentRecordingFile;
     currentRecordingFile = baseName(r.currentFile || '');
     const parts = [formatDuration(r.durationSec || 0), `file ${(r.segmentIndex || 0) + 1}`, formatFileSize(r.totalBytes || 0)];
@@ -868,13 +1015,22 @@ async function fetchRecordingDetail() {
     }
 }
 
+// Start stays off while the request is out, so a double click starts one recording
 async function startRecording() {
     const body = { ...encoderSettings(), segmentMinutes: parseInt(elements.segmentMinutes.value, 10) };
+    recordingStartPending = true;
+    elements.btnRecordStart.disabled = true;
     const result = await apiCall('/api/recording/start', 'POST', body);
-    if (succeeded(result)) {
+    recordingStartPending = false;
+    if (succeeded(result) && result.alreadyRecording) {
+        // Started elsewhere (another dashboard, the phone, kiosk auto-start): left as it is
+        notify(result.paused ? 'The recording is paused: press Resume to continue it' : 'Already recording', 'info');
+    } else if (succeeded(result)) {
         encoderFormEdited = false;
         notify(`Recording (new file every ${result.segmentDuration || 'segment'})`, 'success');
+        fetchStreamDefaults();
     } else {
+        elements.btnRecordStart.disabled = recordingActive;
         notify('Failed to start recording: ' + errorText(result), 'error');
     }
     fetchStatus();
@@ -927,6 +1083,7 @@ function renderRecordings() {
         return;
     }
     recordingsCache.forEach(rec => {
+        // The file being recorded (also while paused) can't be downloaded, uploaded or deleted until it closes
         const live = recordingActive && rec.name === currentRecordingFile;
         const item = document.createElement('div');
         item.className = 'list-item';
@@ -946,7 +1103,7 @@ function renderRecordings() {
         if (live) {
             const badge = document.createElement('span');
             badge.className = 'live-badge';
-            badge.textContent = ' · ● recording';
+            badge.textContent = recordingPaused ? ' · ● recording (paused)' : ' · ● recording';
             meta.appendChild(badge);
         }
         main.append(name, meta);
@@ -993,15 +1150,33 @@ async function uploadRecording(rec, destination) {
     fetchUploadStatus();
 }
 
+// The phone's fixed retention policy, which POST /api/storage/cleanup applies
+const RETENTION_POLICY = 'recordings older than 7 days, the oldest beyond 10 GB in total, ' +
+    'and as many as needed to keep 1 GB free; never the file being recorded';
+
 async function cleanUpStorage() {
-    if (!confirm('Delete the recordings the retention policy no longer keeps?')) return;
+    if (!confirm(`Clean up now? This deletes ${RETENTION_POLICY}.`)) return;
+    elements.btnStorageCleanup.disabled = true;
     const result = await apiCall('/api/storage/cleanup', 'POST');
-    if (succeeded(result)) {
+    elements.btnStorageCleanup.disabled = false;
+    if (!succeeded(result)) {
+        notify('Clean-up failed: ' + errorText(result), 'error');
+    } else if (typeof result.filesDeleted !== 'number') {
+        // Older phones clean up in the background and report nothing
         notify(result.message || 'Clean-up started', 'success');
         setTimeout(refreshLibrary, 2000);
+        return;
     } else {
-        notify('Clean-up failed: ' + errorText(result), 'error');
+        const count = result.filesDeleted;
+        notify(count > 0
+            ? `Deleted ${count} recording${count === 1 ? '' : 's'} (${formatFileSize(result.bytesFreed || 0)} freed)`
+            : 'Nothing to clean up: every recording is within the retention policy', 'success');
+        const failed = Array.isArray(result.failed) ? result.failed : [];
+        if (failed.length > 0) {
+            notify(`Could not delete ${failed.map(baseName).join(', ')}`, 'error');
+        }
     }
+    refreshLibrary();
 }
 
 async function fetchStorageStatus() {
@@ -1023,16 +1198,26 @@ async function fetchStorageStatus() {
 
 // ==================== Thermal ====================
 
+/**
+ * The thermal profile and the thresholds in force: GET /api/thermal/profile's
+ * "config" is what the governor uses (the profile's, or an override's).
+ * Retried from fetchThermal until it has loaded.
+ */
 async function fetchThermalProfile() {
+    if (thermalProfilePending) return;
+    thermalProfilePending = true;
     const r = await apiCall('/api/thermal/profile');
+    thermalProfilePending = false;
     if (!r || r.error || !r.profile) return;
     const p = r.profile;
-    thermalLimits.cpuWarn = p.cpuWarnC;
-    thermalLimits.cpuEmergency = p.cpuEmergencyC;
-    thermalLimits.batteryWarn = p.batteryWarnC;
-    thermalLimits.batteryEmergency = p.batteryEmergencyC;
+    const c = r.config || {};
+    thermalLimits.cpuWarn = c.cpuWarningC ?? p.cpuWarnC;
+    thermalLimits.cpuEmergency = c.cpuEmergencyC ?? p.cpuEmergencyC;
+    thermalLimits.batteryWarn = c.batteryWarningC ?? p.batteryWarnC;
+    thermalLimits.batteryEmergency = c.batteryEmergencyC ?? p.batteryEmergencyC;
+    thermalProfileLoaded = true;
     elements.thermalProfile.textContent = `Profile: ${p.displayName} (${r.source}). ` +
-        `Throttling starts at ${p.cpuWarnC}°C CPU or ${p.batteryWarnC}°C battery.`;
+        `Throttling starts at ${formatDegrees(thermalLimits.cpuWarn)} CPU or ${formatDegrees(thermalLimits.batteryWarn)} battery.`;
 }
 
 const LEVEL_CLASS = { NORMAL: 'normal', ELEVATED: 'normal', WARNING: 'warning', CRITICAL: 'critical', EMERGENCY: 'critical' };
@@ -1055,6 +1240,9 @@ async function fetchThermal() {
             : 'Thermal monitoring is unavailable: the phone did not answer.';
         return;
     }
+    if (!thermalProfileLoaded) {
+        fetchThermalProfile();
+    }
     if (r.cpuTemperatureC <= 0 && r.batteryTemperatureC <= 0) {
         elements.throttleDetail.textContent = 'Waiting for the first reading…';
         return;
@@ -1064,12 +1252,27 @@ async function fetchThermal() {
     showTemperature(elements.batteryMeter, elements.batteryTemp, elements.batteryLevel,
         r.batteryTemperatureC, r.batteryLevel, thermalLimits.batteryEmergency);
 
+    // Most phones have no charging switch LensDaemon can write: chargingDisabled
+    // then only says the battery is too warm to charge, and the phone keeps charging
+    const noChargeSwitch = !!r.chargeControl && r.chargeControl.available === false;
     const battery = [`Battery ${r.batteryPercent}%`, r.isCharging ? 'charging' : 'not charging'];
-    if (r.chargingDisabled) battery.push('charging held back to keep it cool');
+    if (r.chargingDisabled && !noChargeSwitch) {
+        battery.push('charging held back to keep it cool');
+    } else if (r.chargingDisabled && r.isCharging) {
+        battery.push('too warm to charge: unplug the charger (this phone doesn\'t let LensDaemon switch charging off)');
+    } else if (r.chargingDisabled) {
+        battery.push('too warm to charge: let it cool before plugging it in');
+    }
     elements.batteryDetail.textContent = battery.join(' · ');
+    // The phone's advice (unplug at the charge target, plug in when low), unless the line above gives it
+    const advice = r.chargeControl?.recommendation || '';
+    elements.chargeAdvice.textContent = r.chargingDisabled && noChargeSwitch ? '' : advice;
 
-    const actions = (r.activeActions || []).filter(a => a !== 'NONE').map(action =>
-        action === 'REDUCE_BITRATE' ? `bitrate −${r.bitrateReductionPercent}%` : (THROTTLE_LABELS[action] || action.toLowerCase()));
+    const actions = (r.activeActions || []).filter(a => a !== 'NONE').map(action => {
+        if (action === 'REDUCE_BITRATE') return `bitrate −${r.bitrateReductionPercent}%`;
+        if (action === 'DISABLE_CHARGING' && noChargeSwitch) return r.isCharging ? 'unplug the charger' : 'too warm to charge';
+        return THROTTLE_LABELS[action] || action.toLowerCase();
+    });
     elements.throttleDetail.textContent = actions.length > 0
         ? `Throttling: ${actions.join(', ')}`
         : (r.isThrottling ? `Throttling (${r.statusText})` : 'Not throttling');
@@ -1118,6 +1321,70 @@ async function fetchUploadStatus() {
     elements.btnUploadStop.disabled = r.state !== 'UPLOADING';
     elements.btnUploadRetry.disabled = !q.failedCount;
     elements.btnUploadClear.disabled = !q.pendingCount;
+
+    if (q.failedCount > 0) {
+        fetchFailedUploads();
+    } else {
+        renderFailedUploads([]);
+    }
+}
+
+/** The uploads that used up their attempts, with why (GET /api/upload/queue "failed"). */
+async function fetchFailedUploads() {
+    const r = await apiCall('/api/upload/queue');
+    // Older phones don't keep failed uploads
+    if (!r || r.error || !Array.isArray(r.failed)) return;
+    renderFailedUploads(r.failed);
+}
+
+function renderFailedUploads(failed) {
+    // Redrawn only when something changed, so a click on Remove isn't lost to a poll
+    const key = failed.map(task => `${task.id}|${task.error}`).join('\n');
+    if (key === failedUploadsKey) return;
+    failedUploadsKey = key;
+    const list = elements.uploadFailed;
+    list.innerHTML = '';
+    list.hidden = failed.length === 0;
+    failed.forEach(task => {
+        const item = document.createElement('div');
+        item.className = 'list-item';
+        const main = document.createElement('div');
+        main.className = 'list-item-main';
+        const name = document.createElement('div');
+        name.className = 'list-item-name';
+        name.textContent = `${task.fileName} → ${task.destination}`;
+        const meta = document.createElement('div');
+        meta.className = 'list-item-meta failed-reason';
+        meta.textContent = `Failed: ${task.error || 'no reason given'}`;
+        main.append(name, meta);
+        const actions = document.createElement('div');
+        actions.className = 'list-item-actions';
+        actions.appendChild(actionButton('Remove', 'btn btn-small btn-danger-outline', () => removeFailedUpload(task)));
+        item.append(main, actions);
+        list.appendChild(item);
+    });
+}
+
+async function retryFailedUploads() {
+    const result = await apiCall('/api/upload/retry', 'POST');
+    if (succeeded(result) && typeof result.retried === 'number') {
+        notify(`Retrying ${result.retried} upload${result.retried === 1 ? '' : 's'}`, 'success');
+    } else if (succeeded(result)) {
+        notify(result.message || 'Retrying the failed uploads', 'success');
+    } else {
+        notify('Retry failed: ' + errorText(result), 'error');
+    }
+    fetchUploadStatus();
+}
+
+async function removeFailedUpload(task) {
+    const result = await apiCall(`/api/upload/task/${encodeURIComponent(task.id)}`, 'DELETE');
+    if (succeeded(result)) {
+        notify(`${task.fileName} removed from the uploads`, 'success');
+    } else {
+        notify('Could not remove the upload: ' + errorText(result), 'error');
+    }
+    fetchUploadStatus();
 }
 
 async function uploadAction(endpoint) {
@@ -1262,10 +1529,10 @@ async function removeStorage(kind) {
 
 // ==================== Kiosk ====================
 
-const SCREEN_MODES = { PREVIEW: 'Camera preview', OFF: 'Off', DIM: 'Dimmed', BLACK: 'Black' };
+const SCREEN_MODES = { PREVIEW: 'Camera preview', OFF: 'Off (phone\'s screen timeout)', DIM: 'Dimmed', BLACK: 'Black' };
 
 async function fetchKioskStatus() {
-    const r = await apiCall('/api/kiosk/status');
+    const [r, config] = await Promise.all([apiCall('/api/kiosk/status'), apiCall('/api/kiosk/config')]);
     const available = !!r && !r.error;
     elements.kioskUnavailable.hidden = available;
     elements.kioskBody.hidden = !available;
@@ -1277,38 +1544,159 @@ async function fetchKioskStatus() {
     }
 
     kioskEnabled = !!r.kioskEnabled;
+    kioskDeviceOwner = !!r.isDeviceOwner;
     elements.kioskEnabled.textContent = kioskEnabled ? 'On' : 'Off';
     elements.kioskPinned.textContent = r.isLockTaskActive ? 'Yes' : 'No';
     elements.kioskOwner.textContent = r.isDeviceOwner ? 'Yes' : 'No';
     elements.kioskScreen.textContent = SCREEN_MODES[r.screenMode] || r.screenMode || '--';
+    if (config && !config.error) {
+        kioskConfig = config;
+        showKioskConfig(config);
+    }
 
-    let hint = '';
-    if (!r.isDeviceOwner) {
-        hint = 'LensDaemon can only lock the phone to its screen as device owner: ' +
-            'adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver (see the setup wizard).';
-    } else if (kioskEnabled && !r.isLockTaskActive) {
-        hint = 'Kiosk mode is on: LensDaemon pins itself as soon as its screen is open on the phone.';
-    } else if (kioskEnabled) {
-        hint = 'To leave kiosk mode at the phone, hold Volume Up + Volume Down for 5 seconds.';
-    }
-    if (kioskEnabled && r.autoStartEnabled) {
-        hint += (hint ? ' ' : '') + 'LensDaemon starts by itself after a reboot.';
-    }
-    elements.kioskHint.textContent = hint;
+    elements.kioskHint.textContent = kioskHint(r, kioskConfig);
     elements.btnKioskToggle.textContent = kioskEnabled ? 'Turn Off' : 'Turn On';
     elements.btnKioskToggle.className = `btn ${kioskEnabled ? 'btn-danger' : 'btn-primary'}`;
     elements.btnKioskToggle.disabled = false;
 }
 
+/**
+ * What to know at the phone: how to leave kiosk mode (from the exit settings),
+ * and whether LensDaemon comes back by itself after a reboot, which takes
+ * Device Owner (Android won't open its screen, or on Android 11+ its camera,
+ * from the background otherwise) and comes after the phone's first unlock.
+ */
+function kioskHint(status, config) {
+    const parts = [];
+    if (!status.isDeviceOwner) {
+        parts.push('LensDaemon can only lock the phone to its screen as device owner: ' +
+            'adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver (see the setup wizard).');
+    } else if (kioskEnabled) {
+        if (!status.isLockTaskActive) {
+            parts.push('Kiosk mode is on: LensDaemon pins itself as soon as its screen is open on the phone.');
+        }
+        parts.push(exitHint(config));
+    }
+    if (kioskEnabled && status.autoStartEnabled) {
+        parts.push(status.isDeviceOwner
+            ? 'LensDaemon starts by itself after a reboot (on a phone with a screen lock, only once it is unlocked).'
+            : 'Starting by itself after a reboot needs Device Owner (and a phone without a screen lock).');
+    }
+    return parts.join(' ');
+}
+
+function exitHint(config) {
+    const security = config && config.security;
+    // Without the settings (older phones), the default gesture
+    if (!security) return 'To leave kiosk mode at the phone, hold Volume Up + Volume Down for 5 s.';
+    if (security.allowedExitGesture === false) return 'The exit gesture is off: turn kiosk mode off from this dashboard.';
+    const seconds = +((security.exitGestureTimeoutMs ?? 5000) / 1000).toFixed(1);
+    return `To leave kiosk mode at the phone, hold Volume Up + Volume Down for ${seconds} s` +
+        `${security.exitPinSet ? ', then enter the exit PIN' : ''}.`;
+}
+
+/** The kiosk settings form, from GET /api/kiosk/config; fields being edited are left alone. */
+function showKioskConfig(config) {
+    const security = config.security || {};
+    const pinSet = !!security.exitPinSet;
+    elements.kioskPinState.textContent = pinSet ? 'Exit PIN: set' : 'Exit PIN: not set';
+    elements.kioskPinState.classList.toggle('configured', pinSet);
+    elements.kioskExitPin.placeholder = pinSet ? 'Set: type a new one to change it' : 'Not set';
+    elements.btnKioskPinRemove.disabled = !pinSet;
+    if (kioskFormEdited) return;
+
+    const autoStart = config.autoStart || {};
+    elements.kioskStartRtsp.checked = !!autoStart.startRtsp;
+    elements.kioskStartRecording.checked = !!autoStart.startRecording;
+    elements.kioskDelay.value = autoStart.delaySeconds ?? 5;
+    const mode = (config.screen && config.screen.mode) || 'PREVIEW';
+    setSelectValue(elements.kioskScreenMode, mode, SCREEN_MODES[mode] || mode);
+    elements.kioskExitGesture.checked = security.allowedExitGesture !== false;
+    elements.kioskGestureSeconds.value = +((security.exitGestureTimeoutMs ?? 5000) / 1000).toFixed(1);
+    elements.kioskGestureSeconds.disabled = !elements.kioskExitGesture.checked;
+}
+
+/**
+ * Save the kiosk settings (PUT /api/kiosk/config), with the exit PIN when one
+ * is typed. The phone checks them (PIN of 4-12 digits, known screen mode, no
+ * negative time) and refuses the whole change with its reason otherwise.
+ */
+async function saveKioskSettings() {
+    const delay = Number(elements.kioskDelay.value);
+    if (elements.kioskDelay.value === '' || !Number.isInteger(delay) || delay < 0 || delay > MAX_BOOT_DELAY_S) {
+        showResult(elements.kioskResult, false, `The start delay must be a whole number of seconds from 0 to ${MAX_BOOT_DELAY_S}`);
+        return;
+    }
+    const body = {
+        autoStart: {
+            startRtsp: elements.kioskStartRtsp.checked,
+            startRecording: elements.kioskStartRecording.checked,
+            delaySeconds: delay
+        },
+        screen: { mode: elements.kioskScreenMode.value },
+        security: { allowedExitGesture: elements.kioskExitGesture.checked }
+    };
+    if (elements.kioskExitGesture.checked) {
+        const hold = Number(elements.kioskGestureSeconds.value);
+        if (elements.kioskGestureSeconds.value === '' || !(hold >= 1 && hold <= MAX_GESTURE_HOLD_S)) {
+            showResult(elements.kioskResult, false, `Hold the exit gesture for 1 to ${MAX_GESTURE_HOLD_S} seconds`);
+            return;
+        }
+        body.security.exitGestureTimeoutMs = Math.round(hold * 1000);
+    }
+    const pin = elements.kioskExitPin.value.trim();
+    if (pin) body.security.exitPin = pin;
+
+    showResult(elements.kioskResult, null, 'Saving…');
+    const result = await apiCall('/api/kiosk/config', 'PUT', body);
+    if (succeeded(result)) {
+        kioskFormEdited = false;
+        elements.kioskExitPin.value = '';
+        showResult(elements.kioskResult, true, pin ? 'Saved, with the new exit PIN' : 'Saved');
+    } else {
+        showResult(elements.kioskResult, false, 'Not saved: ' + errorText(result));
+    }
+    fetchKioskStatus();
+}
+
+async function setExitPin() {
+    const pin = elements.kioskExitPin.value.trim();
+    if (!pin) {
+        showResult(elements.kioskResult, false, 'Type the new exit PIN first');
+        elements.kioskExitPin.focus();
+        return;
+    }
+    const result = await apiCall('/api/kiosk/config', 'PUT', { security: { exitPin: pin } });
+    if (succeeded(result)) {
+        elements.kioskExitPin.value = '';
+        showResult(elements.kioskResult, true, 'Exit PIN set: the phone asks for it after the exit gesture');
+    } else {
+        showResult(elements.kioskResult, false, 'Exit PIN not set: ' + errorText(result));
+    }
+    fetchKioskStatus();
+}
+
+async function removeExitPin() {
+    if (!confirm('Remove the exit PIN? Anyone at the phone can then leave kiosk mode with the exit gesture.')) return;
+    const result = await apiCall('/api/kiosk/config', 'PUT', { security: { exitPin: '' } });
+    showResult(elements.kioskResult, succeeded(result),
+        succeeded(result) ? 'Exit PIN removed' : 'Exit PIN not removed: ' + errorText(result));
+    fetchKioskStatus();
+}
+
 async function toggleKiosk() {
     const enable = !kioskEnabled;
-    const question = enable
-        ? 'Turn on kiosk mode? LensDaemon will start on boot and, as device owner, lock the phone to its screen.'
-        : 'Turn off kiosk mode? LensDaemon will unpin itself and no longer start on boot.';
+    let question = 'Turn off kiosk mode? LensDaemon will unpin itself and no longer start on boot.';
+    if (enable) {
+        question = kioskDeviceOwner
+            ? 'Turn on kiosk mode? LensDaemon locks the phone to its screen and starts by itself after a reboot.'
+            : 'Turn on kiosk mode? Without Device Owner, LensDaemon can\'t lock the screen, and Android won\'t open it ' +
+                'or (Android 11+) its camera by itself after a reboot.';
+    }
     if (!confirm(question)) return;
     const result = await apiCall(enable ? '/api/kiosk/enable' : '/api/kiosk/disable', 'POST');
     if (succeeded(result)) {
-        notify(result.message || (enable ? 'Kiosk mode on' : 'Kiosk mode off'), 'success');
+        notify(result.message || (enable ? 'Kiosk mode on' : 'Kiosk mode off'), enable && result.lockTask === false ? 'info' : 'success');
     } else {
         notify('Kiosk mode not changed: ' + errorText(result), 'error');
     }
@@ -1354,6 +1742,10 @@ function formatFileSize(bytes) {
 
 function formatGb(gb) {
     return typeof gb === 'number' ? `${gb.toFixed(1)} GB` : '--';
+}
+
+function formatDegrees(celsius) {
+    return typeof celsius === 'number' ? `${+celsius.toFixed(1)}°C` : '--';
 }
 
 function formatDate(timestamp) {
@@ -1496,18 +1888,36 @@ async function loadScript() {
 
     const result = await apiCall('/api/director/script', 'POST', { script });
     if (succeeded(result)) {
+        const problems = result.errors || [];
         notify(`Script loaded: ${result.scenes} scene${result.scenes === 1 ? '' : 's'}, ${result.totalCues} cues` +
-            (result.estimatedDuration ? `, about ${result.estimatedDuration}` : ''), 'success');
-        (result.errors || []).forEach(problem => notify(`Script: ${problem}`, 'error'));
+            (result.estimatedDuration ? `, about ${result.estimatedDuration}` : '') +
+            (problems.length ? ` (${problems.length} problem${problems.length === 1 ? '' : 's'} listed under the script)` : ''),
+        'success');
+        showScriptProblems(problems);
     } else {
+        // The director keeps the script it had: say why this one wasn't taken
         notify('Failed to load script: ' + errorText(result), 'error');
+        showScriptProblems([`Not loaded: ${errorText(result)}`]);
     }
     fetchStatus();
+}
+
+/** The problems the phone found in the script (lines that aren't cues, empty scenes, shots it can't do). */
+function showScriptProblems(problems) {
+    const list = elements.scriptProblems;
+    list.innerHTML = '';
+    (problems || []).forEach(problem => {
+        const item = document.createElement('li');
+        item.textContent = problem;
+        list.appendChild(item);
+    });
+    list.hidden = list.childElementCount === 0;
 }
 
 // Clear script
 async function clearScript() {
     elements.scriptTextarea.value = '';
+    showScriptProblems([]);
     loadedScriptFileName = null;
     elements.scriptFilesList.querySelectorAll('.script-file-item').forEach(item => item.classList.remove('active'));
     const result = await apiCall('/api/director/script/clear', 'POST');
@@ -1774,7 +2184,9 @@ function renderScriptFiles(scripts) {
     });
 }
 
-// Open a saved script: it goes into the editor and is loaded into the director
+// Open a saved script: it goes into the editor and is loaded into the director.
+// The director refuses it while a script runs or is paused: the file still opens,
+// with "loaded": false and the reason in "loadError".
 async function loadScriptFromFile(fileName) {
     const result = await apiCall(`/api/director/scripts/${encodeURIComponent(fileName)}`);
     if (succeeded(result)) {
@@ -1784,9 +2196,16 @@ async function loadScriptFromFile(fileName) {
         elements.scriptFilesList.querySelectorAll('.script-file-item').forEach(item => {
             item.classList.toggle('active', item.dataset.filename === fileName);
         });
-        notify(result.loaded
-            ? `Loaded ${fileName}: ${result.scenes} scenes, ${result.totalCues} cues`
-            : `Opened ${fileName}`, 'success');
+        if (result.loaded) {
+            notify(`Loaded ${fileName}: ${result.scenes} scenes, ${result.totalCues} cues`, 'success');
+            showScriptProblems(result.errors);
+        } else if (result.loadError) {
+            notify(`Opened ${fileName} (not loaded: ${result.loadError})`, 'info');
+            showScriptProblems([`Not loaded: ${result.loadError}`]);
+        } else {
+            notify(`Opened ${fileName}`, 'success');
+            showScriptProblems([]);
+        }
         fetchStatus();
     } else {
         notify('Failed to open the script: ' + errorText(result), 'error');

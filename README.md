@@ -26,7 +26,7 @@ LensDaemon strips away everything that makes a phone a phone and leaves you with
 
 - **No notifications.** No background sync. No distractions.
 - **Thermal-aware encoding** that throttles bitrate before the CPU throttles itself.
-- **Battery bypass** that holds charge at 50% to prevent swelling during 24/7 operation.
+- **Battery care** for 24/7 operation: holds the charge at 50% on phones whose charging switch the app can write; elsewhere it tells you when to unplug the charger.
 - **Network-controlled** via web browser. No app on your main device needed.
 
 One APK. Plug in power. Point at thing. Stream forever.
@@ -39,9 +39,9 @@ One APK. Plug in power. Point at thing. Stream forever.
 |---------|-------------|
 | **Dual Protocol Streaming** | RTSP for universal compatibility, MPEG-TS over UDP for low-latency ingest |
 | **Multi-Lens Control** | Switch wide/main/tele from any browser on your network |
-| **Network Storage** | Record to SMB/NFS shares or S3-compatible buckets |
+| **Network Storage** | Upload recordings to SMB shares or S3-compatible buckets, from the dashboard |
 | **Thermal Dashboard** | Real-time CPU/battery temps, throttle state, encoding stats |
-| **Kiosk Mode** | Locks device to LensDaemon — survives reboots, no escape without override |
+| **Kiosk Mode** | Locks the phone to LensDaemon (Device Owner) — comes back after reboots and crashes, exit gesture with optional PIN |
 | **Web Control Panel** | Dashboard, live preview, full API at `http://{device-ip}:8080` |
 | **Zero Cloud Dependency** | Your footage stays on your network unless you decide otherwise |
 | **AI Director Mode** | Script-driven camera control — lens, zoom, focus respond to your scene cues |
@@ -50,42 +50,39 @@ One APK. Plug in power. Point at thing. Stream forever.
 
 ## AI Director Mode (Experimental)
 
-**Let an LLM be your camera operator.**
+**Script your shots; the phone runs them.**
 
-Feed LensDaemon a script or scene description, and the AI Director interprets your cues to control the camera in real-time:
+Write a script with scene cues, load it from the dashboard, and the AI Director runs it on the phone, cue by cue:
 
 ```
-[SCENE 1 - WIDE SHOT]
-Two people enter the frame from the left.
-
+[SCENE: Arrival]
+[SHOT: WIDE]
+[HOLD: 3]
 [CUT TO: CLOSE-UP]
-Focus on speaker's face. Shallow depth of field.
-
-[PULL BACK - MEDIUM]
-Both subjects in frame. Auto-exposure for backlight.
+[FOCUS: FACE]
+[HOLD: 2]
+[TRANSITION: PULL BACK] - 2s
 ```
 
 **What it does:**
-- Parses scene/script markers to trigger camera actions
-- Switches lenses (wide → main → telephoto) based on shot descriptions
-- Adjusts zoom smoothly on cue ("PUSH IN", "PULL BACK")
-- Sets focus mode and depth based on scene context
-- Marks take boundaries automatically for post-production
-- Suggests "best takes" based on technical quality (focus lock, exposure, stability)
+- Parses scene and shot cues, and reports the lines it could not use
+- Switches lenses (wide → main → telephoto) and zooms for each shot type
+- Zooms smoothly on cue ("PUSH IN", "PULL BACK")
+- Sets the focus target and exposure presets
+- Marks take boundaries automatically, one take per scene, for post-production
+- Scores each take and suggests the best take of each scene
 
 **Thermal-Safe Design:**
-- **Completely inert when disabled** — No background processing, no API calls, zero thermal impact
-- AI processing runs on-demand only, not continuously
-- Scene cues are parsed locally or via configurable LLM endpoint
-- System automatically disables if thermal thresholds are exceeded
+- **Completely inert when disabled** — No background processing, zero thermal impact
+- Cues are parsed on the phone when the script loads; no cloud service or language model is involved
+- The director stops at its temperature threshold (55°C by default) and waits for the phone to cool before it runs again
 
 **Use Cases:**
 - Solo content creators directing their own shots
-- Multi-camera setups with synchronized scene changes
-- Documentary/interview setups with intelligent reframing
+- Interview setups with scripted shot changes
 - Live streaming with automated shot variety
 
-See [AI Director Specification](spec.md#ai-director-mode) for implementation details.
+See the [API reference](docs/API.md#ai-director) for the cue format and the director's controls.
 
 ---
 
@@ -101,7 +98,10 @@ adb install lensdaemon.apk
 adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 ```
 This makes LensDaemon the device owner, which lets it lock the phone to its own
-screen. Kiosk mode itself is switched on later, from the setup wizard or the dashboard.
+screen and start by itself after a reboot. Kiosk mode itself is switched on later,
+from the setup wizard or the dashboard. Android starts apps only after the phone's
+first unlock, so for unattended restarts (after a power cut) use a phone without a
+PIN, pattern or password lock.
 
 ### 3. Launch and Configure
 Open LensDaemon on the device. The phone shows the dashboard's address under its
@@ -114,12 +114,16 @@ upload, delete), network storage, kiosk mode and the AI Director.
 
 For an unattended setup, `http://{device-ip}:8080/setup` walks through Device
 Owner, a kiosk preset, network storage, a test stream and turning kiosk mode on.
-In kiosk mode, hold **Volume Up + Volume Down** for 5 seconds on the phone to leave it.
+In kiosk mode, hold **Volume Up + Volume Down** for 5 seconds on the phone to leave it
+(then enter the exit PIN, if one is set).
 
 ### 4. Start the Stream
 Tap **Start Stream** on the phone, or **Start RTSP** in the web dashboard. The
 phone's overlay shows the RTSP URL, the resolution and frame rate, and how many
-viewers are watching.
+viewers are watching. The phone's button (and kiosk auto-start) uses the phone's
+saved stream settings: 1080p30 H.264 at 4 Mbps until others are saved. Each start
+from the dashboard saves its settings, and the dashboard's encoder settings have
+**Save as phone default**.
 
 ```
 RTSP:        rtsp://{device-ip}:8554/stream
@@ -206,15 +210,19 @@ Full REST API for integration and automation.
 # Get status
 curl http://192.168.1.50:8080/api/status
 
-# Start streaming
-curl -X POST http://192.168.1.50:8080/api/stream/start
+# Start the RTSP stream, then play rtsp://192.168.1.50:8554/stream
+curl -X POST http://192.168.1.50:8080/api/rtsp/start
 
 # Switch to telephoto lens
 curl -X POST http://192.168.1.50:8080/api/lens/tele
 
 # Take a snapshot
-curl -X POST http://192.168.1.50:8080/api/snapshot
+curl -X POST http://192.168.1.50:8080/api/snapshot -o snapshot.jpg
 ```
+
+`POST /api/stream/start` starts only the encoder; RTSP, MPEG-TS and recording
+have their own start endpoints. The API, the preview and the streams have no
+authentication by default, so keep the phone on a network you trust.
 
 See [API.md](docs/API.md) for full reference.
 
@@ -226,10 +234,11 @@ See [API.md](docs/API.md) for full reference.
 - [x] Web control panel
 - [x] Lens switching
 - [x] Local recording with segmentation
-- [x] SMB/NFS network storage
+- [x] SMB network storage (uploads started from the dashboard)
 - [x] S3-compatible upload (AWS, B2, MinIO, R2)
 - [x] Thermal governors with adaptive throttling
-- [x] Battery bypass charging
+- [x] Battery charge limiting (on phones whose charging switch the app can write)
+- [ ] Automatic upload of finished recordings
 - [x] Kiosk mode with Device Owner APIs
 - [ ] SRT protocol
 - [ ] On-device motion detection

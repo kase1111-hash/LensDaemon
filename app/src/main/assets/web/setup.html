@@ -435,7 +435,7 @@
             </div>
 
             <div id="device-owner-help" style="display:none; margin-top: 16px;">
-                <p style="color: var(--warning-color);">Device Owner is not set. Run this ADB command on a factory-reset device (or one with no accounts):</p>
+                <p style="color: var(--warning-color);">Device Owner is not set. Without it, kiosk mode can't lock the screen, and Android won't open LensDaemon or (Android 11+) its camera by itself after a reboot. Run this ADB command on a factory-reset device (or one with no accounts):</p>
                 <div class="code-block">adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver</div>
                 <p>After running the command, tap "Re-check" below.</p>
                 <button class="btn btn-primary" onclick="runChecks()">Re-check</button>
@@ -459,12 +459,11 @@
                         24/7 unattended operation
                     </p>
                     <ul>
-                        <li>Screen OFF (saves power)</li>
-                        <li>Auto-start streaming on boot</li>
-                        <li>Auto-start RTSP server</li>
+                        <li>Screen off (the phone's own screen timeout)</li>
+                        <li>Starts the RTSP stream on boot</li>
                         <li>Lock all system UI</li>
-                        <li>Auto-restart on crash</li>
-                        <li>Network auto-reconnect</li>
+                        <li>Restarts its outputs after a crash</li>
+                        <li>Failed uploads resume when the network returns</li>
                     </ul>
                 </div>
                 <div class="preset-card" id="preset-interactive" onclick="selectPreset('interactive')">
@@ -475,10 +474,9 @@
                     <ul>
                         <li>Screen shows camera preview</li>
                         <li>Keep screen always on</li>
-                        <li>Navigation bar accessible</li>
                         <li>Vol+Vol gesture to exit</li>
                         <li>Dashboard accessible via web</li>
-                        <li>Manual stream control</li>
+                        <li>Starts the RTSP stream on boot; Start/Stop on the phone's screen</li>
                     </ul>
                 </div>
             </div>
@@ -492,7 +490,7 @@
         <!-- Step 3: Storage (Optional) -->
         <div class="step-content" id="step-3">
             <h2>Step 3: Network Storage (Optional)</h2>
-            <p>Configure where recordings are uploaded. You can skip this step and set it up later from the dashboard.</p>
+            <p>Choose where you can upload recordings. Uploads are started from the dashboard's Recordings list (automatic upload is not available yet). You can skip this step and set it up later from the dashboard.</p>
 
             <div class="form-group">
                 <label for="storage-type">Storage Backend</label>
@@ -634,12 +632,20 @@
                 <div><strong>Thermal Profile:</strong> <span id="summary-thermal">Default</span></div>
             </div>
 
+            <div class="form-group">
+                <label for="exit-pin">Exit PIN (4-12 digits, optional)</label>
+                <input type="password" id="exit-pin" inputmode="numeric" pattern="\d{4,12}" maxlength="12" autocomplete="new-password" placeholder="Leave empty to keep the current one">
+                <div class="form-hint">Asked for at the phone after the exit gesture. Without one, anyone at the phone can leave kiosk mode with Vol Up + Vol Down.</div>
+            </div>
+
             <div id="activation-result" class="result-banner"></div>
 
             <div style="margin: 16px 0; padding: 12px; background: rgba(255,152,0,0.1); border: 1px solid var(--warning-color); border-radius: 6px;">
                 <strong style="color: var(--warning-color);">Warning:</strong>
-                Once kiosk mode is activated, the device will be locked to LensDaemon and start it after every reboot.
-                You can turn it off in the dashboard's Kiosk Mode panel, or at the phone by holding Vol Up + Vol Down for 5 seconds.
+                Once kiosk mode is activated on a Device Owner phone, the phone is locked to LensDaemon and starts it after every reboot.
+                Android starts it only after the phone's first unlock, so unattended restarts need a phone without a PIN, pattern or password lock.
+                Without Device Owner, kiosk mode can't lock the screen, and Android won't open LensDaemon or (Android 11+) its camera by itself after a reboot.
+                You can turn kiosk mode off in the dashboard's Kiosk Mode panel, or at the phone by holding Vol Up + Vol Down for 5 seconds (then the exit PIN, if set).
             </div>
 
             <div class="nav-buttons">

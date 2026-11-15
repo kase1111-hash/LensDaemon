@@ -82,6 +82,14 @@ class KioskManager(
     private val _config = MutableStateFlow(KioskConfig.DEFAULT)
     val config: StateFlow<KioskConfig> = _config.asStateFlow()
 
+    /**
+     * Held while the on/off setting is saved together with the kiosk
+     * restrictions that follow it, so they always match the last saved
+     * setting: the web API's threads ([updateConfig]) and the activity's main
+     * thread ([enableKiosk], [disableKiosk]) both change it.
+     */
+    private val enabledLock = Any()
+
     // Tracking (read from the web API's threads)
     @Volatile private var startTime: Long = 0
     @Volatile private var restartCount: Int = 0
@@ -130,8 +138,8 @@ class KioskManager(
      * setting is saved, and also decides whether LensDaemon starts on boot; the
      * activity on screen applies it, pinning or unpinning itself. Turning it on
      * brings LensDaemon to the front when it is the device owner, which can
-     * start activities from the background; turning it off lifts the kiosk
-     * restrictions at once.
+     * start activities from the background. The kiosk restrictions follow at
+     * once, pinned or not (see [updateConfig]).
      */
     fun requestKioskMode(enabled: Boolean) {
         updateConfig(_config.value.copy(enabled = enabled))
@@ -175,14 +183,9 @@ class KioskManager(
             startTime = System.currentTimeMillis()
             _kioskState.value = KioskState.ENABLED
 
-            // Save enabled state
-            val newConfig = _config.value.copy(enabled = true)
-            _config.value = newConfig
-            configStore.saveConfig(newConfig)
-
-            // No safe boot (which would start the phone without LensDaemon),
-            // factory reset or USB file transfer while kiosk mode is on
-            setKioskRestrictions()
+            // Save enabled state, with no safe boot (which would start the phone
+            // without LensDaemon), factory reset or USB file transfer
+            saveEnabled(true)
 
             updateStatus()
             logEvent(KioskEventType.KIOSK_ENABLED, "Kiosk mode enabled")
@@ -209,15 +212,11 @@ class KioskManager(
             // Restore system UI
             restoreSystemUI(activity)
 
-            clearKioskRestrictions()
-
             // Update state
             _kioskState.value = KioskState.DISABLED
 
-            // Save disabled state
-            val newConfig = _config.value.copy(enabled = false)
-            _config.value = newConfig
-            configStore.saveConfig(newConfig)
+            // Save disabled state, lifting the kiosk restrictions
+            saveEnabled(false)
 
             updateStatus()
             logEvent(KioskEventType.KIOSK_DISABLED, "Kiosk mode disabled")
@@ -382,19 +381,37 @@ class KioskManager(
     }
 
     /**
-     * Update configuration. Turning kiosk mode off here (the web API, or
-     * [requestKioskMode]) also lifts the kiosk restrictions, even when the
-     * phone is not pinned at the moment.
+     * Update configuration. The kiosk restrictions follow the on/off setting
+     * here too (the web API, or [requestKioskMode]), whether or not the phone
+     * is pinned at the moment: turning kiosk mode on sets them, as device
+     * owner, and turning it off lifts them. So a phone that stays pinned while
+     * kiosk mode is turned off and on again (its screen off, so the activity
+     * neither unpins nor pins it) has them again.
      */
     fun updateConfig(newConfig: KioskConfig) {
-        val wasEnabled = _config.value.enabled
-        _config.value = newConfig
-        configStore.saveConfig(newConfig)
-        if (wasEnabled && !newConfig.enabled) {
-            clearKioskRestrictions()
+        synchronized(enabledLock) {
+            val wasEnabled = _config.value.enabled
+            _config.value = newConfig
+            configStore.saveConfig(newConfig)
+            if (newConfig.enabled != wasEnabled) {
+                if (newConfig.enabled) setKioskRestrictions() else clearKioskRestrictions()
+            }
         }
         updateState()
         Timber.tag(TAG).d("Configuration updated")
+    }
+
+    /**
+     * Save kiosk mode on or off ([enableKiosk], [disableKiosk]) and set or
+     * lift the kiosk restrictions to match, in one step with [updateConfig].
+     */
+    private fun saveEnabled(enabled: Boolean) {
+        synchronized(enabledLock) {
+            val newConfig = _config.value.copy(enabled = enabled)
+            _config.value = newConfig
+            configStore.saveConfig(newConfig)
+            if (enabled) setKioskRestrictions() else clearKioskRestrictions()
+        }
     }
 
     /**
@@ -566,7 +583,8 @@ class KioskManager(
     /**
      * Set the user restrictions for kiosk mode, as device owner: no factory
      * reset, no safe boot (it would start the phone without LensDaemon, out of
-     * kiosk mode) and no USB file transfer. [enableKiosk] applies them.
+     * kiosk mode) and no USB file transfer. Applied when kiosk mode is turned
+     * on ([updateConfig]) and whenever the phone is pinned ([enableKiosk]).
      */
     fun setKioskRestrictions() {
         if (!isDeviceOwner()) return

@@ -26,7 +26,9 @@ import timber.log.Timber
  *   pins itself again as device owner, and the outputs autoStart asks for, RTSP
  *   and recording, each on its own, with the saved stream defaults (see
  *   [CameraService.autoStartIntent]). startStreaming alone starts nothing: an
- *   encoder with no output serves nobody.
+ *   encoder with no output serves nobody. The settings are read again then,
+ *   since the dashboard runs during the wait: kiosk mode or its auto-start
+ *   turned off by then starts nothing more.
  *
  * What Android allows at boot:
  * - BOOT_COMPLETED arrives only after the first unlock, so restarting
@@ -83,16 +85,25 @@ class BootReceiver : BroadcastReceiver() {
         val delaySeconds = config.autoStart.delaySeconds.coerceIn(0, MAX_DELAY_S)
         Timber.tag(TAG).i("Auto-start enabled, opening LensDaemon in $delaySeconds s")
         val appContext = context.applicationContext
-        val autoStart = config.autoStart
-        handler.postDelayed({ startupSequence(appContext, autoStart) }, delaySeconds * MS_PER_SECOND)
+        handler.postDelayed({ startupSequence(appContext) }, delaySeconds * MS_PER_SECOND)
     }
 
     /**
-     * After the delay: the app's screen, then the camera outputs [autoStart]
-     * asks for. Android 11+ without Device Owner gives a service started at
-     * boot no camera, so the camera is skipped there.
+     * After the delay: the app's screen, then the camera outputs autoStart
+     * asks for. The settings are read again here, not taken from the boot:
+     * the dashboard and the API run during the wait, so kiosk mode or its
+     * auto-start turned off by then starts nothing, and RTSP and recording
+     * follow what is saved now. Android 11+ without Device Owner gives a
+     * service started at boot no camera, so the camera is skipped there.
      */
-    private fun startupSequence(context: Context, autoStart: AutoStartConfig) {
+    private fun startupSequence(context: Context) {
+        val kiosk = kioskManager(context)
+        val config = kiosk.getConfig()
+        if (!config.enabled || !config.autoStart.enabled) {
+            Timber.tag(TAG).i("Kiosk mode or its auto-start was turned off during the wait: not starting LensDaemon")
+            return
+        }
+        val autoStart = config.autoStart
         Timber.tag(TAG).i("Executing startup sequence")
         startMainActivity(context)
 
@@ -117,7 +128,7 @@ class BootReceiver : BroadcastReceiver() {
                 "RTSP".takeIf { autoStart.startRtsp },
                 "recording".takeIf { autoStart.startRecording }
             )
-            kioskManager(context).recordEvent(
+            kiosk.recordEvent(
                 KioskEventType.AUTO_START,
                 "Auto-start: ${outputs.joinToString(" and ")}",
                 mapOf("rtsp" to autoStart.startRtsp, "record" to autoStart.startRecording)

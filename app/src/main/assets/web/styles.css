@@ -371,6 +371,7 @@ a.btn {
 .checkbox-row input {
     width: 18px;
     height: 18px;
+    flex-shrink: 0;
     accent-color: var(--primary-color);
 }
 
@@ -474,6 +475,11 @@ input[type="range"]::-moz-range-thumb {
 .form-group input:focus {
     outline: none;
     border-color: var(--primary-color);
+}
+
+.form-group input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* Stats Grid */
@@ -1270,6 +1276,85 @@ input:checked + .toggle-slider:before {
 .result-line.success { color: var(--success-color); }
 .result-line.error { color: var(--danger-color); }
 
+.result-line:empty {
+    display: none;
+}
+
+/* ==================== Phone stream defaults ==================== */
+
+.defaults-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0 8px;
+}
+
+.defaults-row .detail-line {
+    margin-bottom: 0;
+    min-width: 0;
+}
+
+/* ==================== Charging advice ==================== */
+
+.detail-line.advice {
+    color: #ffc46b;
+}
+
+/* ==================== Failed uploads ==================== */
+
+.failed-list {
+    margin: 8px 0;
+    max-height: 200px;
+}
+
+.failed-reason {
+    color: #ff8a80;
+    overflow-wrap: anywhere;
+}
+
+/* ==================== Kiosk settings ==================== */
+
+.kiosk-settings {
+    margin-top: 14px;
+}
+
+.kiosk-settings .settings-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: end;
+    margin-bottom: 4px;
+}
+
+.pin-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 10px;
+    margin: 12px 0 6px;
+}
+
+.pin-row .button-group {
+    flex-wrap: nowrap;
+}
+
+/* ==================== Script problems ==================== */
+
+.script-problems {
+    margin: 8px 0 0;
+    padding: 8px 12px 8px 28px;
+    border-left: 3px solid var(--warning-color);
+    background-color: rgba(255, 152, 0, 0.08);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: #ffc46b;
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.script-problems li {
+    overflow-wrap: anywhere;
+}
+
 /* ==================== Director progress ==================== */
 
 .director-progress {
@@ -1364,5 +1449,14 @@ input:checked + .toggle-slider:before {
 
     .stream-target {
         grid-template-columns: minmax(0, 1fr);
+    }
+
+    .kiosk-settings .settings-form,
+    .pin-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .pin-row .button-group {
+        flex-wrap: wrap;
     }
 }

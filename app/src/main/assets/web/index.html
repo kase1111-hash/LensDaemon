@@ -179,6 +179,12 @@
                         </div>
                     </div>
                     <p id="encoder-note" class="stream-hint" hidden></p>
+                    <div class="defaults-row">
+                        <button id="btn-save-defaults" class="btn btn-secondary btn-sm">Save as phone default</button>
+                        <span id="defaults-summary" class="detail-line muted"></span>
+                    </div>
+                    <div id="defaults-result" class="result-line"></div>
+                    <p class="stream-hint">The phone's Start Stream button, kiosk boot and restarts use the saved defaults; each start also saves its settings. The default includes the recording's "New file every".</p>
                 </section>
 
                 <!-- Stats Section -->
@@ -222,6 +228,7 @@
                             <span id="battery-level" class="level-chip">--</span>
                         </div>
                         <div id="battery-detail" class="detail-line"></div>
+                        <div id="charge-advice" class="detail-line advice"></div>
                         <div id="throttle-detail" class="detail-line"></div>
                         <div id="thermal-profile" class="detail-line muted"></div>
                     </div>
@@ -253,6 +260,47 @@
                             <button id="btn-kiosk-toggle" class="btn btn-primary" disabled>Turn On</button>
                             <a href="/setup" class="btn btn-secondary">Setup wizard</a>
                         </div>
+
+                        <details class="config-block kiosk-settings" id="kiosk-settings">
+                            <summary>Kiosk settings <span id="kiosk-pin-state" class="summary-state">--</span></summary>
+                            <div class="pin-row">
+                                <div class="form-group">
+                                    <label for="kiosk-exit-pin">Exit PIN (4-12 digits)</label>
+                                    <input type="password" id="kiosk-exit-pin" inputmode="numeric" pattern="\d{4,12}" maxlength="12" autocomplete="new-password">
+                                </div>
+                                <div class="button-group tight">
+                                    <button id="btn-kiosk-pin-set" class="btn btn-primary btn-sm">Set PIN</button>
+                                    <button id="btn-kiosk-pin-remove" class="btn btn-danger btn-sm" disabled>Remove PIN</button>
+                                </div>
+                            </div>
+                            <p class="stream-hint">Asked for at the phone after the exit gesture. Without one, anyone at the phone can leave kiosk mode with the gesture.</p>
+                            <div class="settings-form">
+                                <label class="checkbox-row"><input type="checkbox" id="kiosk-start-rtsp"> Start RTSP on boot</label>
+                                <label class="checkbox-row"><input type="checkbox" id="kiosk-start-recording"> Record on boot</label>
+                                <div class="form-group">
+                                    <label for="kiosk-delay">Start delay after boot (s)</label>
+                                    <input type="number" id="kiosk-delay" min="0" max="120" step="1">
+                                </div>
+                                <div class="form-group">
+                                    <label for="kiosk-screen-mode">Screen while pinned</label>
+                                    <select id="kiosk-screen-mode">
+                                        <option value="PREVIEW">Preview</option>
+                                        <option value="DIM">Dim</option>
+                                        <option value="BLACK">Black</option>
+                                        <option value="OFF">Off (phone's screen timeout)</option>
+                                    </select>
+                                </div>
+                                <label class="checkbox-row"><input type="checkbox" id="kiosk-exit-gesture"> Exit gesture: hold Volume Up + Volume Down</label>
+                                <div class="form-group">
+                                    <label for="kiosk-gesture-seconds">Hold for (s)</label>
+                                    <input type="number" id="kiosk-gesture-seconds" min="1" max="30" step="1">
+                                </div>
+                            </div>
+                            <div class="button-group">
+                                <button id="btn-kiosk-save" class="btn btn-primary btn-sm">Save settings</button>
+                            </div>
+                            <div id="kiosk-result" class="result-line"></div>
+                        </details>
                     </div>
                 </section>
             </div>
@@ -263,13 +311,14 @@
                     <h3>Recordings</h3>
                     <div class="button-group tight">
                         <button id="btn-recordings-refresh" class="btn btn-small">Refresh</button>
-                        <button id="btn-storage-cleanup" class="btn btn-small" title="Delete recordings the retention policy no longer keeps">Clean up</button>
+                        <button id="btn-storage-cleanup" class="btn btn-small" title="Delete recordings older than 7 days, beyond 10 GB in total, or needed to keep 1 GB free">Clean up</button>
                     </div>
                 </div>
                 <div class="storage-line">
                     <div class="meter"><div id="storage-meter" class="meter-fill"></div></div>
                     <span id="storage-text" class="detail-line">--</span>
                 </div>
+                <p class="stream-hint">The phone keeps the last 7 days of recordings, up to 10 GB, with 1 GB left free: older recordings are deleted when a recording starts, every hour while recording, when space runs low, and with Clean up. The file being recorded is never deleted.</p>
                 <div id="recordings-list" class="item-list">
                     <div class="empty-note">No recordings</div>
                 </div>
@@ -280,6 +329,7 @@
                 <h3>Network Storage</h3>
                 <p id="upload-unavailable" class="muted" hidden>The upload service is not running.</p>
                 <div id="upload-body">
+                    <p class="stream-hint">Upload recordings from the Recordings list, once a bucket or share is set up below. Each upload is tried 3 times; failed uploads are tried again when the network comes back, or with Retry failed.</p>
                     <div class="status-row">
                         <span class="label">Uploads</span>
                         <span id="upload-state" class="value">--</span>
@@ -288,6 +338,7 @@
                         <span class="label">Queue</span>
                         <span id="upload-queue" class="value">--</span>
                     </div>
+                    <div id="upload-failed" class="item-list failed-list" hidden></div>
                     <div id="upload-current" class="detail-line"></div>
                     <div class="button-group wrap">
                         <button id="btn-upload-start" class="btn btn-small">Start uploads</button>
@@ -446,6 +497,7 @@ Hold for a moment.
 
 [CUT TO: WIDE]
 Return to wide shot."></textarea>
+                        <ul id="script-problems" class="script-problems" hidden></ul>
                         <div class="script-actions">
                             <button id="btn-load-script" class="btn btn-primary">Load Script</button>
                             <button id="btn-clear-script" class="btn btn-secondary">Clear</button>
