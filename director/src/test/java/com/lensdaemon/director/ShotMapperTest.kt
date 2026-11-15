@@ -1046,6 +1046,58 @@ class ShotMapperTest {
     }
 
     // ========================================================================
+    // followCamera() and forgetExposure()
+    // ========================================================================
+
+    @Test
+    fun `followCamera takes the camera's lens and zoom and keeps focus and exposure`() {
+        mapper.mapCue(shotCue(ShotType.CLOSE_UP))
+        mapper.mapCue(exposureCue(ExposurePreset.DARK))
+
+        mapper.followCamera(ShotMapper.Framing("wide", 3f))
+
+        val cmd = mapper.getCurrentCommand()!!
+        assertEquals("wide", cmd.lens)
+        assertEquals(3f, cmd.zoomLevel, 0.001f)
+        assertEquals(FocusTarget.FACE, cmd.focusMode)
+        assertEquals(ExposurePreset.DARK, cmd.exposurePreset)
+    }
+
+    @Test
+    fun `cues that keep the framing start from the camera's after followCamera`() {
+        mapper.followCamera(ShotMapper.Framing("wide", 3f))
+
+        val pushIn = mapper.mapCue(transitionCue(TransitionType.PUSH_IN)).command!!
+        assertEquals("wide", pushIn.lens)
+        assertEquals(4.5f, pushIn.zoomLevel, 0.001f)
+
+        mapper.followCamera(ShotMapper.Framing("tele", 2f))
+        val focus = mapper.mapCue(focusCue(FocusTarget.HANDS)).command!!
+        assertEquals("tele", focus.lens)
+        assertEquals(2f, focus.zoomLevel, 0.001f)
+        assertEquals(FocusTarget.HANDS, focus.focusMode)
+    }
+
+    @Test
+    fun `forgetExposure keeps the framing and focus`() {
+        mapper.mapCue(shotCue(ShotType.CLOSE_UP))
+        mapper.mapCue(exposureCue(ExposurePreset.BACKLIT))
+        val before = mapper.getCurrentCommand()!!
+
+        mapper.forgetExposure()
+
+        assertEquals(before.copy(exposurePreset = ExposurePreset.AUTO), mapper.getCurrentCommand())
+        assertEquals(ExposurePreset.AUTO, mapper.mapCue(shotCue(ShotType.WIDE)).command!!.exposurePreset)
+    }
+
+    @Test
+    fun `forgetExposure before any cue leaves no command`() {
+        mapper.forgetExposure()
+
+        assertNull(mapper.getCurrentCommand())
+    }
+
+    // ========================================================================
     // 11. mapScene() maps all cues in sequence
     // ========================================================================
 

@@ -31,7 +31,8 @@ class DirectorManagerTest {
 
     /**
      * A camera that records what it is asked to do, at a temperature the test sets. Like the
-     * phone, it opens another lens at 0 EV (AUTO), here at once.
+     * phone, it opens another lens at 0 EV (AUTO), here at once. It reports the framing the
+     * test sets, and none by default.
      */
     private class FakeCamera : DirectorManager.CameraController {
         val calls: MutableList<String> = Collections.synchronizedList(mutableListOf())
@@ -48,6 +49,9 @@ class DirectorManagerTest {
 
         @Volatile
         var exposure = ExposurePreset.AUTO
+
+        @Volatile
+        var framing: ShotMapper.Framing? = null
 
         override fun switchLens(lens: String) {
             calls.add("lens $lens")
@@ -72,6 +76,8 @@ class DirectorManagerTest {
         }
 
         override fun getCurrentTemperature(): Int = temperature
+
+        override fun getFraming(): ShotMapper.Framing? = framing
     }
 
     private lateinit var persistence: MemoryConfig
@@ -396,6 +402,99 @@ class DirectorManagerTest {
 
         assertTrue(camera.calls.contains("lens wide"))
         assertTrue(camera.exposures.isEmpty())
+    }
+
+    @Test
+    fun `an EXPOSURE AUTO cue in a new script undoes the last script's preset`() {
+        director.loadScript("[SCENE: Night]\n[EXPOSURE: DARK]\n[SHOT: MEDIUM]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the end of the first script") { director.state.value == DirectorState.READY && cuesRun().size == 2 }
+        assertEquals(ExposurePreset.DARK, camera.exposure)
+
+        // On the same lens, so only the cue can bring the exposure back
+        director.loadScript("[SCENE: Day]\n[EXPOSURE: AUTO]\n[SHOT: MEDIUM]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the end of the second script") { director.state.value == DirectorState.READY && cuesRun().size == 4 }
+
+        assertEquals("main", camera.lens)
+        assertEquals(ExposurePreset.AUTO, camera.exposure)
+        assertEquals(listOf(ExposurePreset.DARK, ExposurePreset.DARK, ExposurePreset.AUTO), camera.exposures.toList())
+    }
+
+    @Test
+    fun `an EXPOSURE AUTO cue run by hand undoes an exposure set elsewhere`() {
+        // Say the EV was lowered on the dashboard, with the camera on its main lens
+        camera.lens = "main"
+        camera.exposure = ExposurePreset.DARK
+
+        assertTrue(director.executeCueText("[EXPOSURE: AUTO]"))
+
+        assertEquals(listOf(ExposurePreset.AUTO), camera.exposures.toList())
+        assertEquals(ExposurePreset.AUTO, camera.exposure)
+    }
+
+    @Test
+    fun `a new script leaves the exposure alone until its own EXPOSURE cue`() {
+        director.loadScript("[SCENE: Night]\n[EXPOSURE: DARK]\n[SHOT: MEDIUM]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the end of the first script") { director.state.value == DirectorState.READY && cuesRun().size == 2 }
+        // Then the EV is raised on the dashboard
+        camera.exposure = ExposurePreset.BRIGHT
+        camera.exposures.clear()
+
+        director.loadScript("[SCENE: Day]\n[SHOT: MEDIUM]\n[TRANSITION: PUSH IN]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the end of the second script") { director.state.value == DirectorState.READY && cuesRun().size == 4 }
+
+        assertTrue(camera.exposures.isEmpty())
+        assertEquals(ExposurePreset.BRIGHT, camera.exposure)
+    }
+
+    @Test
+    fun `a cue run by hand after the script keeps the framing and exposure it left`() {
+        // Without a telephoto, the close-up is the main lens at 2.75x
+        director.loadScript("[SCENE: A]\n[EXPOSURE: DARK]\n[SHOT: CLOSE-UP]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the end") { director.state.value == DirectorState.READY && cuesRun().size == 2 }
+        camera.calls.clear()
+        camera.exposures.clear()
+
+        assertTrue(director.executeCueText("[FOCUS: FACE]"))
+
+        assertEquals(listOf("lens main", "zoom 2.75", "focus FACE"), camera.calls.toList())
+        assertEquals(listOf(ExposurePreset.DARK), camera.exposures.toList())
+    }
+
+    @Test
+    fun `a cue run by hand after Stop keeps the framing`() {
+        director.loadScript("[SCENE: A]\n[SHOT: CLOSE-UP]\n[HOLD: 30]").getOrThrow()
+        assertTrue(director.startExecution())
+        await("the hold") { cueIndex() == 1 }
+        director.stopExecution()
+        camera.calls.clear()
+
+        assertTrue(director.executeCueText("[TRANSITION: PUSH IN]"))
+
+        // From the close-up's 2.75x on the main lens
+        assertEquals(listOf("lens main", "zoom 4.125", "focus FACE"), camera.calls.toList())
+    }
+
+    @Test
+    fun `cues that keep the framing start from the camera's lens and zoom`() {
+        // Put on the wide lens at 3x on the dashboard, before any shot
+        camera.lens = "wide"
+        camera.framing = ShotMapper.Framing("wide", 3f)
+
+        assertTrue(director.executeCueText("[TRANSITION: PUSH IN]"))
+        assertEquals(listOf("lens wide", "zoom 4.5", "focus AUTO"), camera.calls.toList())
+
+        // Then on the tele lens at 2x: an exposure cue stays there too
+        camera.calls.clear()
+        camera.lens = "tele"
+        camera.framing = ShotMapper.Framing("tele", 2f)
+        assertTrue(director.executeCueText("[EXPOSURE: DARK]"))
+        assertEquals(listOf("lens tele", "zoom 2.0", "focus AUTO"), camera.calls.toList())
+        assertEquals(listOf(ExposurePreset.DARK), camera.exposures.toList())
     }
 
     // ========================================================================

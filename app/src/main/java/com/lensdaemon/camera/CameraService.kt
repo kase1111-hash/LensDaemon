@@ -91,8 +91,8 @@ class CameraService : Service() {
          * Bring the appliance up unattended (kiosk auto-start at boot): open
          * the camera and start RTSP when [rtsp] and a recording when [record],
          * each on its own, with the saved stream defaults (see
-         * [CameraService.streamDefaults]). Send it with
-         * ContextCompat.startForegroundService.
+         * [CameraService.streamDefaults]); during a thermal EMERGENCY, once the
+         * phone has cooled down. Send it with ContextCompat.startForegroundService.
          */
         fun autoStartIntent(context: Context, rtsp: Boolean, record: Boolean): Intent {
             return Intent(context, CameraService::class.java).apply {
@@ -211,6 +211,21 @@ class CameraService : Service() {
 
     /** Set while a thermal pause holds the outputs stopped; a start or stop by the user clears it ([cancelThermalPause]). */
     @Volatile private var thermalPaused: PausedOutputs? = null
+
+    /**
+     * The thermal EMERGENCY itself, from [pauseForThermal] to [resumeAfterThermal],
+     * whether or not anything ran to stop: unattended starts ([autoStartOutputs])
+     * wait for the resume. Used under the service's lock.
+     */
+    private val thermalHold = ThermalHold()
+
+    /**
+     * Set while [resumeAfterThermal] restarts outputs: an automatic restart is
+     * no new choice, so its starts leave the saved stream defaults as they were
+     * ([rememberStreamDefaults]). Changed and read only under the service's
+     * lock, which every start holds.
+     */
+    private var keepSavedDefaults = false
 
     /**
      * Rebuilds the encoder after it failed while running (see
@@ -358,6 +373,12 @@ class CameraService : Service() {
         lensDaemonCameraManager = LensDaemonCameraManager(applicationContext)
         lensDaemonCameraManager.onImageAvailable = previewFrameGrabber::onImage
         lensDaemonCameraManager.onCameraLost = { scheduleCameraRecovery() }
+        // The camera's autofocus and auto-exposure states, from every frame's
+        // capture result (on the camera thread; both only update state flows)
+        lensDaemonCameraManager.captureCallback = captureResultCallback { result ->
+            focusController.updateFromCaptureResult(result)
+            exposureController.updateFromCaptureResult(result)
+        }
         audioEnabled = streamPrefs().getBoolean(PREF_AUDIO_ENABLED, true)
 
         // Initialize lens controller with available lenses
@@ -522,8 +543,20 @@ class CameraService : Service() {
      * A start that fails with them is tried once more at 1080p30 (RTSP on port
      * 8554), so a bad saved value never leaves the appliance dark; the saved
      * defaults stay as they were.
+     *
+     * During a thermal EMERGENCY nothing starts: the request waits for the
+     * phone to cool down ([resumeAfterThermal] makes it then), with the CPU
+     * kept awake to notice, unless a user's start or stop drops it first. The
+     * check and the starts run under the service's lock, so a pause never
+     * falls between them.
      */
+    @Synchronized
     private fun autoStartOutputs(rtsp: Boolean, record: Boolean) {
+        if (thermalHold.hold(ThermalHold.AutoStart(rtsp, record))) {
+            Timber.w("Phone too hot: the auto-start (RTSP: $rtsp, recording: $record) waits until it has cooled down")
+            if (thermalHold.waiting != null && !streamWakeLock.isHeld) streamWakeLock.acquire()
+            return
+        }
         if (rtsp && !startRtspWithSavedDefaults()) Timber.e("Auto-start: RTSP could not start")
         if (!record) return
         val defaults = streamDefaults()
@@ -802,12 +835,13 @@ class CameraService : Service() {
      * Otherwise (the lens a [switchLens] already prepared, now open, or the
      * same lens reopened after the camera was lost) the zoom, exposure, focus
      * mode and regions asked for are kept, zoom and exposure clamped to the
-     * lens. Either way the focus mode falls back to the first of
-     * CONTINUOUS_VIDEO, AUTO and MANUAL the lens supports when it lacks the
-     * one asked for; since a lens change starts from continuous autofocus
-     * again, a fallback for a fixed-focus lens never sticks to the next lens.
-     * Zoom goes through the zoom controller, so the reported zoom and the
-     * applied one agree.
+     * lens; except a focus hold (AUTO, see [lockFocus]), which goes back to
+     * continuous autofocus: a lens that is opening has no focus to hold.
+     * Either way the focus mode falls back to the first of CONTINUOUS_VIDEO,
+     * AUTO and MANUAL the lens supports when it lacks the one asked for; since
+     * a lens change starts from continuous autofocus again, a fallback for a
+     * fixed-focus lens never sticks to the next lens. Zoom goes through the
+     * zoom controller, so the reported zoom and the applied one agree.
      */
     private fun syncConfigToLens(lensChanged: Boolean) {
         if (lensChanged) {
@@ -826,8 +860,9 @@ class CameraService : Service() {
         }
         exposureController.setExposureCompensation(currentConfig.exposureCompensation)
         val supported = focusController.getSupportedFocusModes()
+        val asked = if (currentConfig.focusMode == FocusMode.AUTO) FocusMode.CONTINUOUS_VIDEO else currentConfig.focusMode
         val focus = when {
-            supported.isEmpty() || currentConfig.focusMode in supported -> currentConfig.focusMode
+            supported.isEmpty() || asked in supported -> asked
             else -> FOCUS_FALLBACKS.firstOrNull { it in supported } ?: supported.first()
         }
         if (focus in supported) focusController.setFocusMode(focus)
@@ -1025,10 +1060,16 @@ class CameraService : Service() {
     }
 
     /**
-     * Lock focus at current position.
+     * Hold the focus where it is (the director's `[FOCUS: MANUAL]`): AUTO focus
+     * mode, in which the lens moves only on an AF trigger and none is sent,
+     * so it stays where continuous autofocus left it until the next focus
+     * change, lens change or camera reopen ([syncConfigToLens]). Drops any tap
+     * region. Does nothing on a lens without AUTO, such as a fixed-focus one.
      */
     fun lockFocus() {
-        focusController.lockFocus()
+        val result = focusController.lockFocus() ?: return
+        currentConfig = currentConfig.copy(focusMode = result.mode, afRegions = null)
+        lensDaemonCameraManager.updateConfig(currentConfig)
     }
 
     /**
@@ -1352,8 +1393,9 @@ class CameraService : Service() {
 
     /**
      * Replace the running encoder with one using [config], keeping the outputs:
-     * RTSP and MPEG-TS viewers stay connected, and a recording (also one an
-     * earlier failed rebuild cut off) continues in a new file, still paused if
+     * RTSP and MPEG-TS viewers stay connected, and an open recording (also one
+     * an earlier failed rebuild cut off, or one whose recorder reported an
+     * error but still holds its file) continues in a new file, still paused if
      * it was paused.
      *
      * When the new encoder does not start, every output is stopped, so the
@@ -1367,12 +1409,9 @@ class CameraService : Service() {
             "Restarting encoder: ${previous?.width}x${previous?.height} ${previous?.frameRate}fps -> " +
                 "${config.width}x${config.height} ${config.frameRate}fps"
         )
-        val wasRecording = isRecordingActive() || recordingInterrupted
+        val wasRecording = isRecordingOpen() || recordingInterrupted
         val wasPaused = recordingToContinuePaused()
-        if (isRecordingActive()) {
-            detachRecorder()
-            recordingCoordinator.stopRecording()
-        }
+        stopRecorder()
 
         isStreamingActive = false
         encoderService?.stopEncoding()
@@ -1447,7 +1486,8 @@ class CameraService : Service() {
     }
 
     /**
-     * Stop every output and then the encoder, and end an encoder rebuild in
+     * Stop every output (also a recorder left in an error, which may still
+     * hold its file) and then the encoder, and end an encoder rebuild in
      * progress. Leaves a thermal pause's record alone (see [pauseForThermal]).
      */
     private fun stopAllOutputs() {
@@ -1458,10 +1498,7 @@ class CameraService : Service() {
         encoderRecoveryStep = 0
         recordingInterrupted = false
         encodingRequested = false
-        if (isRecordingActive()) {
-            detachRecorder()
-            recordingCoordinator.stopRecording()
-        }
+        stopRecorder()
         stopRtspServer()
         stopMpegTsPublisher()
         stopEncoder()

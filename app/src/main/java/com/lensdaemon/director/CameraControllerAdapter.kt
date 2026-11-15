@@ -31,7 +31,8 @@ import kotlin.math.roundToInt
  * so a cue still acts after the camera was changed on the phone or the dashboard. Only a
  * lens switch or zoom animation still under way counts as where the camera is heading.
  * Those windows are measured on [SystemClock.elapsedRealtime], which setting the phone's
- * time doesn't move.
+ * time doesn't move. [getFraming] tells the director the same lens and zoom, which the
+ * cues that keep the framing start from.
  */
 class CameraControllerAdapter(
     private val cameraService: CameraService
@@ -106,16 +107,16 @@ class CameraControllerAdapter(
      * don't reopen the camera again. Maps String → LensType at the module boundary.
      */
     override fun switchLens(lens: String) {
-        val current = currentLensFamily()
         val now = SystemClock.elapsedRealtime()
-        val switching = lastAcceptedLens?.takeIf { current == null || now - lastAcceptedAtMs < LENS_SWITCH_SETTLE_MS }
-        val heading = switching ?: current
+        val heading = headingLens(now)
         if (lens == heading) return
 
         Timber.tag(TAG).d("Switching lens: ${heading ?: "(camera closed)"} -> $lens")
         if (cameraService.switchLens(lens)) {
             lastAcceptedLens = lens
             lastAcceptedAtMs = now
+            // The switch stops a zoom animation of ours: the new lens starts at 1x
+            animatingTo = null
         } else {
             Timber.tag(TAG).w("The camera has no \"$lens\" lens")
         }
@@ -128,8 +129,7 @@ class CameraControllerAdapter(
     override fun setZoom(level: Float, animated: Boolean, durationMs: Long) {
         val target = level.coerceIn(1f, cameraService.getMaxZoom().coerceAtLeast(1f))
         val now = SystemClock.elapsedRealtime()
-        val heading = animatingTo?.takeIf { now < animationEndsAtMs }
-        val reached = heading ?: cameraService.currentZoom.value
+        val reached = headingZoom(now)
         if (abs(target - reached) <= ZOOM_TOLERANCE) return
 
         Timber.tag(TAG).d("Setting zoom: $reached -> $target (animated=$animated, duration=${durationMs}ms)")
@@ -180,10 +180,10 @@ class CameraControllerAdapter(
     /**
      * Set the exposure compensation of a preset: AUTO 0, BRIGHT +1, DARK −1, BACKLIT +2 and
      * SILHOUETTE −2 EV, in the open lens's own steps and within its range, unless the camera
-     * has it already. The director sends a preset other than AUTO with every command, and
-     * AUTO only when a cue goes back to it. A preset other than AUTO also goes onto each lens
-     * that opens in the next [EXPOSURE_KEEP_MS]: a lens switch the same command asked for is
-     * still under way, and the new lens starts at 0 EV.
+     * has it already. The director sends the preset of every [EXPOSURE] cue, AUTO included,
+     * and a preset other than AUTO with every command while it is in force. A preset other
+     * than AUTO also goes onto each lens that opens in the next [EXPOSURE_KEEP_MS]: a lens
+     * switch the same command asked for is still under way, and the new lens starts at 0 EV.
      */
     override fun setExposurePreset(preset: ExposurePreset) {
         synchronized(exposureLock) {
@@ -231,6 +231,17 @@ class CameraControllerAdapter(
 
     override fun getCapabilities(): ShotMapper.CameraCapabilities = getCameraCapabilities()
 
+    /**
+     * The lens family the camera is on or heading to (as [switchLens] counts it) and the zoom
+     * an animation of ours is heading to, else the camera's; null while the camera is closed
+     * and no lens switch is under way.
+     */
+    override fun getFraming(): ShotMapper.Framing? {
+        val now = SystemClock.elapsedRealtime()
+        val lens = headingLens(now) ?: return null
+        return ShotMapper.Framing(lens, headingZoom(now))
+    }
+
     fun getCameraCapabilities(): ShotMapper.CameraCapabilities {
         // The director's "wide" and "telephoto" are the lens families the phone
         // and dashboard buttons use: an ultra-wide or a 5x periscope counts
@@ -276,6 +287,21 @@ class CameraControllerAdapter(
     /** The family of the open lens, or null while the camera is closed or reopening. */
     private fun currentLensFamily(): String? =
         cameraService.getCurrentLens().value?.lensType?.let(LensSelection::familyOf)
+
+    /**
+     * The lens family the camera is heading to at [now]: that of the last switch it accepted,
+     * while no lens is open or for [LENS_SWITCH_SETTLE_MS] after it was asked for, else the
+     * open lens's. Null while the camera is closed and no switch is under way.
+     */
+    private fun headingLens(now: Long): String? {
+        val current = currentLensFamily()
+        val switching = lastAcceptedLens?.takeIf { current == null || now - lastAcceptedAtMs < LENS_SWITCH_SETTLE_MS }
+        return switching ?: current
+    }
+
+    /** The zoom an animation of ours is heading to at [now], while it runs; else the camera's. */
+    private fun headingZoom(now: Long): Float =
+        animatingTo?.takeIf { now < animationEndsAtMs } ?: cameraService.currentZoom.value
 }
 
 /**

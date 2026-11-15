@@ -64,6 +64,9 @@ class DirectorManager internal constructor(
         private const val THERMAL_MONITOR_INTERVAL_MS = 10_000L
 
         private const val EVENT_BUFFER = 64
+
+        /** Cues that keep the framing: they start from the camera's lens and zoom, when the controller tells them. */
+        private val FRAMING_KEEPING_CUES = setOf(CueType.TRANSITION, CueType.FOCUS, CueType.EXPOSURE)
     }
 
     /**
@@ -75,10 +78,10 @@ class DirectorManager internal constructor(
         fun setFocusMode(target: FocusTarget)
 
         /**
-         * Apply an exposure preset. The director sends a preset other than AUTO with every
-         * command while it is in force, and AUTO only when a cue goes back to it. The camera
-         * sets the preset wherever its exposure differs, including on a lens that opens after
-         * the call: a lens change starts the new lens at 0 EV.
+         * Apply an exposure preset. The director sends the preset of every [EXPOSURE] cue,
+         * AUTO included, and a preset other than AUTO with every command while it is in force.
+         * The camera sets the preset wherever its exposure differs, including on a lens that
+         * opens after the call: a lens change starts the new lens at 0 EV.
          */
         fun setExposurePreset(preset: ExposurePreset)
         fun getCurrentTemperature(): Int
@@ -88,6 +91,13 @@ class DirectorManager internal constructor(
          * unknown. Read when a script loads or starts and before each cue run by hand.
          */
         fun getCapabilities(): ShotMapper.CameraCapabilities? = null
+
+        /**
+         * Where the camera is pointed, or heading while a lens switch or zoom animation is
+         * under way; null when unknown. Read before each TRANSITION, FOCUS and EXPOSURE cue,
+         * which keep that lens and zoom, also when they were set on the phone or the dashboard.
+         */
+        fun getFraming(): ShotMapper.Framing? = null
     }
 
     /**
@@ -152,10 +162,12 @@ class DirectorManager internal constructor(
     private var runGeneration = 0
 
     /**
-     * The exposure preset the director last sent (under [cameraLock]). AUTO goes to the camera
-     * only when a cue changes the preset back to it, so a script without [EXPOSURE] cues never
-     * undoes an exposure set on the dashboard. Any other preset goes with every command, and
-     * the camera puts it back where it was lost: a lens change starts the new lens at 0 EV.
+     * The exposure preset the director last sent (under [cameraLock]). Every [EXPOSURE] cue goes
+     * to the camera, AUTO included. Other commands send AUTO only in place of a preset the
+     * director sent, so a script without [EXPOSURE] cues never undoes an exposure set on the
+     * dashboard; any other preset goes with every command, and the camera puts it back where
+     * it was lost: a lens change starts the new lens at 0 EV. Loading or clearing a script and
+     * turning the director off forget the preset, without sending anything.
      */
     private var lastAppliedExposure = ExposurePreset.AUTO
 
@@ -205,7 +217,7 @@ class DirectorManager internal constructor(
                 _currentSession.value = null
                 _state.value = DirectorState.DISABLED
             }
-            resetCameraState()
+            forgetExposurePreset()
             applyConfig(config.copy(enabled = false))
         }
         emitEvent(DirectorEvent.StateChanged(DirectorState.DISABLED))
@@ -255,7 +267,7 @@ class DirectorManager internal constructor(
                 shotMapper.validateMapping(parsed, firstLineNumber = 1)
             val script = parsed.copy(errors = problems)
 
-            resetCameraState()
+            forgetExposurePreset()
             val newState = synchronized(sessionLock) {
                 _currentSession.value = DirectorSession(script = script, startTimeMs = System.currentTimeMillis())
                 // A thermal hold stays until the phone cools
@@ -331,12 +343,13 @@ class DirectorManager internal constructor(
 
     /**
      * Stop execution: a running or paused script stops, its take ends, and the position goes
-     * back to the first scene. A thermal hold stays until the phone cools.
+     * back to the first scene. A thermal hold stays until the phone cools. The camera keeps
+     * the framing, focus and exposure preset the script left, and the cues that follow start
+     * from them.
      */
     fun stopExecution() {
         val newState = synchronized(controlLock) {
             stopRunAndWait()
-            resetShotMapper()
             synchronized(sessionLock) {
                 rewindLocked()
                 when (_state.value) {
@@ -545,7 +558,7 @@ class DirectorManager internal constructor(
     fun clearScript() {
         val newState = synchronized(controlLock) {
             stopRunAndWait()
-            resetCameraState()
+            forgetExposurePreset()
             synchronized(sessionLock) {
                 _currentSession.value = null
                 // A thermal hold stays until the phone cools
@@ -633,21 +646,34 @@ class DirectorManager internal constructor(
 
     /**
      * Maps a camera cue to a command and runs it; false when the cue can't be mapped or the
-     * camera call failed
+     * camera call failed. A cue that keeps the framing (TRANSITION, FOCUS, EXPOSURE) starts
+     * from the camera's lens and zoom when the controller tells them.
      */
     private fun executeCameraCue(cue: DirectorCue): Boolean = synchronized(cameraLock) {
+        if (cue.type in FRAMING_KEEPING_CUES) cameraFraming()?.let { shotMapper.followCamera(it) }
         val result = shotMapper.mapCue(cue)
         val command = result.command
         if (result.success && command != null) {
-            executeCommand(command)
+            executeCommand(command, exposureCue = cue.type == CueType.EXPOSURE)
         } else {
             Timber.tag(TAG).w("Cue not mapped: ${cue.rawText} ${result.warnings}")
             false
         }
     }
 
-    /** Runs a camera command (holding [cameraLock]); the exposure preset as [lastAppliedExposure] says. */
-    private fun executeCommand(command: ShotMapper.CameraCommand): Boolean {
+    /** Where the camera is pointed, as the controller tells; null when it can't. */
+    private fun cameraFraming(): ShotMapper.Framing? = try {
+        cameraController?.getFraming()
+    } catch (e: Exception) {
+        Timber.tag(TAG).w(e, "Could not read the camera's framing")
+        null
+    }
+
+    /**
+     * Runs a camera command (holding [cameraLock]). Its exposure preset goes to the camera when
+     * the command is an [EXPOSURE] cue's ([exposureCue]), otherwise as [lastAppliedExposure] says.
+     */
+    private fun executeCommand(command: ShotMapper.CameraCommand, exposureCue: Boolean): Boolean {
         val controller = cameraController ?: run {
             Timber.tag(TAG).w("No camera controller set, command not executed")
             return false
@@ -665,9 +691,10 @@ class DirectorManager internal constructor(
             // Set focus mode
             controller.setFocusMode(command.focusMode)
 
-            // Exposure: a preset other than AUTO every time, AUTO when a cue goes back to it
+            // Exposure: an [EXPOSURE] cue's preset and any preset other than AUTO every time,
+            // otherwise AUTO only in place of a preset the director sent
             val preset = command.exposurePreset
-            if (preset != ExposurePreset.AUTO || lastAppliedExposure != ExposurePreset.AUTO) {
+            if (exposureCue || preset != ExposurePreset.AUTO || lastAppliedExposure != ExposurePreset.AUTO) {
                 controller.setExposurePreset(preset)
                 lastAppliedExposure = preset
             }
@@ -720,7 +747,6 @@ class DirectorManager internal constructor(
             runGeneration++
             endCurrentTake()
             rewindLocked()
-            resetShotMapper()
             val done = if (_currentSession.value != null) DirectorState.READY else DirectorState.IDLE
             _state.value = done
             done
@@ -812,16 +838,14 @@ class DirectorManager internal constructor(
         endCurrentTake()
     }
 
-    private fun resetShotMapper() {
+    /**
+     * Forgets the director's exposure preset, without sending anything (a script loaded or
+     * cleared, the director turned off): commands carry AUTO again, which leaves the camera's
+     * exposure alone. The framing and focus target stay for the cues that keep them.
+     */
+    private fun forgetExposurePreset() {
         synchronized(cameraLock) {
-            shotMapper.reset()
-        }
-    }
-
-    /** Forgets what the director set on the camera: the mapper starts afresh and exposure counts as AUTO. */
-    private fun resetCameraState() {
-        synchronized(cameraLock) {
-            shotMapper.reset()
+            shotMapper.forgetExposure()
             lastAppliedExposure = ExposurePreset.AUTO
         }
     }

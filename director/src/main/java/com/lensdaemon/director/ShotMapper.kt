@@ -10,7 +10,8 @@ import timber.log.Timber
  *
  * The mapper considers available hardware capabilities and calculates
  * optimal settings to achieve the desired shot composition. Each command carries
- * on the settings it doesn't change, the exposure preset included.
+ * on the settings it doesn't change, the exposure preset included. TRANSITION, FOCUS
+ * and EXPOSURE cues keep the lens and zoom: the camera's own, after [followCamera].
  */
 class ShotMapper(
     config: DirectorConfig = DirectorConfig.DEFAULT
@@ -52,6 +53,9 @@ class ShotMapper(
         val supportsFaceDetection: Boolean = true,
         val supportsManualFocus: Boolean = true
     )
+
+    /** Where the camera is pointed: a lens family ("wide", "main", "tele") and the zoom on that lens. */
+    data class Framing(val lens: String, val zoom: Float)
 
     /**
      * Mapped camera command to execute a shot
@@ -421,6 +425,20 @@ class ShotMapper(
     fun reset() {
         currentCommand = null
         Timber.tag(TAG).d("Shot mapper reset")
+    }
+
+    /**
+     * Takes the camera's lens and zoom as those of the current command, so the next
+     * TRANSITION, FOCUS or EXPOSURE cue keeps the framing the camera has, also when it was
+     * changed outside the director. The focus target and exposure preset stay as they were.
+     */
+    fun followCamera(framing: Framing) {
+        currentCommand = (currentCommand ?: getDefaultCommand()).copy(lens = framing.lens, zoomLevel = framing.zoom)
+    }
+
+    /** Forgets the exposure preset, which goes back to AUTO; the framing and focus target stay. */
+    fun forgetExposure() {
+        currentCommand = currentCommand?.copy(exposurePreset = ExposurePreset.AUTO)
     }
 
     /**
