@@ -61,6 +61,71 @@ class ApiRoutes(
 
         private const val NO_ENCODER = "No encoder running: give the bitrate in a start request or save it as a default"
         private const val FOCUS_ERROR = "x and y must be finite numbers from 0 to 1"
+        private const val NO_CAMERA_OPEN = "The camera is not open"
+        private const val NO_TAP_FOCUS = "This lens has no tap-to-focus (it needs continuous video autofocus)"
+
+        /**
+         * The checks a request to the API or the MJPEG preview meets once its
+         * body has been read, in this order: the rate limit for its connection
+         * address ([limiter]; none when null), then the token ([token]; none
+         * when null). Null lets the request through.
+         *
+         * The limit comes first so that requests with a wrong token use up
+         * their client's allowance like any others: once a token is set, the
+         * limit is what slows down guessing it.
+         */
+        internal fun admission(
+            session: NanoHTTPD.IHTTPSession,
+            limiter: RateLimiter?,
+            token: String?
+        ): NanoHTTPD.Response? = rateLimitRefusal(session, limiter) ?: tokenRefusal(session, token)
+
+        /**
+         * 429 when [limiter] has no request left for the connection's address.
+         * Headers such as X-Forwarded-For are the client's to choose
+         * (LensDaemon is never behind a proxy), so they would let it dodge the
+         * limit or drain another client's allowance.
+         */
+        private fun rateLimitRefusal(session: NanoHTTPD.IHTTPSession, limiter: RateLimiter?): NanoHTTPD.Response? {
+            limiter ?: return null
+            val clientIp = session.remoteIpAddress ?: session.headers["remote-addr"] ?: "unknown"
+            if (limiter.tryAcquire(clientIp)) return null
+
+            val retryAfter = limiter.retryAfterSeconds(clientIp)
+            val body = JSONObject().put("error", "Rate limit exceeded").put("retryAfter", retryAfter).toString()
+            val response = NanoHTTPD.newFixedLengthResponse(TOO_MANY_REQUESTS, WebServer.MIME_JSON, body)
+            response.addHeader("Retry-After", retryAfter.toString())
+            response.addHeader("X-RateLimit-Remaining", "0")
+            return response
+        }
+
+        /**
+         * 401 when [token] is set and the request does not carry it, as
+         * "Authorization: Bearer <token>" or, from clients that can't send
+         * headers (an <img>, an EventSource), as ?token=. GET /api/status and
+         * /api/device need none.
+         */
+        private fun tokenRefusal(session: NanoHTTPD.IHTTPSession, token: String?): NanoHTTPD.Response? {
+            token ?: return null  // Auth disabled
+
+            // Allow public read-only endpoints without auth
+            if (session.uri in PUBLIC_ENDPOINTS && session.method == NanoHTTPD.Method.GET) {
+                return null
+            }
+
+            val authHeader = session.headers["authorization"] ?: ""
+            val providedToken = if (authHeader.startsWith(BEARER_PREFIX, ignoreCase = true)) {
+                authHeader.substring(BEARER_PREFIX.length).trim()
+            } else {
+                session.parms?.get("token") ?: ""
+            }
+            if (providedToken == token) return null
+
+            val body = JSONObject()
+                .put("error", "Authentication required")
+                .put("hint", "Provide Bearer token in Authorization header")
+            return ApiHandlerUtils.jsonResponse(Status.UNAUTHORIZED, body.toString())
+        }
     }
 
     // Service references (set by WebServerService on main thread, read by NanoHTTPD threads)
