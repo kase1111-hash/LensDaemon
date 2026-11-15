@@ -147,6 +147,9 @@ class StreamingOutputsSmokeTest {
             assertFalse("RTSP should be stopped", service.isRtspServerRunning())
             assertFalse("MPEG-TS should be stopped", service.isMpegTsRunning())
             assertFalse("the encoder should be stopped", service.isStreaming())
+            // A real cool-down takes minutes: let the camera drop the stopped
+            // encoder's surface and the encoder be released before resuming
+            waitUntil(10_000) { service.getEncoderStats() == null }
 
             service.resumeAfterThermal()
             assertFalse("the thermal pause should be over", service.isThermalPaused())

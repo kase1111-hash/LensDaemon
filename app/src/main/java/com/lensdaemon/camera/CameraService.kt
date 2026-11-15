@@ -202,7 +202,7 @@ class CameraService : Service() {
         fun restartsAnything(): Boolean = encodingRequested || rtspPort != null || mpegTs != null || recording != null
     }
 
-    /** Set while a thermal pause holds the outputs stopped; a start or stop by the user clears it. */
+    /** Set while a thermal pause holds the outputs stopped; a start or stop by the user clears it ([cancelThermalPause]). */
     @Volatile private var thermalPaused: PausedOutputs? = null
 
     /** Rebuilds the encoder after it failed while running (see [scheduleEncoderRecovery]). */
@@ -217,7 +217,14 @@ class CameraService : Service() {
     /** A recording a failed encoder rebuild cut off, to continue once the encoder runs again. */
     @Volatile private var recordingInterrupted = false
 
-    /** Keeps the CPU running while the encoder runs, so outputs carry on with the screen off. */
+    /** Whether that cut-off recording was paused, so it continues paused. */
+    @Volatile private var interruptedRecordingPaused = false
+
+    /**
+     * Keeps the CPU running while the encoder runs, so outputs carry on with
+     * the screen off, and during a thermal pause, so the thermal monitor keeps
+     * measuring and the outputs come back once the phone has cooled down.
+     */
     private val streamWakeLock: PowerManager.WakeLock by lazy {
         getSystemService(PowerManager::class.java)
             .newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, STREAM_LOCK_TAG)
@@ -1261,7 +1268,7 @@ class CameraService : Service() {
      */
     @Synchronized
     fun startStreaming(config: EncoderConfig = streamDefaults().toEncoderConfig()): Boolean {
-        thermalPaused = null
+        cancelThermalPause()
         encodingRequested = true
         val target = thermallyLimited(config)
         val running = getEncoderConfig()
@@ -1283,7 +1290,8 @@ class CameraService : Service() {
     /**
      * Replace the running encoder with one using [config], keeping the outputs:
      * RTSP and MPEG-TS viewers stay connected, and a recording (also one an
-     * earlier failed rebuild cut off) continues in a new file.
+     * earlier failed rebuild cut off) continues in a new file, still paused if
+     * it was paused.
      *
      * When the new encoder does not start, every output is stopped, so the
      * status is honest. With [keepOutputsOnFailure] (a rebuild after a runtime
@@ -1297,6 +1305,7 @@ class CameraService : Service() {
                 "${config.width}x${config.height} ${config.frameRate}fps"
         )
         val wasRecording = isRecordingActive() || recordingInterrupted
+        val wasPaused = recordingToContinuePaused()
         if (isRecordingActive()) {
             detachRecorder()
             recordingCoordinator.stopRecording()
@@ -1315,16 +1324,26 @@ class CameraService : Service() {
         rtspCoordinator.setStreamConfig(config)
 
         if (!initializeEncoder(config) || !beginEncoding()) {
-            if (keepOutputsOnFailure) keepOutputsForNextRebuild(wasRecording) else stopOutputsAfterFailedRestart()
+            if (keepOutputsOnFailure) keepOutputsForNextRebuild(wasRecording, wasPaused) else stopOutputsAfterFailedRestart()
             return false
         }
 
         recordingInterrupted = false
         if (wasRecording && !startRecording()) {
             Timber.e("Recording could not continue after the encoder restart")
+        } else if (wasRecording && wasPaused) {
+            // New settings, thermal limits or a rebuild are no reason to resume a paused recording
+            pauseRecording()
         }
         return true
     }
+
+    /**
+     * Whether the recording a restart continues is paused: the open recording's
+     * own state, or else that of the one a failed rebuild cut off.
+     */
+    private fun recordingToContinuePaused(): Boolean =
+        if (isRecordingActive()) recordingCoordinator.isPaused() else recordingInterrupted && interruptedRecordingPaused
 
     /** A restart failed: stop every output and release what is left of the encoder. */
     private fun stopOutputsAfterFailedRestart() {
@@ -1338,14 +1357,15 @@ class CameraService : Service() {
 
     /**
      * A rebuild after a runtime failure did not start: keep the outputs, and
-     * a recording to continue, for the next attempt. The service stays
-     * streaming with a broken encoder (the wake locks stay held); the dead
-     * encoder surface is taken off the camera.
+     * a recording to continue ([wasPaused]: paused), for the next attempt. The
+     * service stays streaming with a broken encoder (the wake locks stay
+     * held); the dead encoder surface is taken off the camera.
      */
-    private fun keepOutputsForNextRebuild(wasRecording: Boolean) {
+    private fun keepOutputsForNextRebuild(wasRecording: Boolean, wasPaused: Boolean) {
         Timber.e("Encoder rebuild failed; the outputs wait for the next attempt")
         isStreamingActive = true
         recordingInterrupted = wasRecording
+        interruptedRecordingPaused = wasPaused
         val dead = encoderSurface
         encoderSurface = null
         // On the dispatcher of initializeEncoder's attach, so it runs after that
@@ -1359,7 +1379,7 @@ class CameraService : Service() {
      */
     @Synchronized
     fun stopStreaming() {
-        thermalPaused = null
+        cancelThermalPause()
         stopAllOutputs()
     }
 
@@ -1475,7 +1495,10 @@ class CameraService : Service() {
      * encoder, remembering which ran and how (the requested encoder settings,
      * Start Streaming, the RTSP port, the MPEG-TS settings, the recording's
      * segment length and whether it was paused) for [resumeAfterThermal].
-     * Does nothing when nothing runs or a pause is already in effect.
+     * Does nothing when nothing runs or a pause is already in effect. The CPU
+     * is kept awake during the pause: the thermal monitor that calls for the
+     * resume only runs while it is, and with the screen off the phone would
+     * otherwise go to sleep and never bring the outputs back.
      *
      * Thread-safe; blocks while the outputs stop, so call it off the main thread.
      */
@@ -1489,12 +1512,13 @@ class CameraService : Service() {
             rtspPort = rtspCoordinator.port.takeIf { rtspCoordinator.isRunning() },
             mpegTs = mpegTsCoordinator.getConfig(),
             recording = recordingCoordinator.segmentDuration.takeIf { isRecordingActive() || recordingInterrupted },
-            recordingPaused = recordingCoordinator.isPaused()
+            recordingPaused = recordingToContinuePaused()
         )
         if (!paused.restartsAnything()) return
         Timber.w("Phone too hot: stopping every output until it cools down")
         stopAllOutputs()
         thermalPaused = paused
+        if (!streamWakeLock.isHeld) streamWakeLock.acquire()
     }
 
     /**
@@ -1528,10 +1552,23 @@ class CameraService : Service() {
                 pauseRecording()
             }
         }
+        // Nothing came back: the CPU, kept awake for the resume, may sleep again
+        if (!isStreamingActive) releaseStreamLocks()
     }
 
     /** True while a thermal pause holds the outputs stopped, to restart them once the phone cools down. */
     fun isThermalPaused(): Boolean = thermalPaused != null
+
+    /**
+     * A start or stop by the user ends a thermal pause: nothing is restarted
+     * automatically any more, and the CPU, kept awake for the resume, may
+     * sleep again unless the encoder runs.
+     */
+    private fun cancelThermalPause() {
+        if (thermalPaused == null) return
+        thermalPaused = null
+        if (!isStreamingActive) releaseStreamLocks()
+    }
 
     // ==================== Encoder recovery ====================
 
@@ -1941,7 +1978,7 @@ class CameraService : Service() {
         config: EncoderConfig = streamDefaults().toEncoderConfig(),
         rtspPort: Int = streamDefaults().rtspPort
     ): Boolean {
-        thermalPaused = null
+        cancelThermalPause()
         if (!ensureEncoding(config)) {
             return false
         }
@@ -1965,7 +2002,7 @@ class CameraService : Service() {
      */
     @Synchronized
     fun stopRtspStreaming() {
-        thermalPaused = null
+        cancelThermalPause()
         stopRtspServer()
         stopEncoderIfUnused(Output.RTSP)
         Timber.i("RTSP streaming stopped")
@@ -2015,7 +2052,7 @@ class CameraService : Service() {
         encoderConfig: EncoderConfig = streamDefaults().toEncoderConfig(),
         mpegtsConfig: MpegTsUdpConfig = MpegTsUdpConfig()
     ): Boolean {
-        thermalPaused = null
+        cancelThermalPause()
         if (!ensureEncoding(encoderConfig)) {
             return false
         }
@@ -2038,7 +2075,7 @@ class CameraService : Service() {
      */
     @Synchronized
     fun stopMpegTsStreaming() {
-        thermalPaused = null
+        cancelThermalPause()
         stopMpegTsPublisher()
         stopEncoderIfUnused(Output.MPEGTS)
         Timber.i("MPEG-TS/UDP streaming stopped")
@@ -2107,7 +2144,7 @@ class CameraService : Service() {
             Timber.w("Already recording; the open recording is left as it is")
             return true
         }
-        thermalPaused = null
+        cancelThermalPause()
         if (!ensureEncoding(config)) {
             return false
         }
@@ -2124,7 +2161,7 @@ class CameraService : Service() {
      */
     @Synchronized
     fun stopRecording(): List<String> {
-        thermalPaused = null
+        cancelThermalPause()
         recordingInterrupted = false
         detachRecorder()
         val segments = recordingCoordinator.stopRecording()
