@@ -597,6 +597,11 @@ class LensDaemonCameraManager(private val context: Context) {
     /** Create a capture session for [surfaces] and start the repeating request on it. */
     private suspend fun createSession(device: CameraDevice, surfaces: List<Surface>): Boolean =
         suspendCoroutine { continuation ->
+            // Android can report one failed configuration twice: createCaptureSession
+            // throws a CameraAccessException and also posts onConfigureFailed. Only the
+            // first report completes the request; a second resume would crash the app,
+            // and a late one must not mark a retry that has since succeeded as failed
+            val reported = AtomicBoolean(false)
             try {
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     val outputConfigs = surfaces.map { OutputConfiguration(it) }
@@ -604,39 +609,37 @@ class LensDaemonCameraManager(private val context: Context) {
                         SessionConfiguration.SESSION_REGULAR,
                         outputConfigs,
                         cameraExecutor,
-                        createSessionCallback(continuation)
+                        createSessionCallback(continuation, reported)
                     )
                     device.createCaptureSession(sessionConfig)
                 } else {
                     @Suppress("DEPRECATION")
                     device.createCaptureSession(
                         surfaces,
-                        createSessionCallback(continuation),
+                        createSessionCallback(continuation, reported),
                         cameraHandler
                     )
                 }
-            } catch (e: CameraAccessException) {
+            } catch (e: Exception) {
+                // CameraAccessException (the device failed, or its HAL refused the new
+                // streams), IllegalArgumentException (a target surface was released or
+                // abandoned) or IllegalStateException (the camera was closed underneath us)
                 Timber.e(e, "Failed to create capture session")
-                _cameraState.value = CameraState.ERROR
-                continuation.resumeWithException(e)
-            } catch (e: IllegalArgumentException) {
-                // A target surface was released or abandoned
-                Timber.e(e, "Capture session rejected its surfaces")
-                _cameraState.value = CameraState.ERROR
-                continuation.resumeWithException(e)
-            } catch (e: IllegalStateException) {
-                // The camera device was closed underneath us
-                Timber.e(e, "Camera closed while creating the capture session")
-                _cameraState.value = CameraState.ERROR
-                continuation.resumeWithException(e)
+                if (reported.compareAndSet(false, true)) {
+                    _cameraState.value = CameraState.ERROR
+                    continuation.resumeWithException(e)
+                }
             }
         }
 
     private fun createSessionCallback(
-        continuation: kotlin.coroutines.Continuation<Boolean>
+        continuation: kotlin.coroutines.Continuation<Boolean>,
+        reported: AtomicBoolean
     ): CameraCaptureSession.StateCallback {
         return object : CameraCaptureSession.StateCallback() {
             override fun onConfigured(session: CameraCaptureSession) {
+                // The request already failed through an exception: the session is nobody's
+                if (!reported.compareAndSet(false, true)) return session.close()
                 Timber.i("Capture session configured")
                 captureSession = session
                 _cameraState.value = CameraState.CONFIGURED
@@ -654,6 +657,8 @@ class LensDaemonCameraManager(private val context: Context) {
             }
 
             override fun onConfigureFailed(session: CameraCaptureSession) {
+                // Already reported through the exception createCaptureSession threw
+                if (!reported.compareAndSet(false, true)) return
                 Timber.e("Capture session configuration failed")
                 _cameraState.value = CameraState.ERROR
                 continuation.resumeWithException(
