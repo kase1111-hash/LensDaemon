@@ -564,8 +564,10 @@ class CameraService : Service() {
         if (startRecording(defaults.toEncoderConfig(), segment)) return
         Timber.w("Auto-start: recording did not start with the saved defaults; trying 1080p30")
         if (startRecording(EncoderConfig.PRESET_1080P, segment)) {
-            // A fallback start is no new choice: keep the saved defaults for next time
-            saveStreamDefaults(defaults)
+            // A fallback start is no new choice: keep the saved defaults for next time.
+            // During a thermal resume the start saved nothing, and the defaults may
+            // have been changed (PUT /api/config) since they were read: leave them be
+            if (!keepSavedDefaults) saveStreamDefaults(defaults)
         } else {
             Timber.e("Auto-start: recording could not start")
         }
@@ -583,8 +585,9 @@ class CameraService : Service() {
         if (startRtspStreaming(defaults.toEncoderConfig(), defaults.rtspPort)) return true
         Timber.w("RTSP did not start with the saved defaults; trying 1080p30 on port $DEFAULT_RTSP_PORT")
         if (!startRtspStreaming(EncoderConfig.PRESET_1080P, DEFAULT_RTSP_PORT)) return false
-        // The fallback start saved its own settings as the defaults: put the chosen ones back
-        saveStreamDefaults(defaults)
+        // The fallback start saved its own settings as the defaults: put the chosen ones
+        // back (during a thermal resume it saved nothing, so there is nothing to undo)
+        if (!keepSavedDefaults) saveStreamDefaults(defaults)
         return true
     }
 
@@ -1362,8 +1365,10 @@ class CameraService : Service() {
      * keep encoding until [stopStreaming], whether or not an output is attached.
      *
      * If the encoder already runs with other settings it is restarted with
-     * these. Attached RTSP and MPEG-TS viewers stay connected and pick the new
-     * stream up at its first keyframe; a recording is split into a new
+     * these. MPEG-TS receivers stay connected and pick the new stream up at its
+     * first keyframe, and so do RTSP viewers unless the codec changes (then they
+     * are disconnected: their session description no longer fits the stream,
+     * so players have to reconnect); a recording is split into a new
      * segment, since one MP4 track cannot change format. Under the thermal
      * governor's CRITICAL limits the encoder runs limited, and returns to
      * [config] when they clear.
@@ -1393,7 +1398,8 @@ class CameraService : Service() {
 
     /**
      * Replace the running encoder with one using [config], keeping the outputs:
-     * RTSP and MPEG-TS viewers stay connected, and an open recording (also one
+     * MPEG-TS receivers stay connected, RTSP viewers too unless the codec
+     * changes (they are disconnected then), and an open recording (also one
      * an earlier failed rebuild cut off, or one whose recorder reported an
      * error but still holds its file) continues in a new file, still paused if
      * it was paused.

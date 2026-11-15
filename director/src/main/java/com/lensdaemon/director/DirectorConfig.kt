@@ -61,7 +61,7 @@ enum class FocusTarget {
     HANDS,          // Lower frame focus
     OBJECT,         // Specific object (requires tap coordinates)
     BACKGROUND,     // Distant focus
-    MANUAL          // Fixed focus distance
+    MANUAL          // Hold the focus where it is (no new focus search) until the next focus or shot cue
 }
 
 /**

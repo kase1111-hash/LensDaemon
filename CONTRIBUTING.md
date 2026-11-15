@@ -30,8 +30,8 @@ The output must show `FULL` or `LEVEL_3`. Devices reporting `LIMITED` or `LEGACY
 # Release APK
 ./gradlew assembleRelease
 
-# Install debug build on connected device
-./gradlew installDebug
+# Install debug build on connected device (installCoreDebug: without the AI Director)
+./gradlew installFullDebug
 ```
 
 ## Testing
