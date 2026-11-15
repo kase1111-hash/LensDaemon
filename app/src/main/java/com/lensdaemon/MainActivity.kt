@@ -264,19 +264,17 @@ class MainActivity : AppCompatActivity() {
     private fun handleTapToFocus(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
         val service = cameraService ?: return
 
-        if (!service.isTapToFocusSupported()) {
-            Timber.d("Tap-to-focus not supported")
-            return
-        }
-
         // Convert to normalized coordinates (0.0 to 1.0)
         val normalizedX = x / viewWidth
         val normalizedY = y / viewHeight
 
-        // Trigger tap-to-focus
-        service.triggerTapToFocus(normalizedX, normalizedY, Size(viewWidth, viewHeight))
-
-        // Also trigger spot metering at same location
+        // Focus there on lenses with tap-to-focus (continuous video autofocus);
+        // every lens meters exposure there, fixed-focus ones included
+        if (service.isTapToFocusSupported()) {
+            service.triggerTapToFocus(normalizedX, normalizedY, Size(viewWidth, viewHeight))
+        } else {
+            Timber.d("This lens has no tap-to-focus: metering only")
+        }
         service.triggerSpotMetering(normalizedX, normalizedY)
 
         // Show focus indicator
@@ -571,17 +569,30 @@ class MainActivity : AppCompatActivity() {
         } else {
             StreamingState.IDLE
         }
-        val shown = "$state $rtspOn ${mpegTs != null} $recordingLine"
+        // A thermal pause stopped every output; they come back by themselves when
+        // the phone cools, and Stop cancels that (stopStreaming ends the pause)
+        val controls = StreamControls.of(
+            streaming = streaming,
+            rtspOn = rtspOn,
+            thermalPaused = service.isThermalPaused(),
+            otherOutputs = listOfNotNull(recordingLine, mpegTs).isNotEmpty()
+        )
+        val shown = "$state $rtspOn ${mpegTs != null} $recordingLine ${controls.thermalPaused}"
         if (shown != shownState) {
             shownState = shown
             updateStatus(state)
         }
 
-        val endsMore = listOfNotNull(recordingLine, mpegTs).isNotEmpty()
-        binding.btnStartStream.visibility = if (rtspOn) View.GONE else View.VISIBLE
-        binding.btnStopStream.visibility = if (streaming) View.VISIBLE else View.GONE
-        binding.btnStopStream.setText(if (endsMore) R.string.stop_all else R.string.btn_stop_stream)
-        binding.overlayStreamInfo.visibility = if (streaming) View.VISIBLE else View.GONE
+        binding.btnStartStream.visibility = if (controls.startVisible) View.VISIBLE else View.GONE
+        binding.btnStopStream.visibility = if (controls.stopVisible) View.VISIBLE else View.GONE
+        binding.btnStopStream.setText(if (controls.stopEndsAll) R.string.stop_all else R.string.btn_stop_stream)
+        binding.overlayStreamInfo.visibility = if (controls.infoVisible) View.VISIBLE else View.GONE
+        if (controls.thermalPaused) {
+            binding.tvRtspUrl.setText(R.string.thermal_paused)
+            binding.tvResolution.text = ""
+            binding.tvBitrate.text = ""
+            return
+        }
         if (!streaming) return
 
         val rtspLine = service.getRtspUrl()?.takeIf { rtspOn }

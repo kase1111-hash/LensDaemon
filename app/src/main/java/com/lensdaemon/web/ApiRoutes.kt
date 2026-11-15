@@ -188,13 +188,6 @@ class ApiRoutes(
     internal fun admit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? = admission(session, rateLimiter, apiToken)
 
     /**
-     * The token check alone: null when the request may go ahead, else 401.
-     * Off while no token is set. Requests go through [admit] instead, which
-     * applies the rate limit first so that wrong tokens count against it.
-     */
-    internal fun authorize(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? = tokenRefusal(session, apiToken)
-
-    /**
      * Handle API request - main dispatcher
      */
     fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {

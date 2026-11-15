@@ -26,8 +26,8 @@ internal data class ConfigChange(
  */
 internal object ApiInputs {
 
-    /** Bitrates the encoder may be given, in bits per second (PUT /api/config, stream defaults). */
-    val BITRATE_RANGE = 100_000..50_000_000
+    /** Bitrates the encoder may be given, in bits per second: the stream defaults' range. */
+    val BITRATE_RANGE = StreamDefaults.BITRATE_RANGE
 
     const val ZOOM_ERROR = "zoom must be a finite number"
     const val EV_ERROR = "ev must be a whole number of the camera's exposure steps"

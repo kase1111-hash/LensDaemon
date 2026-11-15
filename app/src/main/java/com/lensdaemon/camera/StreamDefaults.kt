@@ -46,7 +46,7 @@ data class StreamDefaults(
         !isValidWidth(width) -> "width must be an even number from $MIN_WIDTH to $MAX_WIDTH"
         !isValidHeight(height) -> "height must be an even number from $MIN_HEIGHT to $MAX_HEIGHT"
         frameRate !in FRAME_RATES -> "frameRate must be from ${FRAME_RATES.first} to ${FRAME_RATES.last}"
-        bitrateBps !in BITRATES -> "bitrate must be from ${BITRATES.first} to ${BITRATES.last} bits per second"
+        bitrateBps !in BITRATE_RANGE -> "bitrate must be from ${BITRATE_RANGE.first} to ${BITRATE_RANGE.last} bits per second"
         rtspPort !in RTSP_PORTS -> "rtspPort must be from ${RTSP_PORTS.first} to ${RTSP_PORTS.last}"
         segmentMinutes !in SEGMENT_MINUTES -> "segmentMinutes must be 0 (one file), 1, 5, 15, 30 or 60"
         else -> null
@@ -78,7 +78,12 @@ data class StreamDefaults(
         private const val MIN_HEIGHT = 120
         private const val MAX_HEIGHT = 2160
         private val FRAME_RATES = 1..60
-        private val BITRATES = 100_000..50_000_000
+
+        /**
+         * Bitrates the app accepts, in bits per second: for the saved defaults,
+         * PUT /api/config and /api/encoder/capabilities (one definition for all three).
+         */
+        val BITRATE_RANGE = 100_000..50_000_000
         private val RTSP_PORTS = 1024..65535
         private val SEGMENT_MINUTES = listOf(0, 1, 5, 15, 30, 60)
 
@@ -105,7 +110,7 @@ data class StreamDefaults(
                 width = size.first,
                 height = size.second,
                 frameRate = json.intOrNull(KEY_FRAME_RATE) { it in FRAME_RATES } ?: builtIn.frameRate,
-                bitrateBps = json.intOrNull(KEY_BITRATE) { it in BITRATES } ?: builtIn.bitrateBps,
+                bitrateBps = json.intOrNull(KEY_BITRATE) { it in BITRATE_RANGE } ?: builtIn.bitrateBps,
                 rtspPort = json.intOrNull(KEY_RTSP_PORT) { it in RTSP_PORTS } ?: builtIn.rtspPort,
                 segmentMinutes = json.intOrNull(KEY_SEGMENT_MINUTES) { it in SEGMENT_MINUTES } ?: builtIn.segmentMinutes
             )

@@ -38,7 +38,11 @@ class EncoderService : Service() {
         private const val NOTIFICATION_ID = 2001
         private const val CHANNEL_ID = "encoder_service_channel"
 
-        /** Bitrates accepted when the codec does not report its range. */
+        /**
+         * Bitrates accepted when the codec does not report its range. Keep it
+         * equal to StreamDefaults.BITRATE_RANGE (not referenced, so that the
+         * encoder does not depend on the camera package).
+         */
         private val DEFAULT_BITRATE_RANGE = 100_000..50_000_000
 
         // Intent actions

@@ -13,6 +13,7 @@
     <string name="btn_start_stream">Start Stream</string>
     <string name="btn_stop_stream">Stop Stream</string>
     <string name="stop_all">Stop all</string>
+    <string name="thermal_paused">Paused: the phone is too hot; outputs restart when it cools</string>
     <string name="btn_start_recording">Start Recording</string>
     <string name="btn_stop_recording">Stop Recording</string>
     <string name="btn_settings">Settings</string>
