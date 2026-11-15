@@ -14,6 +14,8 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.util.Size
+import android.view.GestureDetector
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.ScaleGestureDetector
 import android.view.View
@@ -29,6 +31,8 @@ import com.lensdaemon.camera.CameraState
 import com.lensdaemon.camera.FocusState
 import com.lensdaemon.camera.LensType
 import com.lensdaemon.databinding.ActivityMainBinding
+import com.lensdaemon.kiosk.KioskActivityController
+import com.lensdaemon.thermal.ThermalService
 import com.lensdaemon.web.WebServerService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -52,9 +56,17 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var binding: ActivityMainBinding
 
+    /** Dashboard address and temperatures over the preview. */
+    private lateinit var overlays: PhoneOverlays
+
+    /** Pins the app to the screen while kiosk mode is on; Vol Up + Vol Down held leaves it. */
+    private lateinit var kiosk: KioskActivityController
+
     /** Refreshes the stream overlay while the activity is visible. */
     private var streamStatusJob: Job? = null
-    private var shownStreaming: Boolean? = null
+
+    /** The outputs the status line last showed, so it is redrawn only when they change. */
+    private var shownState: String? = null
 
     // Camera service connection
     private var cameraService: CameraService? = null
@@ -62,7 +74,6 @@ class MainActivity : AppCompatActivity() {
 
     // Gesture detectors
     private lateinit var scaleGestureDetector: ScaleGestureDetector
-    private var isScaling = false
 
     // Focus indicator handler
     private val focusHandler = Handler(Looper.getMainLooper())
@@ -124,6 +135,9 @@ class MainActivity : AppCompatActivity() {
         hideSystemUI()
         setupUI()
         setupGestureDetectors()
+        overlays = PhoneOverlays(this, binding)
+        kiosk = KioskActivityController(this, (application as LensDaemonApp).kioskManager)
+        kiosk.attach()
 
         if (hasAllPermissions()) {
             startCameraService()
@@ -135,6 +149,7 @@ class MainActivity : AppCompatActivity() {
     override fun onStart() {
         super.onStart()
         startStreamStatusUpdates()
+        overlays.start()
     }
 
     override fun onResume() {
@@ -145,11 +160,17 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         streamStatusJob?.cancel()
         streamStatusJob = null
+        overlays.stop()
         super.onStop()
     }
 
+    /** While kiosk mode pins the app, the volume keys are the way out (held together). */
+    override fun dispatchKeyEvent(event: KeyEvent): Boolean =
+        kiosk.onKeyEvent(event) || super.dispatchKeyEvent(event)
+
     override fun onDestroy() {
         super.onDestroy()
+        kiosk.release()
         focusHandler.removeCallbacks(hideFocusIndicatorRunnable)
         if (serviceBound) {
             unbindService(serviceConnection)
@@ -173,9 +194,8 @@ class MainActivity : AppCompatActivity() {
                 View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION or
                 View.SYSTEM_UI_FLAG_IMMERSIVE_STICKY
         }
-
-        // Keep screen on while app is active
-        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        // Keep-screen-on is KioskActivityController's: on, except in a kiosk
+        // that lets the phone's screen timeout turn the display off
     }
 
     private fun setupUI() {
@@ -203,10 +223,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupGestureDetectors() {
-        // Pinch-to-zoom gesture detector
+        // Pinch-to-zoom gesture detector. Returning true from onScale makes
+        // scaleFactor the change since the last call, which zooms incrementally.
         scaleGestureDetector = ScaleGestureDetector(this, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
             override fun onScaleBegin(detector: ScaleGestureDetector): Boolean {
-                isScaling = true
                 cameraService?.onPinchStart()
                 return true
             }
@@ -219,23 +239,24 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onScaleEnd(detector: ScaleGestureDetector) {
-                isScaling = false
                 cameraService?.onPinchEnd()
                 hideZoomDisplayDelayed()
             }
         })
 
-        // Touch listener for tap-to-focus and pinch-to-zoom
-        binding.surfacePreview.setOnTouchListener { view, event ->
-            scaleGestureDetector.onTouchEvent(event)
-
-            when (event.actionMasked) {
-                MotionEvent.ACTION_UP -> {
-                    if (!isScaling && event.pointerCount == 1) {
-                        handleTapToFocus(event.x, event.y, view.width, view.height)
-                    }
-                }
+        // Tap-to-focus on a real tap only: GestureDetector drops the tap when a
+        // second finger comes down (a pinch) or the finger moves past the touch slop
+        val tapDetector = GestureDetector(this, object : GestureDetector.SimpleOnGestureListener() {
+            override fun onSingleTapUp(e: MotionEvent): Boolean {
+                handleTapToFocus(e.x, e.y, binding.surfacePreview.width, binding.surfacePreview.height)
+                return true
             }
+        })
+
+        // Touch listener for tap-to-focus and pinch-to-zoom
+        binding.surfacePreview.setOnTouchListener { _, event ->
+            scaleGestureDetector.onTouchEvent(event)
+            tapDetector.onTouchEvent(event)
             true
         }
     }
@@ -243,19 +264,17 @@ class MainActivity : AppCompatActivity() {
     private fun handleTapToFocus(x: Float, y: Float, viewWidth: Int, viewHeight: Int) {
         val service = cameraService ?: return
 
-        if (!service.isTapToFocusSupported()) {
-            Timber.d("Tap-to-focus not supported")
-            return
-        }
-
         // Convert to normalized coordinates (0.0 to 1.0)
         val normalizedX = x / viewWidth
         val normalizedY = y / viewHeight
 
-        // Trigger tap-to-focus
-        service.triggerTapToFocus(normalizedX, normalizedY, Size(viewWidth, viewHeight))
-
-        // Also trigger spot metering at same location
+        // Focus there on lenses with tap-to-focus (continuous video autofocus);
+        // every lens meters exposure there, fixed-focus ones included
+        if (service.isTapToFocusSupported()) {
+            service.triggerTapToFocus(normalizedX, normalizedY, Size(viewWidth, viewHeight))
+        } else {
+            Timber.d("This lens has no tap-to-focus: metering only")
+        }
         service.triggerSpotMetering(normalizedX, normalizedY)
 
         // Show focus indicator
@@ -349,6 +368,10 @@ class MainActivity : AppCompatActivity() {
         // The dashboard and REST API run in their own foreground service; the
         // documented flow is "open the app, then browse to http://<ip>:8080".
         ContextCompat.startForegroundService(this, WebServerService.createStartIntent(this))
+
+        // Thermal monitoring runs as soon as the service exists (the web server
+        // binds it too); starting it here gives it its foreground notification
+        ContextCompat.startForegroundService(this, ThermalService.createStartIntent(this))
     }
 
     private fun onCameraServiceConnected() {
@@ -368,7 +391,7 @@ class MainActivity : AppCompatActivity() {
             // Observe camera state
             observeCameraState(service)
 
-            shownStreaming = null
+            shownState = null
             renderStreamState(service)
             if (!service.isStreaming()) binding.tvStatus.text = "Camera ready"
         }
@@ -402,8 +425,9 @@ class MainActivity : AppCompatActivity() {
                 Timber.d("Camera state: $state")
                 when (state) {
                     CameraState.PREVIEWING -> {
-                        binding.tvStatus.text =
-                            if (service.isStreaming()) getString(R.string.status_streaming) else "Preview active"
+                        // While outputs run the status line is renderStreamState's
+                        // (Streaming or Recording): have it redrawn, e.g. after an error
+                        if (service.isStreaming()) shownState = null else binding.tvStatus.text = "Preview active"
                     }
                     CameraState.STREAMING -> {
                         binding.tvStatus.text = getString(R.string.status_streaming)
@@ -476,6 +500,9 @@ class MainActivity : AppCompatActivity() {
     /**
      * Start streaming the way the README describes it: the encoder plus the
      * RTSP server, so the URL shown on screen can be opened in OBS or VLC.
+     * It uses the saved stream defaults (size, frame rate, codec, bitrate and
+     * port, set from the dashboard), and shares the encoder when a recording
+     * or MPEG-TS stream already runs.
      */
     private fun onStartStreamClicked() {
         Timber.i("Start stream clicked")
@@ -516,35 +543,74 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Show what runs, whoever started it (this screen, the dashboard, auto-start).
+     * Start Stream is offered whenever RTSP is off: it shares an encoder that a
+     * recording or MPEG-TS already runs. Stop ends every output, so it reads
+     * "Stop all" when it would end a recording or MPEG-TS too. The status line
+     * says Recording while a recording is open (running or paused), and the
+     * overlay lists RTSP, MPEG-TS, the recording and the encoder settings.
+     */
     private fun renderStreamState(service: CameraService) {
         val streaming = service.isStreaming()
-        if (streaming != shownStreaming) {
-            shownStreaming = streaming
-            updateStatus(if (streaming) StreamingState.STREAMING else StreamingState.IDLE)
+        val rtspOn = service.isRtspServerRunning()
+        val recordingLine = if (service.isRecordingPaused()) {
+            "Recording paused"
+        } else if (service.isRecording()) {
+            "Recording"
+        } else {
+            null
+        }
+        val mpegTs = service.getMpegTsStats()?.takeIf { service.isMpegTsRunning() }
+        val state = if (recordingLine != null) {
+            StreamingState.RECORDING
+        } else if (streaming) {
+            StreamingState.STREAMING
+        } else {
+            StreamingState.IDLE
+        }
+        // A thermal pause stopped every output; they come back by themselves when
+        // the phone cools, and Stop cancels that (stopStreaming ends the pause)
+        val controls = StreamControls.of(
+            streaming = streaming,
+            rtspOn = rtspOn,
+            thermalPaused = service.isThermalPaused(),
+            otherOutputs = listOfNotNull(recordingLine, mpegTs).isNotEmpty()
+        )
+        val shown = "$state $rtspOn ${mpegTs != null} $recordingLine ${controls.thermalPaused}"
+        if (shown != shownState) {
+            shownState = shown
+            updateStatus(state)
         }
 
-        binding.apply {
-            btnStartStream.visibility = if (streaming) View.GONE else View.VISIBLE
-            btnStopStream.visibility = if (streaming) View.VISIBLE else View.GONE
-            overlayStreamInfo.visibility = if (streaming) View.VISIBLE else View.GONE
-            if (!streaming) return
-
-            val url = service.getRtspUrl()
-            tvRtspUrl.text = if (url != null) {
-                "RTSP: $url · ${service.getRtspPlayingCount()} watching"
-            } else {
-                "RTSP server off"
-            }
-            val audio = service.getAudioConfig()
-                ?.let { " · AAC ${it.sampleRate / 1000} kHz ${if (it.channelCount == 2) "stereo" else "mono"}" }
-                ?: " · no audio"
-            tvResolution.text = service.getEncoderConfig()
-                ?.let { "${it.width}x${it.height} @ ${it.frameRate}fps ${it.codec.name}$audio" }
-                .orEmpty()
-            tvBitrate.text = service.getEncoderStats()
-                ?.let { String.format(Locale.US, "%.1f Mbps · %.0f fps", it.currentBitrateBps / 1_000_000.0, it.currentFps) }
-                .orEmpty()
+        binding.btnStartStream.visibility = if (controls.startVisible) View.VISIBLE else View.GONE
+        binding.btnStopStream.visibility = if (controls.stopVisible) View.VISIBLE else View.GONE
+        binding.btnStopStream.setText(if (controls.stopEndsAll) R.string.stop_all else R.string.btn_stop_stream)
+        binding.overlayStreamInfo.visibility = if (controls.infoVisible) View.VISIBLE else View.GONE
+        if (controls.thermalPaused) {
+            binding.tvRtspUrl.setText(R.string.thermal_paused)
+            binding.tvResolution.text = ""
+            binding.tvBitrate.text = ""
+            return
         }
+        if (!streaming) return
+
+        val rtspLine = service.getRtspUrl()?.takeIf { rtspOn }
+            ?.let { "RTSP: $it · ${service.getRtspPlayingCount()} watching" } ?: "RTSP off"
+        val mpegTsLine = mpegTs?.let { "MPEG-TS → ${it.remoteAddress.ifEmpty { "no receiver yet (UDP port ${it.port})" }}" }
+        binding.tvRtspUrl.text = listOfNotNull(rtspLine, mpegTsLine, recordingLine).joinToString("\n")
+        val audio = service.getAudioConfig()
+        val audioText = if (audio == null) {
+            " · no audio"
+        } else {
+            " · AAC ${audio.sampleRate / 1000} kHz ${if (audio.channelCount == 2) "stereo" else "mono"}"
+        }
+        binding.tvResolution.text = service.getEncoderConfig()
+            ?.let { "${it.width}x${it.height} @ ${it.frameRate}fps ${it.codec.name}$audioText" }
+            .orEmpty()
+        binding.tvBitrate.text = service.getEncoderStats()
+            ?.let { String.format(Locale.US, "%.1f Mbps · %.0f fps", it.currentBitrateBps / 1_000_000.0, it.currentFps) }
+            .orEmpty()
     }
 
     private fun onLensSelected(lensType: LensType) {

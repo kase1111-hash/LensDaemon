@@ -6,9 +6,9 @@ import fi.iki.elonen.NanoHTTPD
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONObject
 import timber.log.Timber
 import java.io.IOException
-import java.io.InputStream
 
 /**
  * Web server state
@@ -42,6 +42,16 @@ class WebServer(
         const val MIME_JPEG = "image/jpeg"
         const val MIME_PNG = "image/png"
         const val MIME_MULTIPART = "multipart/x-mixed-replace; boundary=frame"
+
+        private const val MIME_EVENT_STREAM = "text/event-stream"
+
+        /**
+         * Whether a response of [mimeType] may be gzipped: anything but an
+         * event stream, whose small frames would wait inside the compressor
+         * instead of reaching the client as they happen.
+         */
+        internal fun allowsGzip(mimeType: String?): Boolean =
+            mimeType?.trim()?.startsWith(MIME_EVENT_STREAM, ignoreCase = true) != true
     }
 
     // Server state
@@ -111,6 +121,14 @@ class WebServer(
     }
 
     /**
+     * NanoHTTPD decides after [serve] returns whether to gzip a response (any
+     * text or JSON when the client accepts gzip), so a handler cannot opt out.
+     * Server-Sent Events are kept out here: GZIPOutputStream holds each frame
+     * until kilobytes have built up, so the director's live events never arrived.
+     */
+    override fun useGzipWhenAccepted(r: Response): Boolean = allowsGzip(r.mimeType) && super.useGzipWhenAccepted(r)
+
+    /**
      * Handle incoming HTTP request
      */
     override fun serve(session: IHTTPSession): Response {
@@ -148,7 +166,7 @@ class WebServer(
             newFixedLengthResponse(
                 Response.Status.INTERNAL_ERROR,
                 MIME_JSON,
-                """{"error": "Internal server error"}"""
+                JSONObject().put("error", "Internal server error").toString()
             )
         }
     }
@@ -160,20 +178,24 @@ class WebServer(
         val routes = apiRoutes ?: return newFixedLengthResponse(
             Response.Status.SERVICE_UNAVAILABLE,
             MIME_JSON,
-            """{"error": "API not available"}"""
+            JSONObject().put("error", "API not available").toString()
         )
 
         return routes.handleRequest(session)
     }
 
     /**
-     * Handle MJPEG stream request
+     * Handle MJPEG stream request. The preview shows the camera, so it takes
+     * the same token as the API when one is set (Bearer or ?token=), and
+     * counts against the same rate limit, checked first, so that it can't be
+     * used to guess the token at full speed.
      */
     private fun handleMjpegStream(session: IHTTPSession): Response {
+        apiRoutes?.admit(session)?.let { return it }
         val streamer = mjpegStreamer ?: return newFixedLengthResponse(
             Response.Status.SERVICE_UNAVAILABLE,
             MIME_JSON,
-            """{"error": "MJPEG stream not available"}"""
+            JSONObject().put("error", "MJPEG stream not available").toString()
         )
 
         return streamer.createStreamResponse()
@@ -191,7 +213,7 @@ class WebServer(
             newFixedLengthResponse(
                 Response.Status.NOT_FOUND,
                 MIME_JSON,
-                """{"error": "Not found", "path": "$path"}"""
+                JSONObject().put("error", "Not found").put("path", path).toString()
             )
         }
     }
@@ -275,11 +297,12 @@ fun NanoHTTPD.successResponse(json: String): NanoHTTPD.Response {
 }
 
 /**
- * Extension for creating error JSON response
+ * Extension for creating error JSON response: {"error": [message]}, valid
+ * JSON whatever the message holds
  */
 fun NanoHTTPD.errorResponse(
     status: NanoHTTPD.Response.Status,
     message: String
 ): NanoHTTPD.Response {
-    return jsonResponse(status, """{"error": "$message"}""")
+    return jsonResponse(status, JSONObject().put("error", message).toString())
 }

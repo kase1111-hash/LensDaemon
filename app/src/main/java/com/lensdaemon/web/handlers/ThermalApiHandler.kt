@@ -1,5 +1,6 @@
 package com.lensdaemon.web.handlers
 
+import com.lensdaemon.thermal.BatteryBypass
 import com.lensdaemon.thermal.ThermalGovernor
 import com.lensdaemon.thermal.ThermalProfile
 import com.lensdaemon.web.WebServer
@@ -32,8 +33,8 @@ class ThermalApiHandler(
             uri == "/api/thermal/stats" && method == NanoHTTPD.Method.GET -> getThermalStats()
             uri == "/api/thermal/events" && method == NanoHTTPD.Method.GET -> getThermalEvents()
             uri == "/api/thermal/battery" && method == NanoHTTPD.Method.GET -> getBatteryBypassStatus()
-            uri == "/api/thermal/battery/disable" && method == NanoHTTPD.Method.POST -> disableBatteryCharging()
-            uri == "/api/thermal/battery/enable" && method == NanoHTTPD.Method.POST -> enableBatteryCharging()
+            uri == "/api/thermal/battery/disable" && method == NanoHTTPD.Method.POST -> setManualChargingHold(true)
+            uri == "/api/thermal/battery/enable" && method == NanoHTTPD.Method.POST -> setManualChargingHold(false)
             uri == "/api/thermal/profile" && method == NanoHTTPD.Method.GET -> getActiveProfile()
             uri == "/api/thermal/profile" && method == NanoHTTPD.Method.PUT -> setProfileOverride(body)
             uri == "/api/thermal/profile" && method == NanoHTTPD.Method.DELETE -> clearProfileOverride()
@@ -68,6 +69,15 @@ class ThermalApiHandler(
             put("framerateReduced", status.framerateReduced)
             put("activeActions", JSONArray().apply {
                 status.activeActions.forEach { put(it.name) }
+            })
+            // Whether the phone can actually stop charging; chargingDisabled only says the
+            // governor wants it held
+            val bypass = thermal.getBatteryBypass()
+            val bypassStatus = bypass?.getStatus()
+            put("chargeControl", JSONObject().apply {
+                put("available", bypass?.hasHardwareControl() ?: false)
+                put("state", (bypassStatus?.state ?: BatteryBypass.BypassState.DISABLED).name)
+                put("recommendation", bypassStatus?.recommendation ?: "")
             })
         }
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -151,24 +161,52 @@ class ThermalApiHandler(
             put("isCharging", status.isCharging)
             put("chargingDisabled", status.chargingDisabled)
             put("batteryLevel", status.batteryLevel.name)
+            thermal.getBatteryBypass()?.let { put("bypass", bypassJson(it.getStatus())) }
         }
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
-    private fun disableBatteryCharging(): NanoHTTPD.Response {
+    /**
+     * POST /api/thermal/battery/disable (hold = true) and /enable (hold = false): set or
+     * release the manual charging hold, answering 200 once the charging switch has done it.
+     * Phones without a charging switch the app can write get 409 with advice instead, and
+     * nothing changes; so does a phone whose switch refuses to turn charging off (the
+     * bypass then gives that switch up). A switch that rejects the change while charging
+     * is already off gets 500 with the state and chargingBlocked: charging stays off, and
+     * after a refused /enable the manual hold stays.
+     */
+    private fun setManualChargingHold(hold: Boolean): NanoHTTPD.Response {
         val thermal = thermalGovernor ?: return ApiHandlerUtils.serviceUnavailable("Thermal service")
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Charging disabled (manual override)"}"""
-        )
+        val bypass = thermal.getBatteryBypass() ?: return ApiHandlerUtils.serviceUnavailable("Battery bypass")
+        val switched = bypass.hasHardwareControl() && (if (hold) bypass.disableCharging() else bypass.enableCharging())
+        if (!switched && !bypass.hasHardwareControl()) {
+            val advice = bypass.getStatus().recommendation.ifEmpty {
+                if (hold) "Unplug the charger to stop charging" else "Charging is not held back by LensDaemon"
+            }
+            val json = JSONObject()
+                .put("success", false)
+                .put("softwareOnly", true)
+                .put("error", "This phone does not let LensDaemon switch charging off")
+                .put("recommendation", advice)
+            return ApiHandlerUtils.jsonResponse(Status.CONFLICT, json.toString())
+        }
+        val status = bypass.getStatus()
+        val json = JSONObject()
+            .put("success", switched)
+            .put("state", status.state.name)
+            .put("chargingBlocked", status.chargingBlocked)
+        if (!switched) json.put("error", "The phone's charging switch did not accept the change")
+        return ApiHandlerUtils.jsonResponse(if (switched) Status.OK else Status.INTERNAL_ERROR, json.toString())
     }
 
-    private fun enableBatteryCharging(): NanoHTTPD.Response {
-        val thermal = thermalGovernor ?: return ApiHandlerUtils.serviceUnavailable("Thermal service")
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Charging enabled"}"""
-        )
+    private fun bypassJson(status: BatteryBypass.BatteryBypassStatus): JSONObject = JSONObject().apply {
+        put("state", status.state.name)
+        put("targetPercent", status.targetPercent)
+        put("resumePercent", status.resumePercent)
+        put("chargingBlocked", status.chargingBlocked)
+        put("hasHardwareControl", status.hasHardwareControl)
+        put("softwareOnly", status.softwareOnly)
+        put("recommendation", status.recommendation)
     }
 
     // ==================== Profile API ====================
@@ -230,10 +268,11 @@ class ThermalApiHandler(
         thermal.profileManager.setOverrideProfile(profile)
         thermal.applyActiveProfile()
 
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Profile override applied", "profile": "${profile.displayName}"}"""
-        )
+        val json = JSONObject()
+            .put("success", true)
+            .put("message", "Profile override applied")
+            .put("profile", profile.displayName)
+        return ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
     }
 
     private fun clearProfileOverride(): NanoHTTPD.Response {
@@ -242,10 +281,11 @@ class ThermalApiHandler(
         thermal.applyActiveProfile()
 
         val detected = thermal.profileManager.getDetectedProfile()
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Override cleared, reverted to auto-detected profile", "profile": "${detected.displayName}"}"""
-        )
+        val json = JSONObject()
+            .put("success", true)
+            .put("message", "Override cleared, reverted to auto-detected profile")
+            .put("profile", detected.displayName)
+        return ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
     }
 
     private fun getDeviceInfo(): NanoHTTPD.Response {
@@ -306,10 +346,11 @@ class ThermalApiHandler(
         val clampedDuration = durationSec.coerceIn(60, 600)
         test.start(clampedDuration)
 
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Stress test started", "durationSeconds": $clampedDuration}"""
-        )
+        val json = JSONObject()
+            .put("success", true)
+            .put("message", "Stress test started")
+            .put("durationSeconds", clampedDuration)
+        return ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
     }
 
     private fun getStressTestStatus(): NanoHTTPD.Response {
@@ -348,9 +389,9 @@ class ThermalApiHandler(
             return ApiHandlerUtils.errorJson(Status.CONFLICT, "No stress test running")
         }
         test.stop()
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Stress test stopped"}"""
-        )
+        val json = JSONObject()
+            .put("success", true)
+            .put("message", "Stress test stopped")
+        return ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
     }
 }

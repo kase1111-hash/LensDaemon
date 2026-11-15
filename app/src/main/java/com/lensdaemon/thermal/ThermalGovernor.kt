@@ -13,32 +13,42 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import timber.log.Timber
+import java.util.Locale
 
 /**
- * Thermal governor for automatic throttling
+ * Thermal governor: turns CPU and battery temperatures into throttling.
  *
- * Monitors temperatures and applies protective measures:
- * - CPU > 45°C → Reduce bitrate by 20%
- * - CPU > 50°C → Reduce resolution to 1080p
- * - CPU > 55°C → Reduce framerate to 24fps
- * - CPU > 60°C → Pause streaming
- * - Battery > 42°C → Disable charging
- * - Battery > 45°C → Alert user
+ * Every [ThermalConfig.monitorIntervalMs] it works out a level for the CPU and one for
+ * the battery, derives the wanted throttling from both ([throttlePlanFor]) and applies
+ * only what changed. With the default (generic profile) thresholds:
+ * - CPU >= 45°C, ELEVATED: no action
+ * - CPU >= 50°C, WARNING: bitrate -20%
+ * - CPU >= 55°C, CRITICAL: bitrate -40%, resolution one step down, frame rate at most 24 fps
+ * - CPU >= 60°C, EMERGENCY: outputs paused until it cools
+ * - Battery >= 42°C, WARNING (and 45°C, CRITICAL): charging held, where the phone lets
+ *   the app switch charging off (elsewhere the battery bypass only advises unplugging)
+ * - Battery >= 48°C, EMERGENCY: charging held and outputs paused until it cools
  *
- * Features:
- * - Hysteresis to prevent oscillation
- * - Smooth transitions between states
- * - Emergency shutdown protection
- * - Event callbacks for state changes
+ * The thresholds come from the device's thermal profile, or a saved override, applied in
+ * [initialize]. A level is left only once the temperature is that level's hysteresis below
+ * its threshold (3°C for the CPU, 2°C for the battery by default), so readings around a
+ * threshold don't flip the throttling on every poll. ALERT_USER only marks events in the
+ * history log when a level rises to CRITICAL or EMERGENCY; no separate alert is posted.
+ *
+ * Callbacks and listeners are called on the main thread.
  */
 class ThermalGovernor(
     private val context: Context,
-    private var config: ThermalConfig = ThermalConfig.DEFAULT
+    initialConfig: ThermalConfig = ThermalConfig.DEFAULT
 ) : ThermalMonitor.ThermalMonitorListener {
 
     companion object {
         private const val TAG = "ThermalGovernor"
     }
+
+    // Written by PUT/DELETE /api/thermal/profile on HTTP threads, read by the main-thread loop
+    @Volatile
+    private var config: ThermalConfig = initialConfig
 
     // Profile manager for device-specific tuning
     val profileManager = ThermalProfileManager(context)
@@ -61,7 +71,7 @@ class ThermalGovernor(
     private val _batteryLevel = MutableStateFlow(ThermalLevel.NORMAL)
     val batteryLevel: StateFlow<ThermalLevel> = _batteryLevel.asStateFlow()
 
-    // Active throttling state
+    // Throttling in force (main thread only)
     private val activeActions = mutableSetOf<ThrottleAction>()
     private var currentBitrateReduction = 0
     private var isResolutionReduced = false
@@ -72,16 +82,24 @@ class ThermalGovernor(
     // Listeners
     private val listeners = mutableListOf<ThermalGovernorListener>()
 
-    // Throttle callbacks
+    /** The wanted bitrate cut in percent, whenever it changes (0 when cooled down). */
     var onReduceBitrate: ((reductionPercent: Int) -> Unit)? = null
-    var onReduceResolution: (() -> Unit)? = null
-    var onReduceFramerate: (() -> Unit)? = null
+
+    /** The wanted encoder limits from CPU CRITICAL, on every change in either direction. */
+    var onEncoderLimits: ((reduceResolution: Boolean, reduceFramerate: Boolean) -> Unit)? = null
+
+    /** The CPU or the battery reached EMERGENCY: stop the outputs. */
     var onPauseStreaming: (() -> Unit)? = null
+
+    /** Neither the CPU nor the battery is at EMERGENCY any more: restart the paused outputs. */
     var onResumeStreaming: (() -> Unit)? = null
+
+    /** Called by [stop] once every throttle has been lifted. */
     var onRestoreSettings: (() -> Unit)? = null
 
     /**
-     * Initialize governor with components
+     * Initialize governor with components, and apply the device's thermal profile
+     * (or the saved override) so its thresholds are in force from the start.
      */
     fun initialize(
         thermalMonitor: ThermalMonitor,
@@ -94,6 +112,10 @@ class ThermalGovernor(
 
         monitor.addListener(this)
         history.setMonitor(monitor)
+        // History records the governor's levels, so its entries match the throttling
+        history.levelSource = { _cpuLevel.value to _batteryLevel.value }
+
+        applyActiveProfile()
     }
 
     /**
@@ -125,7 +147,7 @@ class ThermalGovernor(
     }
 
     /**
-     * Stop the thermal governor
+     * Stop the thermal governor and lift every throttle
      */
     fun stop() {
         Timber.tag(TAG).i("Stopping thermal governor")
@@ -136,8 +158,10 @@ class ThermalGovernor(
         monitor.stop()
         history.stopRecording()
 
-        // Restore all settings
-        restoreAllSettings()
+        applyPlan(ThrottlePlan())
+        onRestoreSettings?.invoke()
+        updateStatus()
+        Timber.tag(TAG).i("All settings restored")
     }
 
     /**
@@ -154,9 +178,10 @@ class ThermalGovernor(
     }
 
     /**
-     * Apply the active thermal profile to the governor config.
-     * Call after initialization or when the profile changes.
+     * Apply the active thermal profile to the governor config. Runs at the end of
+     * [initialize] and whenever the profile changes (PUT/DELETE /api/thermal/profile).
      */
+    @Synchronized
     fun applyActiveProfile() {
         val profile = profileManager.getActiveProfile()
         config = profile.toThermalConfig(config)
@@ -167,6 +192,11 @@ class ThermalGovernor(
      * Get the current config (useful for API responses)
      */
     fun getConfig(): ThermalConfig = config
+
+    /**
+     * The battery bypass (charge limiting), or null when the service runs without one.
+     */
+    fun getBatteryBypass(): BatteryBypass? = batteryBypass
 
     /**
      * Add governor listener
@@ -211,341 +241,133 @@ class ThermalGovernor(
     // ==================== Evaluation ====================
 
     /**
-     * Evaluate current thermal state and apply actions
+     * Work out both levels, apply the throttling they call for, publish the status,
+     * then log the level changes and tell the listeners (who see the new status).
      */
     private suspend fun evaluateThermalState() {
+        val cfg = config
         val cpuTemp = monitor.cpuTemperature.value
         val batteryTemp = monitor.batteryTemperature.value
 
-        // Evaluate CPU thermal level
-        val newCpuLevel = evaluateCpuLevel(cpuTemp)
-        if (newCpuLevel != _cpuLevel.value) {
-            handleCpuLevelChange(_cpuLevel.value, newCpuLevel, cpuTemp)
-            _cpuLevel.value = newCpuLevel
-        }
+        val oldCpu = _cpuLevel.value
+        val oldBattery = _batteryLevel.value
+        val newCpu = levelWithHysteresis(cpuTemp, oldCpu, cfg.cpuConfig.getThresholds())
+        val newBattery = levelWithHysteresis(batteryTemp, oldBattery, cfg.batteryConfig.getThresholds())
+        _cpuLevel.value = newCpu
+        _batteryLevel.value = newBattery
 
-        // Evaluate battery thermal level
-        val newBatteryLevel = evaluateBatteryLevel(batteryTemp)
-        if (newBatteryLevel != _batteryLevel.value) {
-            handleBatteryLevelChange(_batteryLevel.value, newBatteryLevel, batteryTemp)
-            _batteryLevel.value = newBatteryLevel
-        }
-
+        val plan = throttlePlanFor(newCpu, newBattery, cfg)
+        applyPlan(plan)
         updateStatus()
+
+        if (newCpu != oldCpu) {
+            recordLevelChange(ThermalSource.CPU, oldCpu, newCpu, cpuTemp, plan)
+        }
+        if (newBattery != oldBattery) {
+            recordLevelChange(ThermalSource.BATTERY, oldBattery, newBattery, batteryTemp, plan)
+        }
+        if (newCpu != oldCpu || newBattery != oldBattery) {
+            val status = _status.value
+            listeners.forEach { it.onThermalLevelChanged(status) }
+        }
     }
 
     /**
-     * Evaluate CPU thermal level with hysteresis
+     * Log a level change in the event history, with the actions in force after it and
+     * ALERT_USER when the level rose to CRITICAL or EMERGENCY.
      */
-    private fun evaluateCpuLevel(tempC: Float): ThermalLevel {
-        val thresholds = config.cpuConfig.getThresholds()
-        val currentLevel = _cpuLevel.value
-
-        // Check for escalation (going up)
-        for (threshold in thresholds.sortedByDescending { it.level.ordinal }) {
-            if (tempC >= threshold.temperatureCelsius) {
-                return threshold.level
-            }
-        }
-
-        // Check for de-escalation (going down) - requires hysteresis
-        if (currentLevel != ThermalLevel.NORMAL) {
-            val currentThreshold = thresholds.find { it.level == currentLevel }
-            if (currentThreshold != null) {
-                val cooldownTemp = currentThreshold.temperatureCelsius - currentThreshold.hysteresisDegreesC
-                if (tempC < cooldownTemp) {
-                    // Find next lower level
-                    return thresholds
-                        .filter { it.level.ordinal < currentLevel.ordinal }
-                        .maxByOrNull { it.level.ordinal }?.level ?: ThermalLevel.NORMAL
-                }
-                // Still in current level due to hysteresis
-                return currentLevel
-            }
-        }
-
-        return ThermalLevel.NORMAL
-    }
-
-    /**
-     * Evaluate battery thermal level with hysteresis
-     */
-    private fun evaluateBatteryLevel(tempC: Float): ThermalLevel {
-        val thresholds = config.batteryConfig.getThresholds()
-        val currentLevel = _batteryLevel.value
-
-        // Check for escalation
-        for (threshold in thresholds.sortedByDescending { it.level.ordinal }) {
-            if (tempC >= threshold.temperatureCelsius) {
-                return threshold.level
-            }
-        }
-
-        // Check for de-escalation with hysteresis
-        if (currentLevel != ThermalLevel.NORMAL) {
-            val currentThreshold = thresholds.find { it.level == currentLevel }
-            if (currentThreshold != null) {
-                val cooldownTemp = currentThreshold.temperatureCelsius - currentThreshold.hysteresisDegreesC
-                if (tempC < cooldownTemp) {
-                    return thresholds
-                        .filter { it.level.ordinal < currentLevel.ordinal }
-                        .maxByOrNull { it.level.ordinal }?.level ?: ThermalLevel.NORMAL
-                }
-                return currentLevel
-            }
-        }
-
-        return ThermalLevel.NORMAL
-    }
-
-    // ==================== Action Handlers ====================
-
-    /**
-     * Handle CPU level change
-     */
-    private suspend fun handleCpuLevelChange(
+    private suspend fun recordLevelChange(
+        source: ThermalSource,
         oldLevel: ThermalLevel,
         newLevel: ThermalLevel,
-        tempC: Float
+        tempC: Float,
+        plan: ThrottlePlan
     ) {
-        Timber.tag(TAG).i("CPU level: $oldLevel -> $newLevel @ ${tempC}°C")
-
-        val actions = mutableListOf<ThrottleAction>()
-
-        if (newLevel.ordinal > oldLevel.ordinal) {
-            // Escalating - apply throttling
-            when (newLevel) {
-                ThermalLevel.WARNING -> {
-                    applyBitrateReduction(config.bitrateReduction.warningReductionPercent)
-                    actions.add(ThrottleAction.REDUCE_BITRATE)
-                }
-                ThermalLevel.CRITICAL -> {
-                    applyBitrateReduction(config.bitrateReduction.criticalReductionPercent)
-                    applyResolutionReduction()
-                    applyFramerateReduction()
-                    actions.add(ThrottleAction.REDUCE_BITRATE)
-                    actions.add(ThrottleAction.REDUCE_RESOLUTION)
-                    actions.add(ThrottleAction.REDUCE_FRAMERATE)
-                }
-                ThermalLevel.EMERGENCY -> {
-                    pauseStreaming("CPU temperature critical: ${tempC}°C")
-                    actions.add(ThrottleAction.PAUSE_STREAMING)
-                    actions.add(ThrottleAction.ALERT_USER)
-                }
-                else -> {}
-            }
-        } else {
-            // De-escalating - restore settings
-            when (newLevel) {
-                ThermalLevel.NORMAL -> {
-                    restoreAllSettings()
-                }
-                ThermalLevel.ELEVATED -> {
-                    if (isStreamingPaused) {
-                        resumeStreaming()
-                    }
-                    restoreResolution()
-                    restoreFramerate()
-                    restoreBitrate()
-                }
-                ThermalLevel.WARNING -> {
-                    if (isStreamingPaused) {
-                        resumeStreaming()
-                    }
-                    restoreResolution()
-                    restoreFramerate()
-                    applyBitrateReduction(config.bitrateReduction.warningReductionPercent)
-                }
-                ThermalLevel.CRITICAL -> {
-                    if (isStreamingPaused) {
-                        resumeStreaming()
-                    }
-                }
-                else -> {}
-            }
+        Timber.tag(TAG).i("$source level: $oldLevel -> $newLevel @ ${tempC}°C")
+        val actions = plan.actions().toMutableList()
+        if (newLevel > oldLevel && newLevel >= ThermalLevel.CRITICAL) {
+            actions.add(ThrottleAction.ALERT_USER)
         }
-
-        // Record event
-        history.recordEvent(ThermalSource.CPU, oldLevel, newLevel, tempC, actions)
-
-        // Notify listeners
-        val status = _status.value
-        listeners.forEach { it.onThermalLevelChanged(status) }
-    }
-
-    /**
-     * Handle battery level change
-     */
-    private suspend fun handleBatteryLevelChange(
-        oldLevel: ThermalLevel,
-        newLevel: ThermalLevel,
-        tempC: Float
-    ) {
-        Timber.tag(TAG).i("Battery level: $oldLevel -> $newLevel @ ${tempC}°C")
-
-        val actions = mutableListOf<ThrottleAction>()
-
-        if (newLevel.ordinal > oldLevel.ordinal) {
-            // Escalating
-            when (newLevel) {
-                ThermalLevel.WARNING -> {
-                    disableCharging("Battery temperature elevated: ${tempC}°C")
-                    actions.add(ThrottleAction.DISABLE_CHARGING)
-                }
-                ThermalLevel.CRITICAL -> {
-                    disableCharging("Battery temperature high: ${tempC}°C")
-                    actions.add(ThrottleAction.DISABLE_CHARGING)
-                    actions.add(ThrottleAction.ALERT_USER)
-                }
-                ThermalLevel.EMERGENCY -> {
-                    disableCharging("Battery temperature critical: ${tempC}°C")
-                    pauseStreaming("Battery temperature critical: ${tempC}°C")
-                    actions.add(ThrottleAction.DISABLE_CHARGING)
-                    actions.add(ThrottleAction.PAUSE_STREAMING)
-                    actions.add(ThrottleAction.ALERT_USER)
-                }
-                else -> {}
-            }
-        } else {
-            // De-escalating
-            when (newLevel) {
-                ThermalLevel.NORMAL, ThermalLevel.ELEVATED -> {
-                    enableCharging()
-                    if (isStreamingPaused && _cpuLevel.value != ThermalLevel.EMERGENCY) {
-                        resumeStreaming()
-                    }
-                }
-                ThermalLevel.WARNING -> {
-                    // Keep charging disabled
-                    if (isStreamingPaused && _cpuLevel.value != ThermalLevel.EMERGENCY) {
-                        resumeStreaming()
-                    }
-                }
-                else -> {}
-            }
-        }
-
-        // Record event
-        history.recordEvent(ThermalSource.BATTERY, oldLevel, newLevel, tempC, actions)
-
-        // Notify listeners
-        val status = _status.value
-        listeners.forEach { it.onThermalLevelChanged(status) }
+        history.recordEvent(source, oldLevel, newLevel, tempC, actions)
     }
 
     // ==================== Throttle Actions ====================
 
-    private fun applyBitrateReduction(percent: Int) {
-        if (percent > currentBitrateReduction) {
-            currentBitrateReduction = percent
-            activeActions.add(ThrottleAction.REDUCE_BITRATE)
-            onReduceBitrate?.invoke(percent)
-            listeners.forEach { it.onThrottleAction(ThrottleAction.REDUCE_BITRATE, true) }
-            Timber.tag(TAG).d("Applied bitrate reduction: $percent%")
-        }
+    /**
+     * Bring the throttling in line with [plan], acting only on what changed. A pause comes
+     * before the encoder changes and a resume after them, so outputs aren't restarted just
+     * to be stopped, and resumed outputs start with the limits already in place.
+     */
+    private fun applyPlan(plan: ThrottlePlan) {
+        if (plan.pauseStreaming) setStreamingPaused(true)
+        setBitrateReduction(plan.bitrateReductionPercent)
+        setEncoderLimits(plan.reduceResolution, plan.reduceFramerate)
+        setChargingHeld(plan.holdCharging)
+        if (!plan.pauseStreaming) setStreamingPaused(false)
     }
 
-    private fun restoreBitrate() {
-        if (currentBitrateReduction > 0) {
-            currentBitrateReduction = 0
-            activeActions.remove(ThrottleAction.REDUCE_BITRATE)
-            onReduceBitrate?.invoke(0)
-            listeners.forEach { it.onThrottleAction(ThrottleAction.REDUCE_BITRATE, false) }
-            Timber.tag(TAG).d("Restored bitrate")
-        }
+    private fun setBitrateReduction(percent: Int) {
+        if (percent == currentBitrateReduction) return
+        currentBitrateReduction = percent
+        setActionActive(ThrottleAction.REDUCE_BITRATE, percent > 0)
+        onReduceBitrate?.invoke(percent)
+        Timber.tag(TAG).d("Bitrate reduction: $percent%")
     }
 
-    private fun applyResolutionReduction() {
-        if (!isResolutionReduced) {
-            isResolutionReduced = true
-            activeActions.add(ThrottleAction.REDUCE_RESOLUTION)
-            onReduceResolution?.invoke()
-            listeners.forEach { it.onThrottleAction(ThrottleAction.REDUCE_RESOLUTION, true) }
-            Timber.tag(TAG).d("Applied resolution reduction")
-        }
+    private fun setEncoderLimits(reduceResolution: Boolean, reduceFramerate: Boolean) {
+        if (reduceResolution == isResolutionReduced && reduceFramerate == isFramerateReduced) return
+        isResolutionReduced = reduceResolution
+        isFramerateReduced = reduceFramerate
+        setActionActive(ThrottleAction.REDUCE_RESOLUTION, reduceResolution)
+        setActionActive(ThrottleAction.REDUCE_FRAMERATE, reduceFramerate)
+        onEncoderLimits?.invoke(reduceResolution, reduceFramerate)
+        Timber.tag(TAG).d("Encoder limits: lower resolution $reduceResolution, frame rate cap $reduceFramerate")
     }
 
-    private fun restoreResolution() {
-        if (isResolutionReduced) {
-            isResolutionReduced = false
-            activeActions.remove(ThrottleAction.REDUCE_RESOLUTION)
-            listeners.forEach { it.onThrottleAction(ThrottleAction.REDUCE_RESOLUTION, false) }
-            Timber.tag(TAG).d("Restored resolution")
-        }
-    }
-
-    private fun applyFramerateReduction() {
-        if (!isFramerateReduced) {
-            isFramerateReduced = true
-            activeActions.add(ThrottleAction.REDUCE_FRAMERATE)
-            onReduceFramerate?.invoke()
-            listeners.forEach { it.onThrottleAction(ThrottleAction.REDUCE_FRAMERATE, true) }
-            Timber.tag(TAG).d("Applied framerate reduction")
-        }
-    }
-
-    private fun restoreFramerate() {
-        if (isFramerateReduced) {
-            isFramerateReduced = false
-            activeActions.remove(ThrottleAction.REDUCE_FRAMERATE)
-            listeners.forEach { it.onThrottleAction(ThrottleAction.REDUCE_FRAMERATE, false) }
-            Timber.tag(TAG).d("Restored framerate")
-        }
-    }
-
-    private fun pauseStreaming(reason: String) {
-        if (!isStreamingPaused) {
-            isStreamingPaused = true
-            activeActions.add(ThrottleAction.PAUSE_STREAMING)
+    private fun setStreamingPaused(paused: Boolean) {
+        if (paused == isStreamingPaused) return
+        isStreamingPaused = paused
+        setActionActive(ThrottleAction.PAUSE_STREAMING, paused)
+        if (paused) {
+            val reason = pauseReason()
             onPauseStreaming?.invoke()
-            listeners.forEach {
-                it.onThrottleAction(ThrottleAction.PAUSE_STREAMING, true)
-                it.onEmergencyShutdown(reason)
-            }
+            listeners.forEach { it.onEmergencyShutdown(reason) }
             Timber.tag(TAG).w("Paused streaming: $reason")
-        }
-    }
-
-    private fun resumeStreaming() {
-        if (isStreamingPaused) {
-            isStreamingPaused = false
-            activeActions.remove(ThrottleAction.PAUSE_STREAMING)
+        } else {
             onResumeStreaming?.invoke()
-            listeners.forEach { it.onThrottleAction(ThrottleAction.PAUSE_STREAMING, false) }
             Timber.tag(TAG).i("Resumed streaming")
         }
     }
 
-    private fun disableCharging(reason: String) {
-        if (!isChargingDisabled) {
-            isChargingDisabled = true
-            activeActions.add(ThrottleAction.DISABLE_CHARGING)
-            batteryBypass?.disableCharging()
-            listeners.forEach { it.onThrottleAction(ThrottleAction.DISABLE_CHARGING, true) }
-            Timber.tag(TAG).d("Disabled charging: $reason")
+    /**
+     * Hold or release charging through the bypass's thermal hold. Releasing it never
+     * cancels a manual hold set through the API.
+     */
+    private fun setChargingHeld(held: Boolean) {
+        if (held == isChargingDisabled) return
+        isChargingDisabled = held
+        setActionActive(ThrottleAction.DISABLE_CHARGING, held)
+        if (held) {
+            batteryBypass?.disableChargingForThermal()
+            Timber.tag(TAG).d("Charging held: battery too warm")
+        } else {
+            batteryBypass?.releaseThermalHold()
+            Timber.tag(TAG).d("Charging hold released")
         }
     }
 
-    private fun enableCharging() {
-        if (isChargingDisabled) {
-            isChargingDisabled = false
-            activeActions.remove(ThrottleAction.DISABLE_CHARGING)
-            batteryBypass?.enableCharging()
-            listeners.forEach { it.onThrottleAction(ThrottleAction.DISABLE_CHARGING, false) }
-            Timber.tag(TAG).d("Enabled charging")
+    /** Keep [activeActions] in step and tell the listeners when an action turns on or off. */
+    private fun setActionActive(action: ThrottleAction, active: Boolean) {
+        val changed = if (active) activeActions.add(action) else activeActions.remove(action)
+        if (changed) {
+            listeners.forEach { it.onThrottleAction(action, active) }
         }
     }
 
-    private fun restoreAllSettings() {
-        restoreBitrate()
-        restoreResolution()
-        restoreFramerate()
-        enableCharging()
-        if (isStreamingPaused) {
-            resumeStreaming()
-        }
-        onRestoreSettings?.invoke()
-        Timber.tag(TAG).i("All settings restored")
+    private fun pauseReason(): String {
+        val cpuHot = _cpuLevel.value == ThermalLevel.EMERGENCY
+        val tempC = if (cpuHot) monitor.cpuTemperature.value else monitor.batteryTemperature.value
+        return String.format(Locale.US, "%s temperature critical: %.1f°C", if (cpuHot) "CPU" else "Battery", tempC)
     }
 
     // ==================== Status ====================

@@ -44,6 +44,8 @@
     <application
         android:name=".LensDaemonApp"
         android:allowBackup="true"
+        android:fullBackupContent="@xml/backup_rules"
+        android:dataExtractionRules="@xml/data_extraction_rules"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"
@@ -94,8 +96,6 @@
             android:name=".thermal.ThermalService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
-
-        <!-- AI Director Service: declared in app/src/full/AndroidManifest.xml (full variant only) -->
 
         <!-- Device Admin Receiver for Kiosk Mode -->
         <receiver

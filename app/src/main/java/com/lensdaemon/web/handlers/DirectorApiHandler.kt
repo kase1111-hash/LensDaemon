@@ -3,25 +3,23 @@ package com.lensdaemon.web.handlers
 import android.content.Context
 import com.lensdaemon.director.DirectorConfig
 import com.lensdaemon.director.DirectorManager
+import com.lensdaemon.director.DirectorState
 import com.lensdaemon.director.InferenceMode
+import com.lensdaemon.director.ParsedScript
 import com.lensdaemon.director.TakeQuality
 import com.lensdaemon.web.WebServer
 import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
 import org.json.JSONArray
 import org.json.JSONObject
 import timber.log.Timber
 import java.io.File
-import java.io.PipedInputStream
-import java.io.PipedOutputStream
 
 /**
  * Handles all /api/director/ routes including script file management and take-recording linking.
  *
  * Extracted from ApiRoutes to separate director API concerns into a dedicated handler.
+ * Refusals answer {"success": false, "error": reason}.
  */
 class DirectorApiHandler(
     private val context: Context
@@ -118,36 +116,28 @@ class DirectorApiHandler(
             """{"success": true, "message": "AI Director disabled (inert)", "state": "DISABLED"}""")
     }
 
+    /** The whole configuration, without the LLM settings (and their key). */
     private fun getDirectorConfig(): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
-        val status = director.getStatus()
-        val json = JSONObject().apply {
-            put("enabled", status.enabled)
-            put("inferenceMode", status.inferenceMode.name)
-            put("thermalProtectionActive", status.thermalProtectionActive)
-        }
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        val json = configJson(director.getConfig())
+            .put("enabled", director.isEnabled())
+            .put("thermalProtectionActive", director.getStatus().thermalProtectionActive)
+        return reply(Status.OK, json)
     }
 
+    /** A partial update: settings missing from the body keep their values, llmConfig included. */
     private fun updateDirectorConfig(body: JSONObject?): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
         body ?: return ApiHandlerUtils.bodyRequired()
-        val enabled = body.optBoolean("enabled", director.isEnabled())
-        val inferenceModeStr = body.optString("inferenceMode", "PRE_PARSED")
-        val inferenceMode = try { InferenceMode.valueOf(inferenceModeStr.uppercase()) } catch (e: Exception) { InferenceMode.PRE_PARSED }
-        val config = DirectorConfig(
-            enabled = enabled, inferenceMode = inferenceMode,
-            autoTakeSeparation = body.optBoolean("autoTakeSeparation", true),
-            qualityScoring = body.optBoolean("qualityScoring", true),
-            thermalAutoDisable = body.optBoolean("thermalAutoDisable", true),
-            thermalThresholdInference = body.optInt("thermalThresholdInference", 50),
-            thermalThresholdDisable = body.optInt("thermalThresholdDisable", 55),
-            defaultTransitionDurationMs = body.optLong("defaultTransitionDurationMs", 1000),
-            defaultHoldDurationMs = body.optLong("defaultHoldDurationMs", 2000)
-        )
-        director.updateConfig(config)
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Director configuration updated"}""")
+        val current = director.getConfig()
+        val modeName = body.optString("inferenceMode", current.inferenceMode.name).uppercase()
+        val mode = InferenceMode.entries.find { it.name == modeName }
+            ?: return failure(Status.BAD_REQUEST, "Unknown inferenceMode $modeName: use PRE_PARSED or OFF")
+        if (mode == InferenceMode.REMOTE) {
+            return failure(Status.BAD_REQUEST, "REMOTE inference is not available yet; use PRE_PARSED or OFF")
+        }
+        director.updateConfig(updatedConfig(current, body, director.isEnabled()).copy(inferenceMode = mode))
+        return reply(Status.OK, JSONObject().put("success", true).put("message", "Director configuration updated"))
     }
 
     private fun loadDirectorScript(body: JSONObject?): NanoHTTPD.Response {
@@ -158,29 +148,25 @@ class DirectorApiHandler(
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "script field is required"}""")
         }
         val result = director.loadScript(scriptText)
-        return if (result.isSuccess) {
-            val script = result.getOrNull()!!
-            val json = JSONObject().apply {
-                put("success", true)
-                put("message", "Script loaded successfully")
-                put("scenes", script.scenes.size)
-                put("totalCues", script.totalCues)
-                put("estimatedDuration", script.estimatedDurationFormatted)
-                put("errors", JSONArray().apply { script.errors.forEach { put(it) } })
-            }
-            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } else {
-            Timber.tag(TAG).w("Script load failed: ${result.exceptionOrNull()?.message}")
-            NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "Failed to parse script"}""")
-        }
+        val script = result.getOrNull() ?: return scriptRefused(director, result)
+        return reply(Status.OK, scriptJson(script).put("success", true).put("message", "Script loaded successfully"))
+    }
+
+    /** Why a script was not loaded: 409 while the director runs or is paused, else 400. */
+    private fun scriptRefused(director: DirectorManager, result: Result<ParsedScript>): NanoHTTPD.Response {
+        val state = director.state.value
+        val busy = state == DirectorState.RUNNING || state == DirectorState.PAUSED
+        val reason = result.exceptionOrNull()?.message ?: "Failed to parse script"
+        Timber.tag(TAG).w("Script not loaded: $reason")
+        return failure(if (busy) Status.CONFLICT else Status.BAD_REQUEST, reason)
     }
 
     private fun startDirector(): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
-        val success = director.startExecution()
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST, WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Execution started" else "Cannot start - check state and script"}"}""")
+        if (director.startExecution()) {
+            return reply(Status.OK, JSONObject().put("success", true).put("message", "Execution started"))
+        }
+        return startRefused(director, resuming = false)
     }
 
     private fun stopDirector(): NanoHTTPD.Response {
@@ -199,10 +185,28 @@ class DirectorApiHandler(
 
     private fun resumeDirector(): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
-        val success = director.resumeExecution()
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST, WebServer.MIME_JSON,
-            """{"success": $success, "message": "${if (success) "Execution resumed" else "Cannot resume - not paused"}"}""")
+        if (director.resumeExecution()) {
+            return reply(Status.OK, JSONObject().put("success", true).put("message", "Execution resumed"))
+        }
+        return startRefused(director, resuming = true)
+    }
+
+    /** Why the director did not start or resume: 409 while too hot (with the temperature) or running, else 400. */
+    private fun startRefused(director: DirectorManager, resuming: Boolean): NanoHTTPD.Response {
+        val state = director.state.value
+        return when {
+            state == DirectorState.THERMAL_HOLD -> {
+                val temperature = director.lastTemperature()
+                val reading = temperature?.let { " ($it°C)" } ?: ""
+                val message = "Too hot to run the director$reading; it can start again below ${director.thermalResumeTemperature()}°C"
+                reply(Status.CONFLICT, JSONObject().put("success", false).put("error", message).put("temperature", temperature))
+            }
+            state == DirectorState.DISABLED -> failure(Status.BAD_REQUEST, "The director is off")
+            director.currentSession.value == null -> failure(Status.BAD_REQUEST, "No script loaded")
+            state == DirectorState.RUNNING -> failure(Status.CONFLICT, "The director is already running")
+            resuming -> failure(Status.BAD_REQUEST, "Not paused")
+            else -> failure(Status.BAD_REQUEST, "Cannot start in state ${state.name}")
+        }
     }
 
     private fun executeDirectorCue(body: JSONObject?): NanoHTTPD.Response {
@@ -212,39 +216,40 @@ class DirectorApiHandler(
         if (cueText.isEmpty()) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "cue field is required"}""")
         }
-        val success = director.executeCueText(cueText)
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST, WebServer.MIME_JSON,
-            """{"success": $success, "cue": "$cueText"}""")
+        val json = JSONObject().put("cue", cueText)
+        if (director.executeCueText(cueText)) {
+            return reply(Status.OK, json.put("success", true))
+        }
+        val reason = if (director.isEnabled()) "Cue not recognised or could not be run" else "The director is off"
+        return reply(Status.BAD_REQUEST, json.put("success", false).put("error", reason))
     }
 
+    /** The next cue; while a script runs, it runs at once. */
     private fun advanceDirectorCue(): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
-        val nextCue = director.advanceCue()
-        val json = JSONObject().apply {
-            put("success", nextCue != null)
-            if (nextCue != null) {
-                put("cue", JSONObject().apply {
-                    put("type", nextCue.type.name)
-                    put("rawText", nextCue.rawText)
-                    put("lineNumber", nextCue.lineNumber)
-                })
-            } else { put("message", "No more cues") }
-        }
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
+        val nextCue = director.nextCue()
+            ?: return reply(Status.OK, JSONObject().put("success", false).put("message", "No more cues").put("error", "No more cues"))
+        val cue = JSONObject().put("type", nextCue.type.name).put("rawText", nextCue.rawText).put("lineNumber", nextCue.lineNumber)
+        return reply(Status.OK, JSONObject().put("success", true).put("cue", cue))
     }
 
+    /** Goes to a scene, given as "sceneIndex" (or "index"); while a script runs, the scene starts at once. */
     private fun jumpToScene(body: JSONObject?): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
         body ?: return ApiHandlerUtils.bodyRequired()
-        val sceneIndex = body.optInt("sceneIndex", -1)
+        val sceneIndex = body.optInt("sceneIndex", body.optInt("index", -1))
         if (sceneIndex < 0) {
-            return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "sceneIndex is required and must be >= 0"}""")
+            return failure(Status.BAD_REQUEST, "sceneIndex is required and must be >= 0")
         }
-        val success = director.jumpToScene(sceneIndex)
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.BAD_REQUEST, WebServer.MIME_JSON,
-            """{"success": $success, "sceneIndex": $sceneIndex}""")
+        if (director.goToScene(sceneIndex)) {
+            return reply(Status.OK, JSONObject().put("success", true).put("sceneIndex", sceneIndex))
+        }
+        val reason = when {
+            !director.isEnabled() -> "The director is off"
+            director.currentSession.value == null -> "No script loaded"
+            else -> "No scene $sceneIndex in the loaded script"
+        }
+        return reply(Status.BAD_REQUEST, JSONObject().put("success", false).put("sceneIndex", sceneIndex).put("error", reason))
     }
 
     // ---- Takes ----
@@ -286,11 +291,12 @@ class DirectorApiHandler(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /** Marks a take: {"takeNumber", "quality"} (or "mark" for the quality); 404 with an error for an unknown take. */
     private fun markTake(body: JSONObject?): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
         body ?: return ApiHandlerUtils.bodyRequired()
         val takeNumber = body.optInt("takeNumber", -1)
-        val qualityStr = body.optString("quality", "")
+        val qualityStr = body.optString("quality", "").ifEmpty { body.optString("mark", "") }
         val notes = body.optString("notes", "")
         if (takeNumber < 0) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "takeNumber is required"}""")
@@ -298,10 +304,11 @@ class DirectorApiHandler(
         val quality = try { TakeQuality.valueOf(qualityStr.uppercase()) } catch (e: Exception) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "Invalid quality. Use: UNMARKED, GOOD, BAD, CIRCLE, HOLD"}""")
         }
-        val success = director.getTakeManager().markTake(takeNumber, quality, notes)
-        return NanoHTTPD.newFixedLengthResponse(
-            if (success) Status.OK else Status.NOT_FOUND, WebServer.MIME_JSON,
-            """{"success": $success, "takeNumber": $takeNumber, "quality": "${quality.name}"}""")
+        val json = JSONObject().put("takeNumber", takeNumber).put("quality", quality.name)
+        if (!director.getTakeManager().markTake(takeNumber, quality, notes)) {
+            return reply(Status.NOT_FOUND, json.put("success", false).put("error", "Take $takeNumber not found"))
+        }
+        return reply(Status.OK, json.put("success", true))
     }
 
     private fun getBestTakes(): NanoHTTPD.Response {
@@ -367,9 +374,10 @@ class DirectorApiHandler(
         if (takeNumber < 0 || filePath.isEmpty()) {
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "takeNumber and filePath are required"}""")
         }
-        director.getTakeManager().linkTakeToFile(takeNumber, filePath)
-        return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "takeNumber": $takeNumber, "filePath": "$filePath"}""")
+        if (!director.getTakeManager().linkTakeToFile(takeNumber, filePath)) {
+            return failure(Status.NOT_FOUND, "Take $takeNumber not found")
+        }
+        return reply(Status.OK, JSONObject().put("success", true).put("takeNumber", takeNumber).put("filePath", filePath))
     }
 
     private fun getTakeMarkers(): NanoHTTPD.Response {
@@ -422,7 +430,7 @@ class DirectorApiHandler(
                 put("currentSceneIndex", session.currentSceneIndex)
                 put("currentCueIndex", session.currentCueIndex)
                 put("currentScene", session.currentScene?.label ?: "")
-                put("state", session.state.name)
+                put("state", director.state.value.name)
             }
             put("stats", JSONObject().apply {
                 put("totalTakes", stats.totalTakes)
@@ -437,85 +445,10 @@ class DirectorApiHandler(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /** Server-Sent Events: unnamed data frames whose JSON has a type (see [DirectorEventStream]). */
     private fun getDirectorEvents(): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
-
-        val pipedOutput = PipedOutputStream()
-        val pipedInput = PipedInputStream(pipedOutput)
-
-        CoroutineScope(Dispatchers.IO).launch {
-            try {
-                // Send initial state snapshot
-                val status = director.getStatus()
-                val initial = JSONObject().apply {
-                    put("type", "state")
-                    put("enabled", status.enabled)
-                    put("state", status.state.name)
-                    put("currentScene", status.currentScene ?: "")
-                    put("currentCue", status.currentCue ?: "")
-                    put("currentTake", status.takeNumber)
-                }
-                pipedOutput.write("data: $initial\n\n".toByteArray())
-                pipedOutput.flush()
-
-                // Collect ongoing events
-                director.events.collect { event ->
-                    val json = directorEventToJson(event)
-                    pipedOutput.write("data: $json\n\n".toByteArray())
-                    pipedOutput.flush()
-                }
-            } catch (e: Exception) {
-                Timber.tag(TAG).d("SSE client disconnected: ${e.message}")
-            } finally {
-                try { pipedOutput.close() } catch (_: Exception) {}
-            }
-        }
-
-        return NanoHTTPD.newChunkedResponse(Status.OK, "text/event-stream", pipedInput).apply {
-            addHeader("Cache-Control", "no-cache")
-            addHeader("Connection", "keep-alive")
-            addHeader("Access-Control-Allow-Origin", "*")
-        }
-    }
-
-    private fun directorEventToJson(event: DirectorManager.DirectorEvent): JSONObject {
-        return when (event) {
-            is DirectorManager.DirectorEvent.StateChanged -> JSONObject().apply {
-                put("type", "state_changed")
-                put("state", event.state.name)
-            }
-            is DirectorManager.DirectorEvent.ScriptLoaded -> JSONObject().apply {
-                put("type", "script_loaded")
-                put("scenes", event.script.scenes.size)
-                put("totalCues", event.script.totalCues)
-            }
-            is DirectorManager.DirectorEvent.CueExecuted -> JSONObject().apply {
-                put("type", "cue_executed")
-                put("cueType", event.cue.type.name)
-                put("cueText", event.cue.rawText)
-                put("success", event.success)
-            }
-            is DirectorManager.DirectorEvent.TakeStarted -> JSONObject().apply {
-                put("type", "take_started")
-                put("takeNumber", event.take.takeNumber)
-                put("sceneId", event.take.sceneId)
-            }
-            is DirectorManager.DirectorEvent.TakeEnded -> JSONObject().apply {
-                put("type", "take_ended")
-                put("takeNumber", event.take.takeNumber)
-                put("qualityScore", event.take.qualityScore)
-                put("durationMs", event.take.durationMs)
-            }
-            is DirectorManager.DirectorEvent.Error -> JSONObject().apply {
-                put("type", "error")
-                put("message", event.message)
-            }
-            is DirectorManager.DirectorEvent.ThermalWarning -> JSONObject().apply {
-                put("type", "thermal_warning")
-                put("temperature", event.temperature)
-                put("action", event.action)
-            }
-        }
+        return DirectorEventStream.response(director)
     }
 
     // ---- Script Management ----
@@ -571,6 +504,11 @@ class DirectorApiHandler(
         }
     }
 
+    /**
+     * Returns a saved script and loads it. Opening the file succeeds even when the director
+     * refuses the script (while it runs, say): "loaded" is then false and "loadError" says
+     * why, outside "error", which marks a failed request.
+     */
     private fun loadScriptFile(uri: String): NanoHTTPD.Response {
         val rawFileName = uri.removePrefix("/api/director/scripts/")
         if (rawFileName.isEmpty() || rawFileName == "save" || rawFileName == "export" || rawFileName == "import") {
@@ -587,18 +525,15 @@ class DirectorApiHandler(
         }
         return try {
             val content = file.readText()
-            val director = directorManager
-            val loadResult = director?.loadScript(content)
-            val json = JSONObject().apply {
-                put("success", true)
-                put("fileName", fileName)
-                put("content", content)
-                put("loaded", loadResult?.isSuccess ?: false)
-                if (loadResult?.isSuccess == true) {
-                    val script = loadResult.getOrNull()!!
-                    put("scenes", script.scenes.size)
-                    put("totalCues", script.totalCues)
-                }
+            val loadResult = directorManager?.loadScript(content)
+            val script = loadResult?.getOrNull()
+            val json = (script?.let(::scriptJson) ?: JSONObject())
+                .put("success", true)
+                .put("fileName", fileName)
+                .put("content", content)
+                .put("loaded", script != null)
+            if (script == null) {
+                json.put("loadError", loadResult?.exceptionOrNull()?.message ?: "Director service not available")
             }
             NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
         } catch (e: Exception) {
@@ -640,6 +575,7 @@ class DirectorApiHandler(
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /** Loads a script and, when asked and it loaded, saves it as a script file. */
     private fun importScript(body: JSONObject?): NanoHTTPD.Response {
         val director = directorManager ?: return ApiHandlerUtils.serviceUnavailable("Director service")
         body ?: return ApiHandlerUtils.bodyRequired()
@@ -650,8 +586,9 @@ class DirectorApiHandler(
             return NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"error": "script field is required"}""")
         }
         val result = director.loadScript(scriptText)
+        val script = result.getOrNull() ?: return scriptRefused(director, result)
         var saved = false
-        if (result.isSuccess && saveToFile && fileName.isNotEmpty()) {
+        if (saveToFile && fileName.isNotEmpty()) {
             val safeName = ApiHandlerUtils.sanitizeFileName(fileName)
             if (safeName != null) {
                 val scriptsDir = File(context.filesDir, "director_scripts")
@@ -664,23 +601,47 @@ class DirectorApiHandler(
                 }
             }
         }
-        return if (result.isSuccess) {
-            val script = result.getOrNull()!!
-            val json = JSONObject().apply {
-                put("success", true)
-                put("message", "Script imported")
-                put("scenes", script.scenes.size)
-                put("totalCues", script.totalCues)
-                put("saved", saved)
-            }
-            NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
-        } else {
-            Timber.tag(TAG).w("Script import failed: ${result.exceptionOrNull()?.message}")
-            NanoHTTPD.newFixedLengthResponse(Status.BAD_REQUEST, WebServer.MIME_JSON, """{"success": false, "error": "Failed to parse script"}""")
-        }
+        return reply(Status.OK, scriptJson(script).put("success", true).put("message", "Script imported").put("saved", saved))
     }
 
     companion object {
         private const val TAG = "DirectorApiHandler"
     }
 }
+
+private fun reply(status: Status, json: JSONObject): NanoHTTPD.Response =
+    ApiHandlerUtils.jsonResponse(status, json.toString())
+
+/** A refusal: {"success": false, "error": [message]}. */
+private fun failure(status: Status, message: String): NanoHTTPD.Response =
+    reply(status, JSONObject().put("success", false).put("error", message))
+
+/** A loaded script's summary, with the problems found in it. */
+private fun scriptJson(script: ParsedScript): JSONObject = JSONObject()
+    .put("scenes", script.scenes.size)
+    .put("totalCues", script.totalCues)
+    .put("estimatedDuration", script.estimatedDurationFormatted)
+    .put("errors", JSONArray(script.errors))
+
+/** The director settings GET /api/director/config shows: all but the LLM settings, whose key stays private. */
+private fun configJson(config: DirectorConfig): JSONObject = JSONObject()
+    .put("inferenceMode", config.inferenceMode.name)
+    .put("autoTakeSeparation", config.autoTakeSeparation)
+    .put("qualityScoring", config.qualityScoring)
+    .put("thermalAutoDisable", config.thermalAutoDisable)
+    .put("thermalThresholdInference", config.thermalThresholdInference)
+    .put("thermalThresholdDisable", config.thermalThresholdDisable)
+    .put("defaultTransitionDurationMs", config.defaultTransitionDurationMs)
+    .put("defaultHoldDurationMs", config.defaultHoldDurationMs)
+
+/** [current] with the settings [body] carries; the others (llmConfig among them) keep their values. */
+private fun updatedConfig(current: DirectorConfig, body: JSONObject, enabled: Boolean): DirectorConfig = current.copy(
+    enabled = body.optBoolean("enabled", enabled),
+    autoTakeSeparation = body.optBoolean("autoTakeSeparation", current.autoTakeSeparation),
+    qualityScoring = body.optBoolean("qualityScoring", current.qualityScoring),
+    thermalAutoDisable = body.optBoolean("thermalAutoDisable", current.thermalAutoDisable),
+    thermalThresholdInference = body.optInt("thermalThresholdInference", current.thermalThresholdInference),
+    thermalThresholdDisable = body.optInt("thermalThresholdDisable", current.thermalThresholdDisable),
+    defaultTransitionDurationMs = body.optLong("defaultTransitionDurationMs", current.defaultTransitionDurationMs),
+    defaultHoldDurationMs = body.optLong("defaultHoldDurationMs", current.defaultHoldDurationMs)
+)

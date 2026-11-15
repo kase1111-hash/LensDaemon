@@ -1,6 +1,7 @@
 package com.lensdaemon.director
 
 import timber.log.Timber
+import java.util.regex.Matcher
 import java.util.regex.Pattern
 
 /**
@@ -13,30 +14,42 @@ import java.util.regex.Pattern
  * - [TRANSITION: PUSH IN|PULL BACK] - {duration}
  * - [FOCUS: FACE|HANDS|OBJECT|BACKGROUND]
  * - [EXPOSURE: AUTO|BRIGHT|DARK|BACKLIT]
- * - [DOF: SHALLOW|DEEP|AUTO]
  * - [BEAT] or [HOLD: {seconds}]
  * - [TAKE: {number}]
  * - [CUT TO: shot]
+ *
+ * One cue per line, and the text inside a cue's brackets holds no other bracket. A scene
+ * marker without a label is "Untitled". [parseScript] reports what it could not use in
+ * [ParsedScript.errors]: bracketed lines that are not cues, unknown shot names (which become
+ * MEDIUM) and lines with more than one cue (only the first is used). Lines of plain prose
+ * are narration. Parsing takes time in proportion to the script's length.
  */
 class ScriptParser(
-    private val config: DirectorConfig = DirectorConfig.DEFAULT
+    config: DirectorConfig = DirectorConfig.DEFAULT
 ) {
     companion object {
         private const val TAG = "ScriptParser"
 
-        // Regex patterns for cue detection
+        /** At most this many problems are listed one by one; the rest are counted. */
+        private const val MAX_LISTED_PROBLEMS = 10
+
+        // Regex patterns for cue detection. Patterns with free text in the brackets read it
+        // with possessive quantifiers that stop at the next bracket, so matching a line takes
+        // time in proportion to its length: an unclosed cue followed by a long run of text or
+        // spaces can't make the matcher retry every way of splitting it.
         private val SCENE_PATTERN = Pattern.compile(
-            """\[SCENE[:\s]+(.+?)\]""",
+            """\[SCENE[:\s]++([^\[\]]*+)\]""",
             Pattern.CASE_INSENSITIVE
         )
 
+        // Any shot name (the text up to the bracket, trimmed): unknown ones are reported and become MEDIUM
         private val SHOT_PATTERN = Pattern.compile(
-            """\[SHOT[:\s]+(ESTABLISHING|WIDE|FULL[_\s]?SHOT|MEDIUM[_\s]?CLOSE|MEDIUM|CLOSE[_\s]?UP|EXTREME[_\s]?CLOSE[_\s]?UP|ECU|OVER[_\s]?SHOULDER|OTS)\]""",
+            """\[SHOT[:\s]++([^\[\]\s][^\[\]]*+)\]""",
             Pattern.CASE_INSENSITIVE
         )
 
         private val TRANSITION_PATTERN = Pattern.compile(
-            """\[TRANSITION[:\s]+(PUSH[_\s]?IN|PULL[_\s]?BACK|RACK[_\s]?FOCUS|CUT|HOLD)\](?:\s*-?\s*(\d+(?:\.\d+)?)\s*s?)?""",
+            """\[TRANSITION[:\s]+(PUSH[_\s]?IN|PULL[_\s]?BACK|RACK[_\s]?FOCUS|CUT|HOLD)\](?:\s*+-?\s*+(\d+(?:\.\d+)?)\s*s?)?""",
             Pattern.CASE_INSENSITIVE
         )
 
@@ -50,11 +63,6 @@ class ScriptParser(
             Pattern.CASE_INSENSITIVE
         )
 
-        private val DOF_PATTERN = Pattern.compile(
-            """\[DOF[:\s]+(SHALLOW|DEEP|AUTO)\]""",
-            Pattern.CASE_INSENSITIVE
-        )
-
         private val BEAT_PATTERN = Pattern.compile(
             """\[BEAT\]|\[HOLD[:\s]+(\d+(?:\.\d+)?)\s*s?\]""",
             Pattern.CASE_INSENSITIVE
@@ -65,10 +73,19 @@ class ScriptParser(
             Pattern.CASE_INSENSITIVE
         )
 
+        // Any shot name, as for SHOT
         private val CUT_TO_PATTERN = Pattern.compile(
-            """\[CUT\s+TO[:\s]+(WIDE|MEDIUM|CLOSE[_\s]?UP|ESTABLISHING|.+?)\]""",
+            """\[CUT\s++TO[:\s]++([^\[\]\s][^\[\]]*+)\]""",
             Pattern.CASE_INSENSITIVE
         )
+
+        /** The patterns of the cue types, for counting the cues on a line. */
+        private val CUE_PATTERNS = listOf(
+            SHOT_PATTERN, TRANSITION_PATTERN, FOCUS_PATTERN, EXPOSURE_PATTERN, BEAT_PATTERN, TAKE_PATTERN, CUT_TO_PATTERN
+        )
+
+        /** One bracketed part of a line, such as "[SHOT: WIDE]". */
+        private val BRACKETED = Pattern.compile("""\[[^\[\]]*\]""")
 
         // Shorthand patterns for natural language
         private val WIDE_SHOT_NATURAL = Pattern.compile(
@@ -87,14 +104,22 @@ class ScriptParser(
         )
     }
 
-    private val errors = mutableListOf<String>()
+    /**
+     * The settings in force (default transition and hold durations). [DirectorManager]
+     * replaces them when the director's configuration changes.
+     */
+    @Volatile
+    internal var config: DirectorConfig = config
+
+    /** The problems found by the last [parseScript]. */
+    @Volatile
+    private var lastErrors: List<String> = emptyList()
 
     /**
      * Parse a complete script into scenes and cues
      */
     fun parseScript(script: String): ParsedScript {
-        errors.clear()
-
+        val problems = ProblemList()
         val lines = script.lines()
         val scenes = mutableListOf<DirectorScene>()
         var currentScene: DirectorScene? = null
@@ -120,7 +145,7 @@ class ScriptParser(
 
                 // Start new scene
                 currentScene = DirectorScene(
-                    label = sceneMatcher.group(1)?.trim() ?: "Untitled",
+                    label = sceneMatcher.group(1)?.trim().orEmpty().ifEmpty { "Untitled" },
                     description = extractDescription(trimmedLine, sceneMatcher.end()),
                     startLine = lineNumber
                 )
@@ -138,6 +163,7 @@ class ScriptParser(
 
             // Parse cues from the line
             val cues = parseCuesFromLine(trimmedLine, lineNumber)
+            lineProblems(trimmedLine, lineNumber, cues).forEach(problems::add)
             currentCues.addAll(cues)
             totalCues += cues.size
 
@@ -170,14 +196,16 @@ class ScriptParser(
             ))
         }
 
-        Timber.tag(TAG).i("Parsed script: ${scenes.size} scenes, $totalCues cues")
+        val errors = problems.toList()
+        lastErrors = errors
+        Timber.tag(TAG).i("Parsed script: ${scenes.size} scenes, $totalCues cues, ${errors.size} problems")
 
         return ParsedScript(
             rawScript = script,
             scenes = scenes,
             totalCues = totalCues,
             estimatedDurationMs = estimatedDurationMs,
-            errors = errors.toList()
+            errors = errors
         )
     }
 
@@ -199,108 +227,85 @@ class ScriptParser(
     }
 
     /**
-     * Parse explicit cue format [CUE_TYPE: value]
+     * Parse explicit cue format [CUE_TYPE: value]: the first cue written on the line
      */
     private fun parseExplicitCue(line: String, lineNumber: Int): DirectorCue? {
-        // SHOT cue
-        val shotMatcher = SHOT_PATTERN.matcher(line)
-        if (shotMatcher.find()) {
-            val shotTypeStr = shotMatcher.group(1)?.uppercase()?.replace(" ", "_")?.replace("-", "_") ?: ""
-            val shotType = parseShotType(shotTypeStr)
-            return DirectorCue(
+        var first: Matcher? = null
+        for (pattern in CUE_PATTERNS) {
+            val matcher = pattern.matcher(line)
+            if (matcher.find() && (first == null || matcher.start() < first.start())) {
+                first = matcher
+            }
+        }
+        val found = first ?: return null
+
+        return when (found.pattern()) {
+            SHOT_PATTERN -> DirectorCue(
                 type = CueType.SHOT,
                 rawText = line,
-                shotType = shotType,
+                shotType = shotTypeOrNull(normalizeShotName(found.group(1) ?: "")) ?: ShotType.MEDIUM,
                 lineNumber = lineNumber,
-                notes = extractDescription(line, shotMatcher.end())
+                notes = extractDescription(line, found.end())
             )
-        }
-
-        // TRANSITION cue
-        val transitionMatcher = TRANSITION_PATTERN.matcher(line)
-        if (transitionMatcher.find()) {
-            val transitionStr = transitionMatcher.group(1)?.uppercase()?.replace(" ", "_") ?: ""
-            val durationStr = transitionMatcher.group(2)
-            val durationMs = if (durationStr != null) {
-                (durationStr.toFloatOrNull() ?: 1f) * 1000
-            } else {
-                config.defaultTransitionDurationMs.toFloat()
-            }
-
-            return DirectorCue(
-                type = CueType.TRANSITION,
-                rawText = line,
-                transitionType = parseTransitionType(transitionStr),
-                transitionDurationMs = durationMs.toLong(),
-                lineNumber = lineNumber,
-                notes = extractDescription(line, transitionMatcher.end())
-            )
-        }
-
-        // FOCUS cue
-        val focusMatcher = FOCUS_PATTERN.matcher(line)
-        if (focusMatcher.find()) {
-            val focusStr = focusMatcher.group(1)?.uppercase() ?: "AUTO"
-            return DirectorCue(
+            TRANSITION_PATTERN -> transitionCue(line, lineNumber, found)
+            FOCUS_PATTERN -> DirectorCue(
                 type = CueType.FOCUS,
                 rawText = line,
-                focusTarget = parseFocusTarget(focusStr),
+                focusTarget = parseFocusTarget(found.group(1)?.uppercase() ?: "AUTO"),
                 lineNumber = lineNumber
             )
-        }
-
-        // EXPOSURE cue
-        val exposureMatcher = EXPOSURE_PATTERN.matcher(line)
-        if (exposureMatcher.find()) {
-            val exposureStr = exposureMatcher.group(1)?.uppercase() ?: "AUTO"
-            return DirectorCue(
+            EXPOSURE_PATTERN -> DirectorCue(
                 type = CueType.EXPOSURE,
                 rawText = line,
-                exposurePreset = parseExposurePreset(exposureStr),
+                exposurePreset = parseExposurePreset(found.group(1)?.uppercase() ?: "AUTO"),
                 lineNumber = lineNumber
             )
-        }
-
-        // BEAT/HOLD cue
-        val beatMatcher = BEAT_PATTERN.matcher(line)
-        if (beatMatcher.find()) {
-            val holdSeconds = beatMatcher.group(1)?.toFloatOrNull() ?: 0f
-            return DirectorCue(
-                type = CueType.BEAT,
-                rawText = line,
-                holdDurationMs = if (holdSeconds > 0) (holdSeconds * 1000).toLong() else config.defaultHoldDurationMs,
-                lineNumber = lineNumber
-            )
-        }
-
-        // TAKE cue
-        val takeMatcher = TAKE_PATTERN.matcher(line)
-        if (takeMatcher.find()) {
-            val takeNum = takeMatcher.group(1)?.toIntOrNull() ?: 1
-            return DirectorCue(
+            BEAT_PATTERN -> {
+                // [BEAT], or [HOLD: seconds]
+                val holdSeconds = found.group(1)?.toFloatOrNull() ?: 0f
+                DirectorCue(
+                    type = CueType.BEAT,
+                    rawText = line,
+                    holdDurationMs = if (holdSeconds > 0) (holdSeconds * 1000).toLong() else config.defaultHoldDurationMs,
+                    lineNumber = lineNumber
+                )
+            }
+            TAKE_PATTERN -> DirectorCue(
                 type = CueType.TAKE,
                 rawText = line,
-                takeNumber = takeNum,
+                takeNumber = found.group(1)?.toIntOrNull() ?: 1,
                 lineNumber = lineNumber
             )
-        }
-
-        // CUT TO cue
-        val cutMatcher = CUT_TO_PATTERN.matcher(line)
-        if (cutMatcher.find()) {
-            val targetShot = cutMatcher.group(1)?.uppercase()?.replace(" ", "_") ?: "WIDE"
-            val shotType = parseShotType(targetShot)
-            return DirectorCue(
+            // CUT TO
+            else -> DirectorCue(
                 type = CueType.CUT,
                 rawText = line,
-                shotType = shotType,
+                shotType = shotTypeOrNull(normalizeShotName(found.group(1) ?: "")) ?: ShotType.MEDIUM,
                 transitionType = TransitionType.CUT,
                 transitionDurationMs = 0,
                 lineNumber = lineNumber
             )
         }
+    }
 
-        return null
+    /** A TRANSITION cue, with the duration written after it ("- 2s") or the default one. */
+    private fun transitionCue(line: String, lineNumber: Int, matcher: Matcher): DirectorCue {
+        val transitionStr = matcher.group(1)?.uppercase()?.replace(" ", "_") ?: ""
+        val durationStr = matcher.group(2)
+        val durationMs = if (durationStr != null) {
+            (durationStr.toFloatOrNull() ?: 1f) * 1000
+        } else {
+            config.defaultTransitionDurationMs.toFloat()
+        }
+
+        return DirectorCue(
+            type = CueType.TRANSITION,
+            rawText = line,
+            transitionType = parseTransitionType(transitionStr),
+            transitionDurationMs = durationMs.toLong(),
+            lineNumber = lineNumber,
+            notes = extractDescription(line, matcher.end())
+        )
     }
 
     /**
@@ -344,9 +349,55 @@ class ScriptParser(
     }
 
     /**
-     * Parse shot type string to enum
+     * The problems with one script line, numbered from 1 as an editor shows them: a
+     * bracketed line that is not a cue, an unknown shot name, or more than one cue.
      */
-    private fun parseShotType(str: String): ShotType {
+    private fun lineProblems(line: String, lineNumber: Int, cues: List<DirectorCue>): List<String> {
+        val shownLine = lineNumber + 1
+        val cue = cues.firstOrNull()
+            ?: return if (line.startsWith("[")) listOf("Line $shownLine: not a cue: $line") else emptyList()
+        val problems = mutableListOf<String>()
+        unknownShotName(line, cue)?.let { problems.add("Line $shownLine: unknown shot $it, using MEDIUM") }
+        if (explicitCueCount(line) > 1) {
+            problems.add("Line $shownLine: only the first cue on a line is used")
+        }
+        return problems
+    }
+
+    /** The shot name a [SHOT] or [CUT TO] cue on [line] asked for, when the director doesn't know it. */
+    private fun unknownShotName(line: String, cue: DirectorCue): String? {
+        val pattern = when (cue.type) {
+            CueType.SHOT -> SHOT_PATTERN
+            CueType.CUT -> CUT_TO_PATTERN
+            else -> return null
+        }
+        val matcher = pattern.matcher(line)
+        // A shot found in plain words has no bracketed name
+        if (!matcher.find()) return null
+        val name = matcher.group(1)?.trim() ?: return null
+        if (shotTypeOrNull(normalizeShotName(name)) != null) return null
+        return name.ifEmpty { "(none)" }
+    }
+
+    /** How many bracketed cues [line] holds. */
+    private fun explicitCueCount(line: String): Int {
+        val matcher = BRACKETED.matcher(line)
+        var count = 0
+        while (matcher.find()) {
+            val part = matcher.group()
+            if (CUE_PATTERNS.any { it.matcher(part).find() }) count++
+        }
+        return count
+    }
+
+    /** A shot name as [shotTypeOrNull] reads it: upper case, with underscores for spaces and hyphens. */
+    private fun normalizeShotName(name: String): String =
+        name.trim().uppercase().replace(" ", "_").replace("-", "_")
+
+    /**
+     * Parse shot type string to enum; null for a name the director doesn't know
+     */
+    private fun shotTypeOrNull(str: String): ShotType? {
         return when {
             str.contains("ESTABLISHING") -> ShotType.ESTABLISHING
             str.contains("EXTREME") || str == "ECU" -> ShotType.EXTREME_CLOSE
@@ -356,7 +407,7 @@ class ScriptParser(
             str.contains("FULL") -> ShotType.FULL_SHOT
             str.contains("OVER") || str == "OTS" -> ShotType.OVER_SHOULDER
             str.contains("WIDE") -> ShotType.WIDE
-            else -> ShotType.MEDIUM
+            else -> null
         }
     }
 
@@ -445,5 +496,21 @@ class ScriptParser(
     /**
      * Get parsing errors from last parse operation
      */
-    fun getErrors(): List<String> = errors.toList()
+    fun getErrors(): List<String> = lastErrors
+
+    /** Problems of one parse: the first [MAX_LISTED_PROBLEMS] are listed, the rest counted. */
+    private class ProblemList {
+        private val listed = mutableListOf<String>()
+        private var unlisted = 0
+
+        fun add(problem: String) {
+            if (listed.size < MAX_LISTED_PROBLEMS) listed.add(problem) else unlisted++
+        }
+
+        fun toList(): List<String> = when (unlisted) {
+            0 -> listed.toList()
+            1 -> listed + "1 more problem not listed"
+            else -> listed + "$unlisted more problems not listed"
+        }
+    }
 }

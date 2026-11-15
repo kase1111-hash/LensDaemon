@@ -29,12 +29,18 @@ import timber.log.Timber
 /**
  * Screen Controller
  *
- * Manages screen state for kiosk mode:
- * - Screen off (using Device Admin)
+ * Manages screen state for kiosk mode. [KioskActivityController] uses it while
+ * the phone is pinned:
  * - Screen dimming (brightness control)
  * - Black overlay (display on but showing black)
- * - Auto-off timeout
- * - Wake on activity
+ * - Preview: normal brightness, no overlay
+ *
+ * Also here, but not used by kiosk mode:
+ * - Screen off, which locks the phone through Device Admin. Kiosk mode leaves
+ *   the display to the phone's own screen timeout instead, so the Vol Up +
+ *   Vol Down exit stays within reach.
+ * - The auto-off timer is not wired: when it runs out it only logs. Kiosk
+ *   mode configures autoOffTimeoutSec = 0, so it never starts.
  */
 class ScreenController(
     private val context: Context
@@ -351,10 +357,8 @@ class ScreenController(
                 val timeoutMs = config.autoOffTimeoutSec * 1000L
 
                 if (elapsed >= timeoutMs && _currentMode.value != ScreenMode.OFF) {
+                    // Not wired: nothing turns the screen off from here (see the class notes)
                     Timber.tag(TAG).d("Auto-off timeout reached")
-                    // Request screen off via event
-                    // Note: Activity reference would be needed here
-                    // This would typically trigger an event to KioskManager
                     break
                 }
             }

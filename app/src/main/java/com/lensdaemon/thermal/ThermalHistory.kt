@@ -9,6 +9,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
@@ -18,14 +19,31 @@ import java.io.File
 import java.util.concurrent.ConcurrentLinkedDeque
 
 /**
+ * Time spent at each level over [entries] (oldest first). Each step between two entries
+ * counts for the later entry's level, the higher of CPU and battery. A step counts for at
+ * most [maxStepMs], so a gap in the history (the app wasn't running) doesn't add the
+ * downtime to the level the first entry after it shows; a step backwards (clock change)
+ * counts for nothing.
+ */
+internal fun timeAtLevels(entries: List<ThermalHistoryEntry>, maxStepMs: Long): Map<ThermalLevel, Long> {
+    val totals = mutableMapOf<ThermalLevel, Long>()
+    for (i in 1 until entries.size) {
+        val step = (entries[i].timestamp - entries[i - 1].timestamp).coerceIn(0L, maxStepMs.coerceAtLeast(0L))
+        val level = maxOf(entries[i].cpuLevel, entries[i].batteryLevel)
+        totals[level] = (totals[level] ?: 0L) + step
+    }
+    return totals
+}
+
+/**
  * Thermal history tracker
  *
  * Records temperature history for analysis and dashboard display:
  * - 24-hour rolling history
- * - Minute-by-minute granularity
- * - Event logging for thermal state changes
+ * - Minute-by-minute granularity, with the levels the governor uses ([levelSource])
+ * - Event log of the governor's level changes ([recordEvent] is called by the governor only)
  * - Statistics calculation
- * - Persistence across app restarts
+ * - Persistence across app restarts: saved every 10 entries and when released
  */
 class ThermalHistory(
     private val context: Context,
@@ -37,6 +55,10 @@ class ThermalHistory(
         private const val EVENTS_FILE = "thermal_events.json"
         private const val MAX_HISTORY_ENTRIES = 1440  // 24 hours at 1 per minute
         private const val MAX_EVENT_ENTRIES = 500
+        private const val SAVE_EVERY_ENTRIES = 10  // About every 10 minutes
+
+        // Time-in-state counts a step between entries for at most this many intervals
+        private const val MAX_STEP_INTERVALS = 2
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
@@ -47,9 +69,8 @@ class ThermalHistory(
     private val events = ConcurrentLinkedDeque<ThermalEvent>()
     private val mutex = Mutex()
 
-    // Current thermal state for tracking state changes
-    private var lastCpuLevel = ThermalLevel.NORMAL
-    private var lastBatteryLevel = ThermalLevel.NORMAL
+    // Serialises file writes (the periodic save, stopRecording and release can overlap)
+    private val fileLock = Any()
 
     // Statistics
     private var statsStartTime = System.currentTimeMillis()
@@ -57,9 +78,17 @@ class ThermalHistory(
     // Temperature monitor reference
     private var monitor: ThermalMonitor? = null
 
-    init {
-        loadHistory()
-    }
+    /**
+     * The governor's current CPU and battery levels, recorded with each entry so the
+     * history matches the throttling. Without it, levels are worked out from [config]
+     * without hysteresis.
+     */
+    @Volatile
+    var levelSource: (() -> Pair<ThermalLevel, ThermalLevel>)? = null
+
+    // Loads the saved history; recording and saving wait for it, so a late load can't
+    // replace new entries and a save can't write a half-loaded history
+    private val loadJob: Job = loadHistory()
 
     /**
      * Set the thermal monitor to read from
@@ -80,9 +109,15 @@ class ThermalHistory(
         statsStartTime = System.currentTimeMillis()
 
         recordJob = scope.launch {
+            loadJob.join()
+            var sinceSave = 0
             while (isActive) {
                 try {
-                    recordCurrentState()
+                    if (recordCurrentState()) sinceSave++
+                    if (sinceSave >= SAVE_EVERY_ENTRIES) {
+                        sinceSave = 0
+                        saveFiles()
+                    }
                 } catch (e: Exception) {
                     Timber.tag(TAG).e(e, "Error recording thermal history")
                 }
@@ -102,23 +137,36 @@ class ThermalHistory(
     }
 
     /**
-     * Release resources
+     * Release resources. Saves the history and events before returning: this blocks the
+     * caller for two small file writes. Nothing is saved while the saved history is still
+     * loading, since there is nothing new to keep yet and a save would cut the file short.
      */
     fun release() {
-        stopRecording()
+        recordJob?.cancel()
+        recordJob = null
+        if (loadJob.isCompleted) {
+            try {
+                runBlocking(Dispatchers.IO) { saveFiles() }
+            } catch (e: Exception) {
+                Timber.tag(TAG).e(e, "Error saving thermal history on release")
+            }
+        }
         scope.cancel()
     }
 
     /**
      * Record current thermal state
+     *
+     * @return true when an entry was added
      */
-    private suspend fun recordCurrentState() {
-        val mon = monitor ?: return
+    private suspend fun recordCurrentState(): Boolean {
+        val mon = monitor ?: return false
 
         val cpuTemp = mon.cpuTemperature.value
         val batteryTemp = mon.batteryTemperature.value
-        val cpuLevel = calculateLevel(cpuTemp, config.cpuConfig.getThresholds())
-        val batteryLevel = calculateLevel(batteryTemp, config.batteryConfig.getThresholds())
+        val (cpuLevel, batteryLevel) = levelSource?.invoke()
+            ?: (calculateLevel(cpuTemp, config.cpuConfig.getThresholds()) to
+                calculateLevel(batteryTemp, config.batteryConfig.getThresholds()))
 
         val entry = ThermalHistoryEntry(
             timestamp = System.currentTimeMillis(),
@@ -136,16 +184,12 @@ class ThermalHistory(
                 history.removeFirst()
             }
         }
-
-        // Check for level changes and record events
-        checkLevelChanges(cpuTemp, batteryTemp, cpuLevel, batteryLevel)
-
-        lastCpuLevel = cpuLevel
-        lastBatteryLevel = batteryLevel
+        return true
     }
 
     /**
-     * Calculate thermal level from temperature
+     * Calculate thermal level from temperature, without hysteresis (fallback when no
+     * [levelSource] is set)
      */
     private fun calculateLevel(tempC: Float, thresholds: List<ThermalThreshold>): ThermalLevel {
         var level = ThermalLevel.NORMAL
@@ -158,35 +202,7 @@ class ThermalHistory(
     }
 
     /**
-     * Check for thermal level changes and record events
-     */
-    private suspend fun checkLevelChanges(
-        cpuTemp: Float,
-        batteryTemp: Float,
-        cpuLevel: ThermalLevel,
-        batteryLevel: ThermalLevel
-    ) {
-        if (cpuLevel != lastCpuLevel) {
-            recordEvent(
-                source = ThermalSource.CPU,
-                oldLevel = lastCpuLevel,
-                newLevel = cpuLevel,
-                temperature = cpuTemp
-            )
-        }
-
-        if (batteryLevel != lastBatteryLevel) {
-            recordEvent(
-                source = ThermalSource.BATTERY,
-                oldLevel = lastBatteryLevel,
-                newLevel = batteryLevel,
-                temperature = batteryTemp
-            )
-        }
-    }
-
-    /**
-     * Record a thermal event
+     * Record a thermal event (the governor calls this for each level change)
      */
     suspend fun recordEvent(
         source: ThermalSource,
@@ -246,7 +262,9 @@ class ThermalHistory(
     }
 
     /**
-     * Calculate statistics for a time period
+     * Calculate statistics for a time period. Time at WARNING, CRITICAL and EMERGENCY
+     * counts each step between entries for at most two recording intervals, so time the
+     * app wasn't running (the history survives restarts) isn't counted.
      */
     fun getStats(lastHours: Int = 24): ThermalStats {
         val historyList = getHistory(lastHours)
@@ -271,21 +289,7 @@ class ThermalHistory(
         val batteryTemps = historyList.map { it.batteryTemperatureC }
 
         // Calculate time in each state
-        var warningTime = 0L
-        var criticalTime = 0L
-        var emergencyTime = 0L
-
-        for (i in 1 until historyList.size) {
-            val duration = historyList[i].timestamp - historyList[i - 1].timestamp
-            val level = maxOf(historyList[i].cpuLevel, historyList[i].batteryLevel)
-
-            when (level) {
-                ThermalLevel.WARNING -> warningTime += duration
-                ThermalLevel.CRITICAL -> criticalTime += duration
-                ThermalLevel.EMERGENCY -> emergencyTime += duration
-                else -> {}
-            }
-        }
+        val timeAtLevel = timeAtLevels(historyList, config.historyIntervalMs * MAX_STEP_INTERVALS)
 
         val eventList = getEvents(lastHours)
         val throttleEvents = eventList.count {
@@ -301,9 +305,9 @@ class ThermalHistory(
             batteryTempMin = batteryTemps.minOrNull() ?: 0f,
             batteryTempMax = batteryTemps.maxOrNull() ?: 0f,
             batteryTempAvg = batteryTemps.average().toFloat(),
-            timeInWarningMs = warningTime,
-            timeInCriticalMs = criticalTime,
-            timeInEmergencyMs = emergencyTime,
+            timeInWarningMs = timeAtLevel[ThermalLevel.WARNING] ?: 0L,
+            timeInCriticalMs = timeAtLevel[ThermalLevel.CRITICAL] ?: 0L,
+            timeInEmergencyMs = timeAtLevel[ThermalLevel.EMERGENCY] ?: 0L,
             throttleEventCount = throttleEvents
         )
     }
@@ -320,14 +324,13 @@ class ThermalHistory(
     }
 
     /**
-     * Save history to disk
+     * Save history to disk in the background (once the saved history has been loaded)
      */
     private fun saveHistory() {
         scope.launch {
+            loadJob.join()
             try {
-                saveHistoryFile()
-                saveEventsFile()
-                Timber.tag(TAG).d("Thermal history saved")
+                saveFiles()
             } catch (e: Exception) {
                 Timber.tag(TAG).e(e, "Error saving thermal history")
             }
@@ -335,22 +338,32 @@ class ThermalHistory(
     }
 
     /**
+     * Write the history and events files. Works on snapshots of the concurrent deques, so
+     * it needs no coroutine lock and can run from [release] while the caller is blocked.
+     */
+    private fun saveFiles() {
+        synchronized(fileLock) {
+            saveHistoryFile()
+            saveEventsFile()
+        }
+        Timber.tag(TAG).d("Thermal history saved")
+    }
+
+    /**
      * Save history entries to file
      */
-    private suspend fun saveHistoryFile() {
+    private fun saveHistoryFile() {
         val file = File(context.filesDir, HISTORY_FILE)
         val json = JSONArray()
 
-        mutex.withLock {
-            history.forEach { entry ->
-                json.put(JSONObject().apply {
-                    put("timestamp", entry.timestamp)
-                    put("cpuTemp", entry.cpuTemperatureC)
-                    put("batteryTemp", entry.batteryTemperatureC)
-                    put("cpuLevel", entry.cpuLevel.name)
-                    put("batteryLevel", entry.batteryLevel.name)
-                })
-            }
+        history.toList().forEach { entry ->
+            json.put(JSONObject().apply {
+                put("timestamp", entry.timestamp)
+                put("cpuTemp", entry.cpuTemperatureC)
+                put("batteryTemp", entry.batteryTemperatureC)
+                put("cpuLevel", entry.cpuLevel.name)
+                put("batteryLevel", entry.batteryLevel.name)
+            })
         }
 
         file.writeText(json.toString())
@@ -359,23 +372,21 @@ class ThermalHistory(
     /**
      * Save events to file
      */
-    private suspend fun saveEventsFile() {
+    private fun saveEventsFile() {
         val file = File(context.filesDir, EVENTS_FILE)
         val json = JSONArray()
 
-        mutex.withLock {
-            events.forEach { event ->
-                json.put(JSONObject().apply {
-                    put("timestamp", event.timestamp)
-                    put("source", event.source.name)
-                    put("oldLevel", event.oldLevel.name)
-                    put("newLevel", event.newLevel.name)
-                    put("temperature", event.temperatureC)
-                    put("actions", JSONArray().apply {
-                        event.actionsTriggered.forEach { put(it.name) }
-                    })
+        events.toList().forEach { event ->
+            json.put(JSONObject().apply {
+                put("timestamp", event.timestamp)
+                put("source", event.source.name)
+                put("oldLevel", event.oldLevel.name)
+                put("newLevel", event.newLevel.name)
+                put("temperature", event.temperatureC)
+                put("actions", JSONArray().apply {
+                    event.actionsTriggered.forEach { put(it.name) }
                 })
-            }
+            })
         }
 
         file.writeText(json.toString())
@@ -384,15 +395,13 @@ class ThermalHistory(
     /**
      * Load history from disk
      */
-    private fun loadHistory() {
-        scope.launch {
-            try {
-                loadHistoryFile()
-                loadEventsFile()
-                Timber.tag(TAG).d("Thermal history loaded: ${history.size} entries, ${events.size} events")
-            } catch (e: Exception) {
-                Timber.tag(TAG).e(e, "Error loading thermal history")
-            }
+    private fun loadHistory(): Job = scope.launch {
+        try {
+            loadHistoryFile()
+            loadEventsFile()
+            Timber.tag(TAG).d("Thermal history loaded: ${history.size} entries, ${events.size} events")
+        } catch (e: Exception) {
+            Timber.tag(TAG).e(e, "Error loading thermal history")
         }
     }
 
@@ -426,7 +435,8 @@ class ThermalHistory(
     }
 
     /**
-     * Load events from file
+     * Load events from file. Events the governor logged while the file was loading are
+     * kept, after the saved ones.
      */
     private suspend fun loadEventsFile() {
         val file = File(context.filesDir, EVENTS_FILE)
@@ -434,28 +444,33 @@ class ThermalHistory(
 
         val json = JSONArray(file.readText())
         val cutoff = System.currentTimeMillis() - (config.historyRetentionHours * 60 * 60 * 1000L)
+        val loaded = mutableListOf<ThermalEvent>()
+
+        for (i in 0 until json.length()) {
+            val obj = json.getJSONObject(i)
+            val timestamp = obj.getLong("timestamp")
+
+            if (timestamp >= cutoff) {
+                val actionsJson = obj.getJSONArray("actions")
+                val actions = (0 until actionsJson.length()).map {
+                    ThrottleAction.valueOf(actionsJson.getString(it))
+                }
+
+                loaded.add(ThermalEvent(
+                    timestamp = timestamp,
+                    source = ThermalSource.valueOf(obj.getString("source")),
+                    oldLevel = ThermalLevel.valueOf(obj.getString("oldLevel")),
+                    newLevel = ThermalLevel.valueOf(obj.getString("newLevel")),
+                    temperatureC = obj.getDouble("temperature").toFloat(),
+                    actionsTriggered = actions
+                ))
+            }
+        }
 
         mutex.withLock {
-            events.clear()
-            for (i in 0 until json.length()) {
-                val obj = json.getJSONObject(i)
-                val timestamp = obj.getLong("timestamp")
-
-                if (timestamp >= cutoff) {
-                    val actionsJson = obj.getJSONArray("actions")
-                    val actions = (0 until actionsJson.length()).map {
-                        ThrottleAction.valueOf(actionsJson.getString(it))
-                    }
-
-                    events.addLast(ThermalEvent(
-                        timestamp = timestamp,
-                        source = ThermalSource.valueOf(obj.getString("source")),
-                        oldLevel = ThermalLevel.valueOf(obj.getString("oldLevel")),
-                        newLevel = ThermalLevel.valueOf(obj.getString("newLevel")),
-                        temperatureC = obj.getDouble("temperature").toFloat(),
-                        actionsTriggered = actions
-                    ))
-                }
+            loaded.asReversed().forEach { events.addFirst(it) }
+            while (events.size > MAX_EVENT_ENTRIES) {
+                events.removeFirst()
             }
         }
     }

@@ -46,6 +46,23 @@ header h1 {
     color: var(--primary-color);
 }
 
+.header-actions {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+}
+
+.header-link {
+    color: var(--primary-color);
+    text-decoration: none;
+    font-size: 0.9rem;
+    white-space: nowrap;
+}
+
+.header-link:hover {
+    text-decoration: underline;
+}
+
 .status-indicator {
     padding: 8px 16px;
     border-radius: 20px;
@@ -63,31 +80,40 @@ header h1 {
     color: white;
 }
 
-/* Main Layout */
+/* Main Layout: two columns that stack their cards independently, then
+   full-width rows; one column on narrow screens */
 main {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 20px;
+    align-items: start;
+}
+
+.column {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+    min-width: 0;
+}
+
+.wide,
+.director-section {
+    grid-column: 1 / -1;
 }
 
 @media (max-width: 900px) {
     main {
-        grid-template-columns: 1fr;
+        grid-template-columns: minmax(0, 1fr);
     }
 }
 
 /* Preview Section */
-.preview-section {
-    grid-column: 1 / -1;
-}
-
 .preview-container {
     position: relative;
     background-color: #000;
     border-radius: 8px;
     overflow: hidden;
     aspect-ratio: 16 / 9;
-    max-height: 400px;
 }
 
 .preview-image {
@@ -125,15 +151,18 @@ main {
     margin-top: 15px;
 }
 
-/* Control Groups */
+/* Cards */
+.card,
 .control-group,
 .settings-section,
 .stats-section {
     background-color: var(--card-bg);
     border-radius: 8px;
     padding: 20px;
+    min-width: 0;
 }
 
+.card h3,
 .control-group h3,
 .settings-section h3,
 .stats-section h3 {
@@ -142,6 +171,46 @@ main {
     margin-bottom: 15px;
     text-transform: uppercase;
     letter-spacing: 1px;
+}
+
+.card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    margin-bottom: 15px;
+}
+
+.card-header h3 {
+    margin-bottom: 0;
+}
+
+.field-label {
+    display: block;
+    font-size: 0.85rem;
+    color: var(--text-muted);
+    margin: 14px 0 8px;
+}
+
+.field-label:first-of-type {
+    margin-top: 0;
+}
+
+.detail-line {
+    font-size: 0.85rem;
+    color: var(--text-color);
+    margin-bottom: 8px;
+    overflow-wrap: anywhere;
+}
+
+.detail-line:empty {
+    display: none;
+}
+
+.muted {
+    color: var(--text-muted);
+    font-size: 0.85rem;
 }
 
 /* Buttons */
@@ -198,21 +267,46 @@ main {
 
 .button-group {
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
     margin-top: 10px;
+}
+
+.button-group.tight {
+    margin-top: 0;
+    gap: 8px;
+}
+
+a.btn {
+    display: inline-block;
+    text-decoration: none;
+    text-align: center;
+}
+
+.btn-sm {
+    padding: 7px 14px;
+    font-size: 0.85rem;
 }
 
 /* Lens Buttons */
 .lens-buttons {
     display: flex;
+    flex-wrap: wrap;
     gap: 10px;
 }
 
 .btn-lens {
     flex: 1;
+    min-width: 90px;
     background-color: var(--border-color);
     color: var(--text-color);
     padding: 12px;
+}
+
+.btn-lens .lens-factor {
+    display: block;
+    font-size: 0.75rem;
+    opacity: 0.75;
 }
 
 .btn-lens.active {
@@ -241,6 +335,14 @@ main {
 }
 
 .status-text.stopped {
+    color: var(--danger-color);
+}
+
+.status-text.paused {
+    color: var(--warning-color);
+}
+
+.status-text.error {
     color: var(--danger-color);
 }
 
@@ -273,6 +375,7 @@ main {
 .checkbox-row input {
     width: 18px;
     height: 18px;
+    flex-shrink: 0;
     accent-color: var(--primary-color);
 }
 
@@ -281,6 +384,11 @@ main {
     grid-template-columns: 2fr 1fr;
     gap: 10px;
     margin-bottom: 10px;
+}
+
+.inline-field {
+    margin: 4px 0 6px;
+    max-width: 260px;
 }
 
 .rtsp-link:hover {
@@ -324,7 +432,7 @@ input[type="range"]::-moz-range-thumb {
 
 #zoom-value,
 #exposure-value {
-    min-width: 60px;
+    min-width: 70px;
     text-align: right;
     font-weight: 500;
 }
@@ -340,6 +448,15 @@ input[type="range"]::-moz-range-thumb {
     .settings-form {
         grid-template-columns: 1fr;
     }
+}
+
+.config-block .settings-form {
+    margin-top: 12px;
+}
+
+/* A note under a settings form, before its buttons */
+.stream-hint.form-note {
+    margin: 10px 0 0;
 }
 
 .form-group {
@@ -367,6 +484,11 @@ input[type="range"]::-moz-range-thumb {
 .form-group input:focus {
     outline: none;
     border-color: var(--primary-color);
+}
+
+.form-group input:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* Stats Grid */
@@ -397,6 +519,12 @@ input[type="range"]::-moz-range-thumb {
     font-size: 1.5rem;
     font-weight: 600;
     color: var(--primary-color);
+}
+
+/* The encoder state carries its settings ("ENCODING 1920x1080@30 H264") */
+#stat-encoder {
+    font-size: 1rem;
+    line-height: 1.4;
 }
 
 /* Footer */
@@ -543,7 +671,9 @@ input:checked + .toggle-slider:before {
 .state-ready { color: var(--primary-color); }
 .state-running { color: var(--success-color); }
 .state-paused { color: var(--warning-color); }
-.state-thermal { color: var(--danger-color); }
+.state-thermal,
+.state-thermal-hold { color: var(--danger-color); }
+.state-parsing { color: var(--primary-color); }
 
 /* Script Input */
 .script-input {
@@ -592,6 +722,8 @@ input:checked + .toggle-slider:before {
     display: flex;
     gap: 10px;
     flex-wrap: wrap;
+    align-items: flex-start;
+    align-content: flex-start;
 }
 
 .btn-warning {
@@ -930,4 +1062,410 @@ input:checked + .toggle-slider:before {
     color: var(--success-color);
     font-weight: 500;
     margin-left: 4px;
+}
+
+/* ==================== Notices ==================== */
+
+.toast-area {
+    position: fixed;
+    right: 16px;
+    bottom: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 100;
+    max-width: min(420px, calc(100vw - 32px));
+}
+
+.toast {
+    background-color: #24305a;
+    border-left: 4px solid var(--primary-color);
+    color: var(--text-color);
+    padding: 10px 14px;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    overflow-wrap: anywhere;
+}
+
+.toast.success { border-left-color: var(--success-color); }
+.toast.error { border-left-color: var(--danger-color); }
+
+/* ==================== Meters (temperature, storage) ==================== */
+
+.meter-row {
+    display: grid;
+    grid-template-columns: 64px minmax(0, 1fr) 56px auto;
+    align-items: center;
+    gap: 10px;
+    margin-bottom: 10px;
+    font-size: 0.9rem;
+}
+
+.meter {
+    height: 8px;
+    background-color: var(--bg-color);
+    border-radius: 4px;
+    overflow: hidden;
+}
+
+.meter-fill {
+    height: 100%;
+    width: 0;
+    border-radius: 4px;
+    background-color: var(--success-color);
+    transition: width 0.5s, background-color 0.5s;
+}
+
+.meter-fill.warning { background-color: var(--warning-color); }
+.meter-fill.critical { background-color: var(--danger-color); }
+
+.meter-value {
+    text-align: right;
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+}
+
+.level-chip {
+    font-size: 0.7rem;
+    padding: 2px 8px;
+    border-radius: 10px;
+    background-color: var(--border-color);
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.level-chip.normal { background-color: rgba(76, 175, 80, 0.2); color: #8fd694; }
+.level-chip.warning { background-color: rgba(255, 152, 0, 0.2); color: #ffc46b; }
+.level-chip.critical { background-color: rgba(244, 67, 54, 0.25); color: #ff8a80; }
+
+.storage-line {
+    display: grid;
+    grid-template-columns: minmax(80px, 240px) minmax(0, 1fr);
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 12px;
+}
+
+.storage-line .detail-line {
+    margin-bottom: 0;
+}
+
+/* ==================== Lists (recordings) ==================== */
+
+.item-list {
+    background-color: var(--bg-color);
+    border-radius: 6px;
+    max-height: 320px;
+    overflow-y: auto;
+}
+
+.empty-note {
+    padding: 16px;
+    text-align: center;
+    color: var(--text-muted);
+    font-style: italic;
+    font-size: 0.85rem;
+}
+
+.list-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.list-item:last-child {
+    border-bottom: none;
+}
+
+.list-item-main {
+    min-width: 0;
+}
+
+.list-item-name {
+    font-size: 0.85rem;
+    font-weight: 500;
+    overflow-wrap: anywhere;
+}
+
+.list-item-meta {
+    font-size: 0.75rem;
+    color: var(--text-muted);
+}
+
+.list-item-actions {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: flex-end;
+    gap: 6px;
+    flex-shrink: 0;
+}
+
+.list-item-actions .btn,
+.list-item-actions a.btn {
+    padding: 5px 10px;
+    font-size: 0.75rem;
+}
+
+.btn-danger-outline {
+    background-color: transparent;
+    color: var(--danger-color);
+    border: 1px solid var(--danger-color);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+    background-color: var(--danger-color);
+    color: white;
+}
+
+.live-badge {
+    color: var(--danger-color);
+    font-size: 0.75rem;
+    font-weight: 600;
+}
+
+/* ==================== Network storage settings ==================== */
+
+.config-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    gap: 14px;
+    align-items: start;
+    margin-top: 14px;
+}
+
+@media (max-width: 900px) {
+    .config-grid {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.config-block {
+    background-color: var(--bg-color);
+    border-radius: 6px;
+    padding: 12px 14px;
+}
+
+.config-block summary {
+    cursor: pointer;
+    font-size: 0.9rem;
+    font-weight: 500;
+    display: flex;
+    justify-content: space-between;
+    gap: 10px;
+    flex-wrap: wrap;
+}
+
+.summary-state {
+    font-size: 0.8rem;
+    font-weight: 400;
+    color: var(--text-muted);
+}
+
+.summary-state.configured {
+    color: var(--success-color);
+}
+
+.config-block .form-group input,
+.config-block .form-group select {
+    background-color: var(--card-bg);
+}
+
+.result-line {
+    font-size: 0.85rem;
+    margin-top: 10px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+
+.result-line.success { color: var(--success-color); }
+.result-line.error { color: var(--danger-color); }
+
+.result-line:empty {
+    display: none;
+}
+
+/* ==================== Phone stream defaults ==================== */
+
+.defaults-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin: 6px 0 8px;
+}
+
+.defaults-row .detail-line {
+    margin-bottom: 0;
+    min-width: 0;
+}
+
+/* ==================== Charging advice ==================== */
+
+.detail-line.advice {
+    color: #ffc46b;
+}
+
+/* ==================== Failed uploads ==================== */
+
+.failed-list {
+    margin: 8px 0;
+    max-height: 200px;
+}
+
+.failed-reason {
+    color: #ff8a80;
+    overflow-wrap: anywhere;
+}
+
+/* ==================== Kiosk settings ==================== */
+
+.kiosk-settings {
+    margin-top: 14px;
+}
+
+.kiosk-settings .settings-form {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    align-items: end;
+    margin-bottom: 4px;
+}
+
+.pin-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: end;
+    gap: 10px;
+    margin: 12px 0 6px;
+}
+
+.pin-row .button-group {
+    flex-wrap: nowrap;
+}
+
+/* ==================== Script problems ==================== */
+
+.script-problems {
+    margin: 8px 0 0;
+    padding: 8px 12px 8px 28px;
+    border-left: 3px solid var(--warning-color);
+    background-color: rgba(255, 152, 0, 0.08);
+    border-radius: 4px;
+    font-size: 0.8rem;
+    color: #ffc46b;
+    max-height: 160px;
+    overflow-y: auto;
+}
+
+.script-problems li {
+    overflow-wrap: anywhere;
+}
+
+/* ==================== Director progress ==================== */
+
+.director-progress {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.scene-jump {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+}
+
+.scene-jump .label {
+    color: var(--text-muted);
+    font-size: 0.85rem;
+    white-space: nowrap;
+}
+
+.scene-jump select {
+    flex: 1;
+    min-width: 0;
+    padding: 6px 8px;
+    border: 1px solid var(--border-color);
+    border-radius: 6px;
+    background-color: var(--bg-color);
+    color: var(--text-color);
+}
+
+.take-item .take-info {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    margin: 0 10px;
+}
+
+.take-item .take-scene {
+    margin-left: 0;
+}
+
+.take-item select {
+    padding: 3px 6px;
+    font-size: 0.75rem;
+    border: 1px solid var(--border-color);
+    border-radius: 4px;
+    background-color: var(--card-bg);
+    color: var(--text-color);
+    margin-right: 10px;
+}
+
+/* ==================== Small screens ==================== */
+
+@media (max-width: 600px) {
+    .container {
+        padding: 12px 16px;
+    }
+
+    header {
+        flex-wrap: wrap;
+        gap: 8px;
+    }
+
+    header h1 {
+        font-size: 1.5rem;
+    }
+
+    .header-actions {
+        gap: 10px;
+    }
+
+    .card,
+    .control-group,
+    .settings-section,
+    .stats-section,
+    .director-section {
+        padding: 16px;
+    }
+
+    .list-item {
+        flex-direction: column;
+        align-items: stretch;
+    }
+
+    .list-item-actions {
+        justify-content: flex-start;
+    }
+
+    .storage-line {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .stream-target {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .kiosk-settings .settings-form,
+    .pin-row {
+        grid-template-columns: minmax(0, 1fr);
+    }
+
+    .pin-row .button-group {
+        flex-wrap: wrap;
+    }
 }

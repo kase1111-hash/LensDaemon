@@ -150,6 +150,27 @@ jobs:
             adb logcat -c
             ./gradlew connectedFullDebugAndroidTest --no-daemon || { mkdir -p app/build/reports/androidTests; adb logcat -d -v threadtime > app/build/reports/androidTests/logcat.txt; sh .github/scripts/failed-test-logcat.sh app/build/reports/androidTests/logcat.txt; exit 1; }
 
+      # The tests that need a camera skip themselves when the emulator has none,
+      # and a skipped test still counts as passed: list them here
+      - name: Summarize instrumentation tests
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob
+          import xml.etree.ElementTree as ET
+          files = glob.glob('app/build/outputs/androidTest-results/connected/**/TEST-*.xml', recursive=True)
+          if not files:
+              print('No instrumentation test results found')
+          for path in files:
+              root = ET.parse(path).getroot()
+              for suite in root.iter('testsuite'):
+                  print(f"{suite.get('name')}: {suite.get('tests')} tests, {suite.get('failures')} failed, "
+                        f"{suite.get('errors')} errors, {suite.get('skipped')} skipped")
+              for case in root.iter('testcase'):
+                  if case.find('skipped') is not None:
+                      print(f"  skipped: {case.get('classname')}.{case.get('name')}")
+          EOF
+
       - name: Upload instrumentation test results
         if: always()
         uses: actions/upload-artifact@v4

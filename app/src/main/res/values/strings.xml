@@ -12,9 +12,15 @@
     <!-- Button Labels -->
     <string name="btn_start_stream">Start Stream</string>
     <string name="btn_stop_stream">Stop Stream</string>
+    <string name="stop_all">Stop all</string>
+    <string name="thermal_paused">Paused: the phone is too hot; outputs restart when it cools</string>
     <string name="btn_start_recording">Start Recording</string>
     <string name="btn_stop_recording">Stop Recording</string>
     <string name="btn_settings">Settings</string>
+
+    <!-- Web dashboard address -->
+    <string name="dashboard_address">Dashboard: %1$s</string>
+    <string name="dashboard_no_network">Dashboard: connect to Wi-Fi to reach it</string>
 
     <!-- Lens Labels -->
     <string name="lens_wide">Wide</string>

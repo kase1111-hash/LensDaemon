@@ -3,6 +3,7 @@ package com.lensdaemon.camera
 import android.graphics.ImageFormat
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraMetadata
+import android.hardware.camera2.params.MeteringRectangle
 import android.util.Size
 
 /**
@@ -57,7 +58,20 @@ data class CaptureConfig(
     val exposureCompensation: Int = 0,
     val whiteBalance: WhiteBalanceMode = WhiteBalanceMode.AUTO,
     val zoomRatio: Float = 1.0f,
-    val stabilizationMode: StabilizationMode = StabilizationMode.OFF
+    val stabilizationMode: StabilizationMode = StabilizationMode.OFF,
+    /**
+     * Where autofocus looks (tap-to-focus), in the open lens's active-array
+     * coordinates; null leaves it to the camera. Applied when the lens
+     * supports AF regions; cleared on a lens change, unlockFocus and focus
+     * mode changes.
+     */
+    val afRegions: List<MeteringRectangle>? = null,
+    /**
+     * Where auto-exposure meters (spot metering), in the open lens's
+     * active-array coordinates; null leaves it to the camera. Applied when
+     * the lens supports AE regions; cleared on a lens change and resetMetering.
+     */
+    val aeRegions: List<MeteringRectangle>? = null
 )
 
 /**

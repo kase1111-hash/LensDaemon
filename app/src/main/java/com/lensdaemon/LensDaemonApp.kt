@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.os.Build
+import com.lensdaemon.kiosk.KioskManager
 import timber.log.Timber
 
 /**
@@ -21,6 +22,12 @@ class LensDaemonApp : Application() {
 
         fun getInstance(): LensDaemonApp = instance
     }
+
+    /**
+     * Kiosk mode for the whole app: the web API turns it on and off, and the
+     * activity on screen pins or unpins itself to match.
+     */
+    val kioskManager: KioskManager by lazy { KioskManager(this) }
 
     override fun onCreate() {
         super.onCreate()

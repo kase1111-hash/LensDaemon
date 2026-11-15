@@ -98,6 +98,9 @@ class StorageManager(
 
     companion object {
         private const val TAG = "StorageManager"
+
+        /** How often free space is read while a recording is open (see [startRetentionSchedule]). */
+        private const val SPACE_GUARD_INTERVAL_MS = 5_000L
     }
 
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -116,6 +119,20 @@ class StorageManager(
 
     private var retentionJob: Job? = null
     private var videoFormat: MediaFormat? = null
+
+    /** Segment length for the next recording; [updateSegmentDuration] changes it. */
+    @Volatile
+    private var segmentDuration: SegmentDuration = config.segmentDuration
+
+    /**
+     * Stops the recording when the disk is still critically full after
+     * retention ran (checked every few seconds while a recording is open, see
+     * [startRetentionSchedule]). Set by the owner so that the stop goes through
+     * it and releases what it holds for the recording (the encoder); when null
+     * the recording is stopped here. Invoked once per recording, on an IO thread.
+     */
+    @Volatile
+    var onStorageFull: (() -> Unit)? = null
 
     /** AAC track format recorded from the next segment on, or null for video only. */
     var audioFormat: MediaFormat? = null
@@ -162,12 +179,21 @@ class StorageManager(
     }
 
     /**
-     * Start recording
+     * Start recording. Refused while a recording is open, running or paused:
+     * the open file is never abandoned for a new one.
      */
     fun startRecording(): Boolean {
-        if (_state.value == StorageManagerState.RECORDING) {
+        if (_state.value == StorageManagerState.RECORDING || _state.value == StorageManagerState.PAUSED) {
             Timber.tag(TAG).w("Already recording")
             return false
+        }
+
+        // A writer left behind in ERROR (a segment that failed to open) is
+        // released here, so a new recording can start
+        fileWriter?.let { stale ->
+            stale.removeListener(this)
+            stale.release()
+            fileWriter = null
         }
 
         val format = videoFormat
@@ -176,24 +202,24 @@ class StorageManager(
             return false
         }
 
-        // Check available space
-        val storageInfo = localStorage.getStorageSpace()
-        if (storageInfo.isCriticallyLowSpace) {
+        // Enforce retention first: it may free the space this recording needs
+        if (config.autoEnforceRetention) {
+            enforceRetentionSync()
+        }
+
+        // Check available space. A start just above the mark is stopped by the
+        // free-space check once the recording takes it below (startRetentionSchedule)
+        if (localStorage.getStorageSpace().isCriticallyLowSpace) {
             Timber.tag(TAG).e("Cannot start recording: critically low storage space")
             onRecordingEvent(RecordingEvent.Error("Critically low storage space"))
             return false
-        }
-
-        // Enforce retention before starting if needed
-        if (config.autoEnforceRetention) {
-            enforceRetentionSync()
         }
 
         // Create file writer
         val writerConfig = FileWriterConfig(
             outputDirectory = localStorage.getRecordingsDirectory(),
             encoderConfig = config.encoderConfig,
-            segmentDuration = config.segmentDuration,
+            segmentDuration = segmentDuration,
             rotationDegrees = config.rotationDegrees
         )
 
@@ -213,7 +239,7 @@ class StorageManager(
         fileWriter = writer
         _state.value = StorageManagerState.RECORDING
 
-        // Start retention enforcement schedule
+        // Retention on schedule, and the free-space check, until the recording stops
         startRetentionSchedule()
 
         updateStatus()
@@ -332,20 +358,28 @@ class StorageManager(
     }
 
     /**
-     * Manually enforce retention policy
+     * Manually enforce retention policy. The segment being written is never
+     * deleted, nor counted towards the limits.
      */
     fun enforceRetention(): RetentionResult {
-        val result = retentionPolicy.enforce(localStorage.getRecordingsDirectory())
+        val result = retentionPolicy.enforce(
+            localStorage.getRecordingsDirectory(),
+            setOfNotNull(fileWriter?.getStats()?.currentFilePath)
+        )
         updateStatus()
         return result
     }
 
     /**
-     * Synchronous retention enforcement (for use before recording)
+     * Synchronous retention enforcement (for use before recording); like
+     * [enforceRetention], it leaves an open segment alone.
      */
     private fun enforceRetentionSync() {
         try {
-            val result = retentionPolicy.enforce(localStorage.getRecordingsDirectory())
+            val result = retentionPolicy.enforce(
+                localStorage.getRecordingsDirectory(),
+                setOfNotNull(fileWriter?.getStats()?.currentFilePath)
+            )
             if (result.hasDeleted) {
                 Timber.tag(TAG).i(
                     "Retention enforced: ${result.filesDeleted} files deleted, " +
@@ -358,10 +392,13 @@ class StorageManager(
     }
 
     /**
-     * Preview what would be deleted by retention policy
+     * Preview what would be deleted by retention policy (never the open segment)
      */
     fun previewRetention(): List<File> {
-        return retentionPolicy.preview(localStorage.getRecordingsDirectory())
+        return retentionPolicy.preview(
+            localStorage.getRecordingsDirectory(),
+            setOfNotNull(fileWriter?.getStats()?.currentFilePath)
+        )
     }
 
     /**
@@ -398,9 +435,11 @@ class StorageManager(
     }
 
     /**
-     * Update segment duration (for new recordings)
+     * Update segment duration: applies from the next recording, a running
+     * one keeps its segment length.
      */
     fun updateSegmentDuration(duration: SegmentDuration) {
+        segmentDuration = duration
         Timber.tag(TAG).d("Segment duration updated: ${duration.displayName}")
     }
 
@@ -408,7 +447,9 @@ class StorageManager(
      * Release all resources
      */
     fun release() {
-        if (isRecording() || isPaused()) {
+        // Any open writer is finalized, including one left in ERROR (a full
+        // disk reports the error before the owner gets to stop the recording)
+        if (fileWriter != null) {
             stopRecording()
         }
 
@@ -448,30 +489,12 @@ class StorageManager(
     override fun onStorageWarning(level: StorageWarningLevel, availableBytes: Long) {
         Timber.tag(TAG).w("Storage warning: $level (${availableBytes / (1024 * 1024)}MB available)")
 
-        when (level) {
-            StorageWarningLevel.CRITICAL -> {
-                // If critically low during recording, enforce retention
-                if (isRecording() && config.autoEnforceRetention) {
-                    scope.launch {
-                        val result = enforceRetention()
-                        if (result.bytesFreed < 500L * 1024 * 1024) {
-                            // Still not enough space, stop recording
-                            Timber.tag(TAG).e("Storage critically low, stopping recording")
-                            stopRecording()
-                            onRecordingEvent(RecordingEvent.Error("Storage full - recording stopped"))
-                        }
-                    }
-                }
-            }
-            StorageWarningLevel.LOW -> {
-                // Low warning - enforce retention if enabled
-                if (config.autoEnforceRetention) {
-                    scope.launch { enforceRetention() }
-                }
-            }
-            StorageWarningLevel.NORMAL -> {
-                // All good
-            }
+        // Low or critically low: clean up by the retention policy. This is
+        // reported only when the level changes, so it does not decide whether a
+        // recording can go on: the free-space check that runs while a recording
+        // is open does (startRetentionSchedule)
+        if (level != StorageWarningLevel.NORMAL && config.autoEnforceRetention) {
+            scope.launch { enforceRetention() }
         }
 
         updateStatus()
@@ -486,27 +509,51 @@ class StorageManager(
     }
 
     /**
-     * Start periodic retention enforcement
+     * Runs from the start of a recording until it stops, so also while it is
+     * paused or its writer reported an error with its file still open. It
+     * applies the retention policy every
+     * [StorageManagerConfig.retentionCheckIntervalMs], and reads the free space
+     * every [SPACE_GUARD_INTERVAL_MS]: when the disk is critically low (under
+     * 500 MB), the policy runs at once, and if that leaves it critically low the
+     * recording is stopped, through [onStorageFull] when set, while there is
+     * still room to finalize its file. Reading the space here, rather than
+     * waiting for the space monitor to report a change of level, means a
+     * recording that was kept going (or started) just above the mark is still
+     * stopped before the disk fills.
      */
     private fun startRetentionSchedule() {
-        if (!config.autoEnforceRetention) return
-
         stopRetentionSchedule()
 
         retentionJob = scope.launch {
-            while (isActive) {
-                delay(config.retentionCheckIntervalMs)
-                try {
-                    enforceRetention()
+            var sinceRetentionMs = 0L
+            var full = false
+            // Ends when the disk is full, or when the recording stops (the job is cancelled)
+            while (!full) {
+                delay(SPACE_GUARD_INTERVAL_MS)
+                sinceRetentionMs += SPACE_GUARD_INTERVAL_MS
+                val due = sinceRetentionMs >= config.retentionCheckIntervalMs
+                if (due) sinceRetentionMs = 0L
+                full = try {
+                    if (config.autoEnforceRetention && (due || localStorage.getStorageSpace().isCriticallyLowRead)) {
+                        enforceRetention()
+                    }
+                    localStorage.getStorageSpace().isCriticallyLowRead
                 } catch (e: Exception) {
-                    Timber.tag(TAG).e(e, "Error in scheduled retention enforcement")
+                    Timber.tag(TAG).e(e, "Error checking storage while recording")
+                    false
                 }
             }
+            // Not when the recording was stopped meanwhile
+            ensureActive()
+            Timber.tag(TAG).e("Storage critically low, stopping recording")
+            onRecordingEvent(RecordingEvent.Error("Storage full - recording stopped"))
+            val stop = onStorageFull
+            if (stop != null) stop() else stopRecording()
         }
     }
 
     /**
-     * Stop periodic retention enforcement
+     * Stop periodic retention enforcement and the free-space check
      */
     private fun stopRetentionSchedule() {
         retentionJob?.cancel()
@@ -527,6 +574,13 @@ class StorageManager(
         )
     }
 }
+
+/**
+ * Under 500 MB free, by a read that worked: a failed one reports 0 bytes in
+ * all, which is no reason to delete recordings or stop one.
+ */
+private val StorageSpaceInfo.isCriticallyLowRead: Boolean
+    get() = totalBytes > 0 && isCriticallyLowSpace
 
 /**
  * Builder for StorageManager configuration

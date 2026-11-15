@@ -1082,8 +1082,7 @@ class ScriptParserTest {
 
     @Test
     fun `DOF cue is not included in parseCuesFromLine`() {
-        // DOF pattern exists but parseExplicitCue does not handle it,
-        // so it should not produce a cue
+        // Depth of field is not a cue type, so it should not produce a cue
         val cues = parser.parseCuesFromLine("[DOF: SHALLOW]")
         assertTrue(cues.isEmpty())
     }
@@ -1179,5 +1178,143 @@ class ScriptParserTest {
         val cue = parser.parseSingleCue("[CUT TO: CLOSE-UP]")
         assertNotNull(cue)
         assertEquals(TransitionType.CUT, cue!!.transitionType)
+    }
+
+    // ========================================================================
+    // Problems reported in ParsedScript.errors (lines numbered from 1)
+    // ========================================================================
+
+    @Test
+    fun `misspelled cue yields an error and no cue`() {
+        val result = parser.parseScript("[SCENE: A]\n[SHOT: WIDE]\n[TRANSITON: PUSH IN]")
+
+        assertEquals(1, result.totalCues)
+        assertEquals(CueType.SHOT, result.scenes[0].cues[0].type)
+        assertEquals(listOf("Line 3: not a cue: [TRANSITON: PUSH IN]"), result.errors)
+        assertEquals(result.errors, parser.getErrors())
+    }
+
+    @Test
+    fun `unknown CUT TO shot maps to MEDIUM and adds an error`() {
+        val result = parser.parseScript("[CUT TO: BLACK]")
+
+        val cue = result.scenes[0].cues[0]
+        assertEquals(CueType.CUT, cue.type)
+        assertEquals(ShotType.MEDIUM, cue.shotType)
+        assertEquals(listOf("Line 1: unknown shot BLACK, using MEDIUM"), result.errors)
+    }
+
+    @Test
+    fun `unknown SHOT name maps to MEDIUM and adds an error`() {
+        val result = parser.parseScript("[SCENE: A]\n[SHOT: DRONE]")
+
+        assertEquals(ShotType.MEDIUM, result.scenes[0].cues[0].shotType)
+        assertEquals(listOf("Line 2: unknown shot DRONE, using MEDIUM"), result.errors)
+    }
+
+    @Test
+    fun `hyphenated shot names are read from the bracket`() {
+        val cue = parser.parseSingleCue("[SHOT: EXTREME CLOSE-UP]")
+        assertEquals(ShotType.EXTREME_CLOSE, cue!!.shotType)
+        assertEquals(CueType.SHOT, cue.type)
+    }
+
+    @Test
+    fun `a second cue on a line is reported`() {
+        val result = parser.parseScript("[SHOT: WIDE] [FOCUS: FACE]")
+
+        assertEquals(1, result.totalCues)
+        assertEquals(CueType.SHOT, result.scenes[0].cues[0].type)
+        assertEquals(listOf("Line 1: only the first cue on a line is used"), result.errors)
+    }
+
+    @Test
+    fun `the first cue written on a line is the one used`() {
+        val result = parser.parseScript("[FOCUS: FACE] [SHOT: WIDE]")
+
+        assertEquals(CueType.FOCUS, result.scenes[0].cues[0].type)
+        assertEquals(FocusTarget.FACE, result.scenes[0].cues[0].focusTarget)
+        assertEquals(listOf("Line 1: only the first cue on a line is used"), result.errors)
+    }
+
+    @Test
+    fun `DOF in a script is reported as not a cue`() {
+        val result = parser.parseScript("[SHOT: WIDE]\n[DOF: SHALLOW]")
+        assertEquals(listOf("Line 2: not a cue: [DOF: SHALLOW]"), result.errors)
+    }
+
+    @Test
+    fun `narration and known cues report no problems`() {
+        val script = """
+            [SCENE: Arrival]
+            The host walks in.
+            [SHOT: CLOSE-UP]
+            [TRANSITION: PUSH IN] - 2s
+            [HOLD: 3]
+            [CUT TO: CLOSE-UP]
+        """.trimIndent()
+
+        assertTrue(parser.parseScript(script).errors.isEmpty())
+    }
+
+    @Test
+    fun `problems beyond ten are counted, not listed`() {
+        val script = (1..12).joinToString("\n") { "[NOPE: $it]" } + "\n[SHOT: WIDE]"
+
+        val errors = parser.parseScript(script).errors
+        assertEquals(11, errors.size)
+        assertEquals("Line 1: not a cue: [NOPE: 1]", errors[0])
+        assertEquals("2 more problems not listed", errors[10])
+    }
+
+    @Test
+    fun `parser follows a changed configuration`() {
+        parser.config = DirectorConfig(defaultHoldDurationMs = 750)
+        assertEquals(750L, parser.parseSingleCue("[BEAT]")!!.holdDurationMs)
+    }
+
+    // ========================================================================
+    // Bracket text and parsing time
+    // ========================================================================
+
+    @Test
+    fun `unclosed cues followed by long runs of spaces parse in linear time`() {
+        val spaces = " ".repeat(200_000)
+        val script = listOf(
+            "[SHOT: a${spaces}b",
+            "[SCENE: ${spaces}b",
+            "[CUT TO: ${spaces}b",
+            "[TRANSITION: CUT]${spaces}x",
+            "[SHOT: a".repeat(25_000),
+            "[SCENE: A]",
+            "[SHOT: WIDE]"
+        ).joinToString("\n")
+
+        val started = System.nanoTime()
+        val result = parser.parseScript(script)
+        val elapsedMs = (System.nanoTime() - started) / 1_000_000
+
+        // Each of these lines used to take minutes: the matcher tried every split of the spaces
+        assertTrue("parsing took $elapsedMs ms", elapsedMs < 5_000)
+        assertEquals(2, result.scenes.size)
+        assertEquals(CueType.TRANSITION, result.scenes[0].cues.single().type)
+        assertEquals(CueType.SHOT, result.scenes[1].cues.single().type)
+        assertEquals(listOf(1, 2, 3, 5), result.errors.map { it.substringBefore(":").removePrefix("Line ").toInt() })
+    }
+
+    @Test
+    fun `a scene marker without a label is Untitled`() {
+        val result = parser.parseScript("[SCENE:]\n[SHOT: WIDE]\n[SCENE: ]\n[SHOT: MEDIUM]")
+
+        assertEquals(listOf("Untitled", "Untitled"), result.scenes.map { it.label })
+        assertTrue(result.errors.isEmpty())
+    }
+
+    @Test
+    fun `spaces before the closing bracket are not part of the shot name`() {
+        val result = parser.parseScript("[SHOT: CLOSE-UP  ]\n[CUT TO: WIDE ]")
+
+        assertEquals(listOf(ShotType.CLOSE_UP, ShotType.WIDE), result.scenes[0].cues.map { it.shotType })
+        assertTrue(result.errors.isEmpty())
     }
 }

@@ -18,6 +18,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.launch
 import timber.log.Timber
 
 /**
@@ -29,6 +32,11 @@ import timber.log.Timber
  * - Battery bypass/charge limiting
  * - Temperature history logging
  * - Service binding for API access
+ *
+ * Monitoring runs whenever the service exists, so binding to it (web server, phone
+ * overlay) is enough. Starting it (ACTION_START, boot, the camera's restart path, or the
+ * null intent of a sticky restart) also makes it a foreground service with a notification
+ * that follows the thermal status. A service that is only bound posts no notification.
  */
 class ThermalService : Service(), ThermalGovernorListener {
 
@@ -79,10 +87,18 @@ class ThermalService : Service(), ThermalGovernorListener {
     // Configuration
     private var config = ThermalConfig.DEFAULT
 
-    // Callbacks for external systems (e.g., encoder throttling)
+    // True once startForeground succeeded: the notification is only posted while it is
+    @Volatile
+    private var inForeground = false
+
+    // Callbacks for external systems (e.g., encoder throttling), called on the main thread.
+    // See ThermalGovernor for when each fires.
+
+    /** The wanted bitrate cut in percent whenever it changes, 0 once cooled down. */
     var onReduceBitrate: ((reductionPercent: Int) -> Unit)? = null
-    var onReduceResolution: (() -> Unit)? = null
-    var onReduceFramerate: (() -> Unit)? = null
+
+    /** Lower resolution / 24 fps cap from CPU CRITICAL, on every change in either direction. */
+    var onEncoderLimits: ((reduceResolution: Boolean, reduceFramerate: Boolean) -> Unit)? = null
     var onPauseStreaming: (() -> Unit)? = null
     var onResumeStreaming: (() -> Unit)? = null
     var onRestoreSettings: (() -> Unit)? = null
@@ -105,24 +121,43 @@ class ThermalService : Service(), ThermalGovernorListener {
 
         // Wire up throttle callbacks
         governor.onReduceBitrate = { percent -> onReduceBitrate?.invoke(percent) }
-        governor.onReduceResolution = { onReduceResolution?.invoke() }
-        governor.onReduceFramerate = { onReduceFramerate?.invoke() }
+        governor.onEncoderLimits = { resolution, framerate -> onEncoderLimits?.invoke(resolution, framerate) }
         governor.onPauseStreaming = { onPauseStreaming?.invoke() }
         governor.onResumeStreaming = { onResumeStreaming?.invoke() }
         governor.onRestoreSettings = { onRestoreSettings?.invoke() }
+
+        // The notification follows the status: level, throttling and whole degrees
+        serviceScope.launch {
+            governor.status
+                .map { status ->
+                    listOf(
+                        status.overallLevel,
+                        status.activeActions,
+                        status.cpuTemperatureC.toInt(),
+                        status.batteryTemperatureC.toInt()
+                    )
+                }
+                .distinctUntilChanged()
+                .collect { if (inForeground) updateNotification() }
+        }
+
+        // Monitor whenever the service exists, bound or started (both calls are idempotent)
+        governor.start()
+        batteryBypass?.start()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Timber.tag(TAG).d("onStartCommand: ${intent?.action}")
 
         when (intent?.action) {
-            ACTION_START -> {
-                startThermalManagement()
-            }
             ACTION_STOP -> {
                 stopThermalManagement()
+                inForeground = false
+                stopForeground(STOP_FOREGROUND_REMOVE)
                 stopSelf()
             }
+            // ACTION_START, and the null intent of a sticky restart
+            else -> startThermalManagement()
         }
 
         return START_STICKY
@@ -134,22 +169,30 @@ class ThermalService : Service(), ThermalGovernorListener {
         super.onDestroy()
         Timber.tag(TAG).i("ThermalService destroyed")
 
+        inForeground = false
         governor.release()
         serviceScope.cancel()
     }
 
     /**
-     * Start thermal management
+     * Start thermal management: go to the foreground (when Android allows it) and make
+     * sure monitoring runs. A refused foreground start leaves monitoring running.
      */
     fun startThermalManagement() {
         Timber.tag(TAG).i("Starting thermal management")
 
-        startForeground(NOTIFICATION_ID, createNotification("Monitoring..."))
+        try {
+            startForeground(NOTIFICATION_ID, createNotification())
+            inForeground = true
+        } catch (e: IllegalStateException) {
+            // Android 12+ refuses foreground starts from the background without an exemption
+            Timber.tag(TAG).w(e, "Thermal service could not start in the foreground")
+        } catch (e: SecurityException) {
+            Timber.tag(TAG).w(e, "Thermal service may not start in the foreground")
+        }
 
         governor.start()
         batteryBypass?.start()
-
-        updateNotification()
     }
 
     /**
@@ -239,19 +282,21 @@ class ThermalService : Service(), ThermalGovernorListener {
     }
 
     // ==================== ThermalGovernorListener ====================
+    // The notification itself follows governor.status (see onCreate)
 
     override fun onThermalLevelChanged(status: ThermalStatus) {
-        updateNotification()
+        Timber.tag(TAG).d("Thermal level: ${status.overallLevel}")
     }
 
     override fun onThrottleAction(action: ThrottleAction, enabled: Boolean) {
         Timber.tag(TAG).d("Throttle action: $action = $enabled")
-        updateNotification()
     }
 
     override fun onEmergencyShutdown(reason: String) {
         Timber.tag(TAG).w("Emergency shutdown: $reason")
-        updateNotification("EMERGENCY: $reason")
+        if (inForeground) {
+            updateNotification("EMERGENCY: $reason")
+        }
     }
 
     // ==================== Notification ====================
@@ -307,8 +352,10 @@ class ThermalService : Service(), ThermalGovernorListener {
         val battTemp = "%.1f°C".format(status.batteryTemperatureC)
 
         return when {
+            status.cpuTemperatureC <= 0f && status.batteryTemperatureC <= 0f ->
+                "Monitoring: waiting for the first reading"
             status.overallLevel == ThermalLevel.EMERGENCY ->
-                "EMERGENCY - CPU: $cpuTemp, Battery: $battTemp"
+                "EMERGENCY, outputs paused - CPU: $cpuTemp, Battery: $battTemp"
             status.isThrottling ->
                 "Throttling - CPU: $cpuTemp, Battery: $battTemp"
             else ->

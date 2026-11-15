@@ -38,9 +38,17 @@ class RtspCoordinator {
     /** Callback invoked when an RTSP client requests a keyframe */
     var onKeyframeRequest: (() -> Unit)? = null
 
+    /**
+     * The port the server started by [start] listens on; 0 once stopped. A
+     * start while the server runs keeps it on its port.
+     */
+    @Volatile
+    var port: Int = 0
+        private set
+
     fun start(port: Int = 8554): Boolean {
         if (rtspServer?.isRunning() == true) {
-            Timber.w("RTSP server already running")
+            Timber.w("RTSP server already running on port ${this.port}")
             return true
         }
 
@@ -52,6 +60,7 @@ class RtspCoordinator {
 
         val success = rtspServer?.start() ?: false
         if (success) {
+            this.port = port
             _serverState.value = RtspServerState.RUNNING
             Timber.i("RTSP server started: ${rtspServer?.getRtspUrl()}")
         } else {
@@ -64,6 +73,7 @@ class RtspCoordinator {
     fun stop() {
         rtspServer?.stop()
         rtspServer = null
+        port = 0
         _serverState.value = RtspServerState.STOPPED
         Timber.i("RTSP server stopped")
     }

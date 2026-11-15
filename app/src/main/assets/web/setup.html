@@ -318,6 +318,30 @@
             display: block;
         }
 
+        .result-banner.pending {
+            background: rgba(0,0,0,0.2);
+            border: 1px solid var(--border-color);
+            display: block;
+        }
+
+        .test-preview {
+            width: 100%;
+            max-height: 320px;
+            object-fit: contain;
+            background: #000;
+            border-radius: 6px;
+            margin: 12px 0;
+        }
+
+        .check-text .detail a { color: var(--primary-color); word-break: break-all; }
+
+        @media (max-width: 600px) {
+            .container { padding: 12px 16px; }
+            .form-row { grid-template-columns: 1fr; gap: 0; }
+            .step-label { font-size: 0.65rem; }
+            .step-content { padding: 18px; }
+        }
+
         /* Loading spinner */
         .spinner {
             display: inline-block;
@@ -411,8 +435,9 @@
             </div>
 
             <div id="device-owner-help" style="display:none; margin-top: 16px;">
-                <p style="color: var(--warning-color);">Device Owner is not set. Run this ADB command on a factory-reset device (or one with no accounts):</p>
+                <p style="color: var(--warning-color);">Device Owner is not set. Without it, kiosk mode can't lock the screen, and Android won't open LensDaemon or (Android 11+) its camera by itself after a reboot. Run this ADB command on a factory-reset device (or one with no accounts):</p>
                 <div class="code-block">adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver</div>
+                <p id="device-owner-undo" style="color: var(--warning-color);">For a normal install this can't be undone, from the phone or over ADB: only a factory reset removes Device Owner again (turn kiosk mode off first, as it blocks factory reset). The exception is a test-only build, which Android Studio's Run installs, already on the phone when the command runs: adb shell dpm remove-active-admin com.lensdaemon/.AdminReceiver then removes it.</p>
                 <p>After running the command, tap "Re-check" below.</p>
                 <button class="btn btn-primary" onclick="runChecks()">Re-check</button>
             </div>
@@ -435,12 +460,11 @@
                         24/7 unattended operation
                     </p>
                     <ul>
-                        <li>Screen OFF (saves power)</li>
-                        <li>Auto-start streaming on boot</li>
-                        <li>Auto-start RTSP server</li>
+                        <li>Screen off (the phone's own screen timeout)</li>
+                        <li>Starts the RTSP stream on boot</li>
                         <li>Lock all system UI</li>
-                        <li>Auto-restart on crash</li>
-                        <li>Network auto-reconnect</li>
+                        <li>Restarts its outputs after a crash</li>
+                        <li>Failed uploads resume when the network returns</li>
                     </ul>
                 </div>
                 <div class="preset-card" id="preset-interactive" onclick="selectPreset('interactive')">
@@ -451,10 +475,9 @@
                     <ul>
                         <li>Screen shows camera preview</li>
                         <li>Keep screen always on</li>
-                        <li>Navigation bar accessible</li>
                         <li>Vol+Vol gesture to exit</li>
                         <li>Dashboard accessible via web</li>
-                        <li>Manual stream control</li>
+                        <li>Starts the RTSP stream on boot; Start/Stop on the phone's screen</li>
                     </ul>
                 </div>
             </div>
@@ -468,7 +491,7 @@
         <!-- Step 3: Storage (Optional) -->
         <div class="step-content" id="step-3">
             <h2>Step 3: Network Storage (Optional)</h2>
-            <p>Configure where recordings are uploaded. You can skip this step and set it up later from the dashboard.</p>
+            <p>Choose where you can upload recordings. Uploads are started from the dashboard's Recordings list (automatic upload is not available yet). You can skip this step and set it up later from the dashboard.</p>
 
             <div class="form-group">
                 <label for="storage-type">Storage Backend</label>
@@ -482,8 +505,13 @@
             <div id="s3-config" style="display:none;">
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="s3-endpoint">Endpoint URL</label>
-                        <input type="text" id="s3-endpoint" placeholder="https://s3.amazonaws.com">
+                        <label for="s3-backend">Provider</label>
+                        <select id="s3-backend">
+                            <option value="S3">Amazon S3</option>
+                            <option value="BACKBLAZE_B2">Backblaze B2</option>
+                            <option value="MINIO">MinIO</option>
+                            <option value="CLOUDFLARE_R2">Cloudflare R2</option>
+                        </select>
                     </div>
                     <div class="form-group">
                         <label for="s3-region">Region</label>
@@ -491,17 +519,22 @@
                     </div>
                 </div>
                 <div class="form-group">
+                    <label for="s3-endpoint">Endpoint</label>
+                    <input type="text" id="s3-endpoint" placeholder="http://minio.local:9000 or &lt;account&gt;.r2.cloudflarestorage.com">
+                    <div class="form-hint">Leave empty for Amazon S3 and Backblaze B2: it follows from the region. Start it with http:// for a server without HTTPS, such as a MinIO server on your network; without http://, the phone connects with HTTPS.</div>
+                </div>
+                <div class="form-group">
                     <label for="s3-bucket">Bucket Name</label>
                     <input type="text" id="s3-bucket" placeholder="my-recordings">
                 </div>
                 <div class="form-row">
                     <div class="form-group">
-                        <label for="s3-access-key">Access Key</label>
-                        <input type="text" id="s3-access-key" placeholder="AKIAIOSFODNN7EXAMPLE">
+                        <label for="s3-access-key">Access Key ID</label>
+                        <input type="text" id="s3-access-key" placeholder="AKIAIOSFODNN7EXAMPLE" autocomplete="off">
                     </div>
                     <div class="form-group">
-                        <label for="s3-secret-key">Secret Key</label>
-                        <input type="password" id="s3-secret-key" placeholder="Secret key">
+                        <label for="s3-secret-key">Secret Access Key</label>
+                        <input type="password" id="s3-secret-key" placeholder="Secret key" autocomplete="new-password">
                     </div>
                 </div>
                 <button class="btn btn-secondary" onclick="testS3()">Test Connection</button>
@@ -510,8 +543,8 @@
 
             <div id="smb-config" style="display:none;">
                 <div class="form-group">
-                    <label for="smb-host">Server Address</label>
-                    <input type="text" id="smb-host" placeholder="192.168.1.100">
+                    <label for="smb-server">Server Address</label>
+                    <input type="text" id="smb-server" placeholder="192.168.1.100">
                 </div>
                 <div class="form-group">
                     <label for="smb-share">Share Name</label>
@@ -520,11 +553,11 @@
                 <div class="form-row">
                     <div class="form-group">
                         <label for="smb-username">Username</label>
-                        <input type="text" id="smb-username" placeholder="user">
+                        <input type="text" id="smb-username" placeholder="user" autocomplete="off">
                     </div>
                     <div class="form-group">
                         <label for="smb-password">Password</label>
-                        <input type="password" id="smb-password" placeholder="Password">
+                        <input type="password" id="smb-password" placeholder="Password" autocomplete="new-password">
                     </div>
                 </div>
                 <button class="btn btn-secondary" onclick="testSmb()">Test Connection</button>
@@ -540,7 +573,7 @@
         <!-- Step 4: Test Stream -->
         <div class="step-content" id="step-4">
             <h2>Step 4: Test Stream &amp; Thermal Check</h2>
-            <p>Start a test stream to verify the camera and check thermal behavior.</p>
+            <p>Start a test stream to verify the camera and check thermal behavior. Open the stream address in VLC or OBS to see what viewers will get.</p>
 
             <div class="check-item">
                 <div class="check-icon pending" id="check-stream-icon">...</div>
@@ -549,6 +582,8 @@
                     <span class="detail" id="check-stream-detail">Not started</span>
                 </div>
             </div>
+
+            <img id="test-preview" class="test-preview" alt="Live camera preview" style="display:none;">
 
             <div style="margin: 16px 0;">
                 <button class="btn btn-success" id="btn-test-stream" onclick="startTestStream()">Start Test Stream</button>
@@ -598,12 +633,20 @@
                 <div><strong>Thermal Profile:</strong> <span id="summary-thermal">Default</span></div>
             </div>
 
+            <div class="form-group">
+                <label for="exit-pin">Exit PIN (4-12 digits, optional)</label>
+                <input type="password" id="exit-pin" inputmode="numeric" pattern="\d{4,12}" maxlength="12" autocomplete="new-password" placeholder="Leave empty to keep the current one">
+                <div class="form-hint">Asked for at the phone after the exit gesture. Without one, anyone at the phone can leave kiosk mode with Vol Up + Vol Down.</div>
+            </div>
+
             <div id="activation-result" class="result-banner"></div>
 
             <div style="margin: 16px 0; padding: 12px; background: rgba(255,152,0,0.1); border: 1px solid var(--warning-color); border-radius: 6px;">
                 <strong style="color: var(--warning-color);">Warning:</strong>
-                Once kiosk mode is activated, the device will be locked to LensDaemon.
-                You can exit via the web dashboard or by holding Vol Up + Vol Down for 5 seconds.
+                Once kiosk mode is activated on a Device Owner phone, the phone is locked to LensDaemon and starts it after every reboot.
+                Android starts it only after the phone's first unlock, so unattended restarts need a phone without a PIN, pattern or password lock.
+                Without Device Owner, kiosk mode can't lock the screen, and Android won't open LensDaemon or (Android 11+) its camera by itself after a reboot.
+                You can turn kiosk mode off in the dashboard's Kiosk Mode panel, or at the phone by holding Vol Up + Vol Down for 5 seconds (then the exit PIN, if set).
             </div>
 
             <div class="nav-buttons">

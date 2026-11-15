@@ -154,6 +154,11 @@ data class SmbCredentials(
  * - Android Keystore for key storage
  * - Secure storage for S3 and SMB credentials
  * - Credential validation
+ *
+ * The key never leaves the phone's keystore. Settings that can't be decrypted any more
+ * (restored from a backup, or the key was reset) are removed, and the backend reads as
+ * not set up, instead of failing every start. The credentials file is also kept out of
+ * Auto Backup and device transfer (res/xml/backup_rules.xml, data_extraction_rules.xml).
  */
 class CredentialStore(
     private val context: Context
@@ -219,9 +224,20 @@ class CredentialStore(
     }
 
     /**
-     * Retrieve S3-compatible credentials
+     * Retrieve S3-compatible credentials. Saved settings that can't be decrypted are
+     * removed, and null returned as if none were saved.
      */
     fun getS3Credentials(): S3Credentials? {
+        return try {
+            readS3Credentials()
+        } catch (e: SecurityException) {
+            Timber.tag(TAG).w(e, "Saved S3 settings can't be decrypted; removing them")
+            deleteS3Credentials()
+            null
+        }
+    }
+
+    private fun readS3Credentials(): S3Credentials? {
         val endpoint = decrypt(prefs.getString(KEY_S3_ENDPOINT, null) ?: return null)
         val region = decrypt(prefs.getString(KEY_S3_REGION, null) ?: return null)
         val bucket = decrypt(prefs.getString(KEY_S3_BUCKET, null) ?: return null)
@@ -287,9 +303,20 @@ class CredentialStore(
     }
 
     /**
-     * Retrieve SMB credentials
+     * Retrieve SMB credentials. Saved settings that can't be decrypted are removed, and
+     * null returned as if none were saved.
      */
     fun getSmbCredentials(): SmbCredentials? {
+        return try {
+            readSmbCredentials()
+        } catch (e: SecurityException) {
+            Timber.tag(TAG).w(e, "Saved SMB settings can't be decrypted; removing them")
+            deleteSmbCredentials()
+            null
+        }
+    }
+
+    private fun readSmbCredentials(): SmbCredentials? {
         val server = decrypt(prefs.getString(KEY_SMB_SERVER, null) ?: return null)
         val share = decrypt(prefs.getString(KEY_SMB_SHARE, null) ?: return null)
         val username = decrypt(prefs.getString(KEY_SMB_USERNAME, null) ?: return null)

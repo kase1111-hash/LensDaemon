@@ -1046,6 +1046,58 @@ class ShotMapperTest {
     }
 
     // ========================================================================
+    // followCamera() and forgetExposure()
+    // ========================================================================
+
+    @Test
+    fun `followCamera takes the camera's lens and zoom and keeps focus and exposure`() {
+        mapper.mapCue(shotCue(ShotType.CLOSE_UP))
+        mapper.mapCue(exposureCue(ExposurePreset.DARK))
+
+        mapper.followCamera(ShotMapper.Framing("wide", 3f))
+
+        val cmd = mapper.getCurrentCommand()!!
+        assertEquals("wide", cmd.lens)
+        assertEquals(3f, cmd.zoomLevel, 0.001f)
+        assertEquals(FocusTarget.FACE, cmd.focusMode)
+        assertEquals(ExposurePreset.DARK, cmd.exposurePreset)
+    }
+
+    @Test
+    fun `cues that keep the framing start from the camera's after followCamera`() {
+        mapper.followCamera(ShotMapper.Framing("wide", 3f))
+
+        val pushIn = mapper.mapCue(transitionCue(TransitionType.PUSH_IN)).command!!
+        assertEquals("wide", pushIn.lens)
+        assertEquals(4.5f, pushIn.zoomLevel, 0.001f)
+
+        mapper.followCamera(ShotMapper.Framing("tele", 2f))
+        val focus = mapper.mapCue(focusCue(FocusTarget.HANDS)).command!!
+        assertEquals("tele", focus.lens)
+        assertEquals(2f, focus.zoomLevel, 0.001f)
+        assertEquals(FocusTarget.HANDS, focus.focusMode)
+    }
+
+    @Test
+    fun `forgetExposure keeps the framing and focus`() {
+        mapper.mapCue(shotCue(ShotType.CLOSE_UP))
+        mapper.mapCue(exposureCue(ExposurePreset.BACKLIT))
+        val before = mapper.getCurrentCommand()!!
+
+        mapper.forgetExposure()
+
+        assertEquals(before.copy(exposurePreset = ExposurePreset.AUTO), mapper.getCurrentCommand())
+        assertEquals(ExposurePreset.AUTO, mapper.mapCue(shotCue(ShotType.WIDE)).command!!.exposurePreset)
+    }
+
+    @Test
+    fun `forgetExposure before any cue leaves no command`() {
+        mapper.forgetExposure()
+
+        assertNull(mapper.getCurrentCommand())
+    }
+
+    // ========================================================================
     // 11. mapScene() maps all cues in sequence
     // ========================================================================
 
@@ -1821,5 +1873,43 @@ class ShotMapperTest {
         assertEquals(16f, ShotMapper.WIDE_FOCAL_LENGTH, 0.001f)
         assertEquals(24f, ShotMapper.MAIN_FOCAL_LENGTH, 0.001f)
         assertEquals(70f, ShotMapper.TELEPHOTO_FOCAL_LENGTH, 0.001f)
+    }
+
+    // ========================================================================
+    // Exposure carried by shots and cuts
+    // ========================================================================
+
+    @Test
+    fun `EXPOSURE BACKLIT then SHOT CLOSE_UP keeps BACKLIT`() {
+        mapper.mapCue(exposureCue(ExposurePreset.BACKLIT))
+
+        val result = mapper.mapCue(shotCue(ShotType.CLOSE_UP))
+
+        assertTrue(result.success)
+        assertEquals(ExposurePreset.BACKLIT, result.command!!.exposurePreset)
+    }
+
+    @Test
+    fun `EXPOSURE DARK then CUT TO WIDE keeps DARK`() {
+        mapper.mapCue(shotCue(ShotType.MEDIUM))
+        mapper.mapCue(exposureCue(ExposurePreset.DARK))
+
+        val result = mapper.mapCue(cutCue(ShotType.WIDE))
+
+        assertEquals(ExposurePreset.DARK, result.command!!.exposurePreset)
+        assertEquals("wide", result.command!!.lens)
+    }
+
+    @Test
+    fun `validateMapping numbers lines from the first line number given`() {
+        mapper.updateCapabilities(minimalCapabilities)
+        val scene = DirectorScene(
+            label = "Test",
+            cues = listOf(DirectorCue(type = CueType.SHOT, rawText = "[SHOT: WIDE]", shotType = ShotType.WIDE, lineNumber = 0))
+        )
+        val script = ParsedScript(rawScript = "", scenes = listOf(scene), totalCues = 1, estimatedDurationMs = 0)
+
+        assertTrue(mapper.validateMapping(script, firstLineNumber = 1).any { it.contains("line 1:") })
+        assertTrue(mapper.validateMapping(script).any { it.contains("line 0:") })
     }
 }

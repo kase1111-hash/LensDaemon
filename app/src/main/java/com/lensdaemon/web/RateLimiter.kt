@@ -10,12 +10,16 @@ import java.util.concurrent.ConcurrentHashMap
  * When a request arrives, a token is consumed. If no tokens remain, the
  * request is rejected with 429 Too Many Requests.
  *
- * Stale buckets are cleaned up periodically to prevent memory leaks.
+ * Stale buckets are cleaned up periodically to prevent memory leaks, and at
+ * most [maxBuckets] clients are tracked: past that, stale buckets go at once
+ * and then the ones idle longest, so a client cycling through addresses
+ * cannot grow the map without bound.
  */
 class RateLimiter(
     private val maxTokens: Int = DEFAULT_MAX_TOKENS,
     private val refillPerSecond: Double = DEFAULT_REFILL_PER_SECOND,
-    private val cleanupIntervalMs: Long = CLEANUP_INTERVAL_MS
+    private val cleanupIntervalMs: Long = CLEANUP_INTERVAL_MS,
+    private val maxBuckets: Int = MAX_BUCKETS
 ) {
     companion object {
         private const val TAG = "RateLimiter"
@@ -31,9 +35,13 @@ class RateLimiter(
 
         /** Remove buckets idle for more than 10 minutes */
         const val STALE_THRESHOLD_MS = 600_000L
+
+        /** Track at most this many clients */
+        const val MAX_BUCKETS = 1024
     }
 
     private val buckets = ConcurrentHashMap<String, TokenBucket>()
+    @Volatile
     private var lastCleanup = System.currentTimeMillis()
 
     /**
@@ -46,6 +54,7 @@ class RateLimiter(
         val bucket = buckets.getOrPut(clientKey) {
             TokenBucket(maxTokens, refillPerSecond)
         }
+        if (buckets.size > maxBuckets) trimBuckets(keep = clientKey)
         return bucket.tryConsume()
     }
 
@@ -79,12 +88,36 @@ class RateLimiter(
         val now = System.currentTimeMillis()
         if (now - lastCleanup < cleanupIntervalMs) return
         lastCleanup = now
+        removeStale(now)
+    }
 
+    private fun removeStale(now: Long) {
         val staleThreshold = now - STALE_THRESHOLD_MS
         val removed = buckets.entries.removeAll { it.value.lastAccess < staleThreshold }
         if (removed) {
             Timber.tag(TAG).d("Cleaned up stale rate limit buckets, ${buckets.size} remaining")
         }
+    }
+
+    /**
+     * Bring the map back to [maxBuckets]: stale buckets first, then the ones
+     * idle longest, never [keep] (the client asking now). A forgotten client
+     * starts again with a full bucket.
+     */
+    @Synchronized
+    private fun trimBuckets(keep: String) {
+        if (buckets.size <= maxBuckets) return
+        removeStale(System.currentTimeMillis())
+        val excess = buckets.size - maxBuckets
+        if (excess <= 0) return
+        // Read each last access once: buckets keep being used while this sorts
+        buckets.entries
+            .map { it.key to it.value.lastAccess }
+            .filter { it.first != keep }
+            .sortedBy { it.second }
+            .take(excess)
+            .forEach { buckets.remove(it.first) }
+        Timber.tag(TAG).w("Tracking too many clients: forgot the $excess idle longest")
     }
 
     /**
@@ -99,6 +132,9 @@ class RateLimiter(
     ) {
         private var tokens: Double = maxTokens.toDouble()
         private var lastRefill: Long = System.currentTimeMillis()
+
+        // Read without the lock when the limiter trims its buckets
+        @Volatile
         var lastAccess: Long = System.currentTimeMillis()
             private set
 

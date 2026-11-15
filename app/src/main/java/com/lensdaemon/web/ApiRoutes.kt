@@ -2,13 +2,15 @@ package com.lensdaemon.web
 
 import android.content.Context
 import android.os.Build
+import android.util.Size
+import com.lensdaemon.BuildConfig
 import com.lensdaemon.camera.CameraService
-import com.lensdaemon.camera.LensType
+import com.lensdaemon.camera.LensSelection
 import com.lensdaemon.director.DirectorManager
-import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.kiosk.KioskManager
 import com.lensdaemon.storage.UploadService
 import com.lensdaemon.thermal.ThermalGovernor
+import com.lensdaemon.web.handlers.ApiHandlerUtils
 import com.lensdaemon.web.handlers.DirectorApiHandler
 import com.lensdaemon.web.handlers.KioskApiHandler
 import com.lensdaemon.web.handlers.StreamApiHandler
@@ -18,7 +20,6 @@ import fi.iki.elonen.NanoHTTPD
 import fi.iki.elonen.NanoHTTPD.Response.Status
 import org.json.JSONArray
 import org.json.JSONObject
-import timber.log.Timber
 import java.io.ByteArrayInputStream
 
 /**
@@ -32,13 +33,14 @@ import java.io.ByteArrayInputStream
  * - [DirectorApiHandler] -> /api/director
  *
  * Status, lens, camera, snapshot, config, and encoder routes remain inline.
+ *
+ * Every request passes, in order: body read, cross-site check ([CrossSiteGuard]),
+ * then [admit]: the rate limit (per connection address) and the token check.
  */
 class ApiRoutes(
     private val context: Context
 ) {
     companion object {
-        private const val TAG = "ApiRoutes"
-
         // Default preview resolution for tap-to-focus coordinate mapping
         private const val DEFAULT_PREVIEW_WIDTH = 1920
         private const val DEFAULT_PREVIEW_HEIGHT = 1080
@@ -54,6 +56,76 @@ class ApiRoutes(
             "/api/status",
             "/api/device"
         )
+
+        private const val BEARER_PREFIX = "Bearer "
+
+        private const val NO_ENCODER = "No encoder running: give the bitrate in a start request or save it as a default"
+        private const val FOCUS_ERROR = "x and y must be finite numbers from 0 to 1"
+        private const val NO_CAMERA_OPEN = "The camera is not open"
+        private const val NO_TAP_FOCUS = "This lens has no tap-to-focus (it needs continuous video autofocus)"
+
+        /**
+         * The checks a request to the API or the MJPEG preview meets once its
+         * body has been read, in this order: the rate limit for its connection
+         * address ([limiter]; none when null), then the token ([token]; none
+         * when null). Null lets the request through.
+         *
+         * The limit comes first so that requests with a wrong token use up
+         * their client's allowance like any others: once a token is set, the
+         * limit is what slows down guessing it.
+         */
+        internal fun admission(
+            session: NanoHTTPD.IHTTPSession,
+            limiter: RateLimiter?,
+            token: String?
+        ): NanoHTTPD.Response? = rateLimitRefusal(session, limiter) ?: tokenRefusal(session, token)
+
+        /**
+         * 429 when [limiter] has no request left for the connection's address.
+         * Headers such as X-Forwarded-For are the client's to choose
+         * (LensDaemon is never behind a proxy), so they would let it dodge the
+         * limit or drain another client's allowance.
+         */
+        private fun rateLimitRefusal(session: NanoHTTPD.IHTTPSession, limiter: RateLimiter?): NanoHTTPD.Response? {
+            limiter ?: return null
+            val clientIp = session.remoteIpAddress ?: session.headers["remote-addr"] ?: "unknown"
+            if (limiter.tryAcquire(clientIp)) return null
+
+            val retryAfter = limiter.retryAfterSeconds(clientIp)
+            val body = JSONObject().put("error", "Rate limit exceeded").put("retryAfter", retryAfter).toString()
+            val response = NanoHTTPD.newFixedLengthResponse(TOO_MANY_REQUESTS, WebServer.MIME_JSON, body)
+            response.addHeader("Retry-After", retryAfter.toString())
+            response.addHeader("X-RateLimit-Remaining", "0")
+            return response
+        }
+
+        /**
+         * 401 when [token] is set and the request does not carry it, as
+         * "Authorization: Bearer <token>" or, from clients that can't send
+         * headers (an <img>, an EventSource), as ?token=. GET /api/status and
+         * /api/device need none.
+         */
+        private fun tokenRefusal(session: NanoHTTPD.IHTTPSession, token: String?): NanoHTTPD.Response? {
+            token ?: return null  // Auth disabled
+
+            // Allow public read-only endpoints without auth
+            if (session.uri in PUBLIC_ENDPOINTS && session.method == NanoHTTPD.Method.GET) {
+                return null
+            }
+
+            val authHeader = session.headers["authorization"] ?: ""
+            val providedToken = if (authHeader.startsWith(BEARER_PREFIX, ignoreCase = true)) {
+                authHeader.substring(BEARER_PREFIX.length).trim()
+            } else {
+                session.parms?.get("token") ?: ""
+            }
+            if (providedToken == token) return null
+
+            val body = JSONObject()
+                .put("error", "Authentication required")
+                .put("hint", "Provide Bearer token in Authorization header")
+            return ApiHandlerUtils.jsonResponse(Status.UNAUTHORIZED, body.toString())
+        }
     }
 
     // Service references (set by WebServerService on main thread, read by NanoHTTPD threads)
@@ -61,6 +133,10 @@ class ApiRoutes(
         set(value) {
             field = value
             streamHandler.cameraService = value
+            // Uploads take only the recordings GET /api/recordings lists, and not the file
+            // the recorder holds open (whatever the recording state, as for delete and download)
+            uploadHandler.recordings = { value?.listRecordings().orEmpty() }
+            uploadHandler.liveRecordingPath = { value?.getRecordingStats()?.currentFilePath }
         }
 
     @Volatile var uploadService: UploadService? = null
@@ -104,79 +180,32 @@ class ApiRoutes(
     private val directorHandler = DirectorApiHandler(context)
 
     /**
-     * Check API authentication.
-     * Returns an error response if auth fails, null if auth passes.
+     * What every API request and the MJPEG preview (/mjpeg) pass once their
+     * body is read: the rate limit, then the token, as [admission] describes,
+     * with this server's [rateLimiter] and [apiToken]. Null when the request
+     * may go ahead, else 429 or 401.
      */
-    private fun checkAuth(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
-        val token = apiToken ?: return null  // Auth disabled
-
-        val uri = session.uri
-        // Allow public read-only endpoints without auth
-        if (uri in PUBLIC_ENDPOINTS && session.method == NanoHTTPD.Method.GET) {
-            return null
-        }
-
-        val authHeader = session.headers["authorization"] ?: ""
-        val providedToken = if (authHeader.startsWith("Bearer ", ignoreCase = true)) {
-            authHeader.substring(7).trim()
-        } else {
-            session.parms?.get("token") ?: ""
-        }
-
-        if (providedToken != token) {
-            return NanoHTTPD.newFixedLengthResponse(
-                Status.UNAUTHORIZED,
-                WebServer.MIME_JSON,
-                """{"error": "Authentication required", "hint": "Provide Bearer token in Authorization header"}"""
-            )
-        }
-        return null
-    }
-
-    /**
-     * Check rate limit for client.
-     * Returns 429 response if rate-limited, null if allowed.
-     */
-    private fun checkRateLimit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? {
-        val limiter = rateLimiter ?: return null
-
-        val clientIp = session.headers["x-forwarded-for"]?.split(",")?.firstOrNull()?.trim()
-            ?: session.headers["remote-addr"]
-            ?: "unknown"
-
-        if (!limiter.tryAcquire(clientIp)) {
-            val retryAfter = limiter.retryAfterSeconds(clientIp)
-            val body = """{"error": "Rate limit exceeded", "retryAfter": $retryAfter}"""
-            val response = NanoHTTPD.newFixedLengthResponse(
-                TOO_MANY_REQUESTS,
-                WebServer.MIME_JSON,
-                body
-            )
-            response.addHeader("Retry-After", retryAfter.toString())
-            response.addHeader("X-RateLimit-Remaining", "0")
-            return response
-        }
-
-        return null
-    }
+    internal fun admit(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response? = admission(session, rateLimiter, apiToken)
 
     /**
      * Handle API request - main dispatcher
      */
     fun handleRequest(session: NanoHTTPD.IHTTPSession): NanoHTTPD.Response {
-        // Check authentication first
-        checkAuth(session)?.let { return it }
-
-        // Check rate limit
-        checkRateLimit(session)?.let { return it }
-
         val uri = session.uri
         val method = session.method
 
-        // Parse request body for POST/PUT
+        // Read the body of a POST or PUT before anything can answer early: NanoHTTPD
+        // does not skip an unread body, which would be taken for the next request
+        // on a kept-alive connection
         val body = if (method == NanoHTTPD.Method.POST || method == NanoHTTPD.Method.PUT) {
-            parseBody(session)
+            RequestBody.readJson(session)
         } else null
+
+        // Refuse writes sent by a page of another site (CSRF)
+        CrossSiteGuard.refusal(method, session.headers)?.let { return ApiHandlerUtils.errorJson(Status.FORBIDDEN, it) }
+
+        // Rate limit, then the token: wrong tokens count against the limit too
+        admit(session)?.let { return it }
 
         // Delegate to per-module handlers by URI prefix
         when {
@@ -226,26 +255,10 @@ class ApiRoutes(
             uri == "/api/encoder/capabilities" && method == NanoHTTPD.Method.GET -> getEncoderCapabilities()
 
             // Not found
-            else -> NanoHTTPD.newFixedLengthResponse(
+            else -> ApiHandlerUtils.jsonResponse(
                 Status.NOT_FOUND,
-                WebServer.MIME_JSON,
-                """{"error": "Endpoint not found", "uri": "$uri", "method": "${method.name}"}"""
+                JSONObject().put("error", "Endpoint not found").put("uri", uri).put("method", method.name).toString()
             )
-        }
-    }
-
-    /**
-     * Parse request body
-     */
-    private fun parseBody(session: NanoHTTPD.IHTTPSession): JSONObject? {
-        return try {
-            val files = mutableMapOf<String, String>()
-            session.parseBody(files)
-            val postData = files["postData"] ?: return null
-            JSONObject(postData)
-        } catch (e: Exception) {
-            Timber.e(e, "$TAG: Error parsing request body")
-            null
         }
     }
 
@@ -256,87 +269,14 @@ class ApiRoutes(
         val json = JSONObject().apply {
             put("status", "ok")
             put("timestamp", System.currentTimeMillis())
-
-            // Camera status
-            put("camera", JSONObject().apply {
-                put("previewActive", camera?.isPreviewActive() ?: false)
-                put("streamingActive", camera?.isStreaming() ?: false)
-                val currentLens = camera?.getCurrentLens()?.value
-                put("currentLens", currentLens?.lensType?.name ?: "none")
-                put("zoom", camera?.currentZoom?.value ?: 1.0f)
-            })
-
-            // Encoder status
-            put("encoder", JSONObject().apply {
-                val state = camera?.encoderState?.value ?: EncoderState.IDLE
-                put("state", state.name)
-                val stats = camera?.getEncoderStats()
-                if (stats != null) {
-                    put("framesEncoded", stats.framesEncoded)
-                    put("currentBitrate", stats.currentBitrateBps)
-                    put("currentFps", stats.currentFps)
-                }
-                camera?.getEncoderConfig()?.let { config ->
-                    put("width", config.width)
-                    put("height", config.height)
-                    put("frameRate", config.frameRate)
-                    put("bitrate", config.bitrateBps)
-                    put("codec", config.codec.name)
-                }
-            })
-
-            // RTSP status
-            put("rtsp", JSONObject().apply {
-                put("running", camera?.isRtspServerRunning() ?: false)
-                put("url", camera?.getRtspUrl() ?: "")
-                put("clients", camera?.getRtspClientCount() ?: 0)
-                put("playing", camera?.getRtspPlayingCount() ?: 0)
-            })
-
-            // MPEG-TS/UDP status
-            put("mpegts", JSONObject().apply {
-                put("running", camera?.isMpegTsRunning() ?: false)
-                val stats = camera?.getMpegTsStats()
-                if (stats != null) {
-                    put("mode", stats.mode.name)
-                    put("connected", stats.isConnected)
-                    put("remoteAddress", stats.remoteAddress)
-                    put("port", stats.port)
-                }
-            })
-
-            // Microphone
+            put("camera", StatusReport.camera(camera))
+            put("encoder", StatusReport.encoder(camera))
+            put("rtsp", StatusReport.rtsp(camera))
+            put("mpegts", StatusReport.mpegTs(camera))
             camera?.let { put("audio", streamHandler.audioStatusJson(it)) }
-
-            // Recording status
-            put("recording", JSONObject().apply {
-                put("active", camera?.isRecording() ?: false)
-                put("paused", camera?.isRecordingPaused() ?: false)
-            })
-
-            // Director status
-            directorManager?.let { director ->
-                put("director", JSONObject().apply {
-                    val status = director.getStatus()
-                    put("enabled", status.enabled)
-                    put("state", status.state.name)
-                    put("currentScene", status.currentScene ?: "")
-                    put("currentCue", status.currentCue ?: "")
-                    put("currentTake", status.takeNumber)
-                    put("stats", JSONObject().apply {
-                        val takeManager = director.getTakeManager()
-                        val takes = takeManager.recordedTakes.value
-                        val goodTakes = takes.count { it.qualityScore >= 7.0f }
-                        val avgScore = if (takes.isNotEmpty()) {
-                            takes.map { it.qualityScore }.average().toFloat()
-                        } else 0f
-                        put("totalTakes", takes.size)
-                        put("goodTakes", goodTakes)
-                        put("averageScore", avgScore)
-                        put("sessionTime", director.getSessionDuration())
-                    })
-                })
-            }
+            put("recording", StatusReport.recording(camera))
+            thermalGovernor?.let { put("thermal", StatusReport.thermal(it)) }
+            directorManager?.let { put("director", StatusReport.director(it)) }
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -354,7 +294,7 @@ class ApiRoutes(
             put("device", Build.DEVICE)
             put("androidVersion", Build.VERSION.RELEASE)
             put("sdkVersion", Build.VERSION.SDK_INT)
-            put("appVersion", "1.0.0")
+            put("appVersion", BuildConfig.VERSION_NAME)
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
@@ -362,27 +302,28 @@ class ApiRoutes(
 
     // ==================== Lens Control ====================
 
+    /**
+     * Switch to the lens a name asks for: "wide", "main" or "tele" (the nearest
+     * lens of that family on this phone) or a lens type such as "ultra_wide".
+     */
     private fun switchLens(uri: String): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
         val lensName = uri.substringAfterLast("/")
-        val lensType = when (lensName.lowercase()) {
-            "wide", "ultrawide" -> LensType.WIDE
-            "main", "primary" -> LensType.MAIN
-            "tele", "telephoto", "zoom" -> LensType.TELEPHOTO
-            else -> return NanoHTTPD.newFixedLengthResponse(
+        if (!LensSelection.isKnownName(lensName)) {
+            return ApiHandlerUtils.jsonResponse(
                 Status.BAD_REQUEST,
-                WebServer.MIME_JSON,
-                """{"error": "Unknown lens type: $lensName"}"""
+                JSONObject().put("success", false).put("error", "Unknown lens: $lensName").toString()
             )
         }
-
-        camera.switchLens(lensType)
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "lens": "${lensType.name}"}"""
+        val lens = camera.findLens(lensName) ?: return ApiHandlerUtils.jsonResponse(
+            Status.NOT_FOUND,
+            JSONObject().put("success", false).put("error", "This phone has no $lensName lens").toString()
         )
+
+        camera.switchLens(lens.lensType)
+
+        return success(JSONObject().put("success", true).put("lens", lens.lensType.name))
     }
 
     private fun getLenses(): NanoHTTPD.Response {
@@ -398,6 +339,8 @@ class ApiRoutes(
                     put(JSONObject().apply {
                         put("type", lens.lensType.name)
                         put("displayName", lens.lensType.displayName)
+                        put("group", LensSelection.familyOf(lens.lensType))
+                        put("zoomFactor", lens.lensType.zoomFactor)
                         put("cameraId", lens.cameraId)
                         put("focalLength", lens.focalLength)
                         put("aperture", lens.aperture)
@@ -411,62 +354,75 @@ class ApiRoutes(
 
     // ==================== Camera Control ====================
 
+    /**
+     * POST /api/zoom {"zoom": 2.5} ("level" is taken too): answers the zoom
+     * applied, within the lens's range. 400 unless the value is a finite number.
+     */
     private fun setZoom(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
-        val zoom = body?.optDouble("zoom", 1.0) ?: 1.0
-        camera.setZoom(zoom.toFloat())
+        val zoom = ApiInputs.zoom(body) ?: return failure(Status.BAD_REQUEST, ApiInputs.ZOOM_ERROR)
+        val applied = camera.setZoom(zoom.toFloat())
 
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "zoom": $zoom}"""
-        )
+        return success(JSONObject().put("success", true).put("zoom", applied))
     }
 
+    /**
+     * POST /api/focus {"x": 0.5, "y": 0.4}, from the left and top edges as
+     * shares of the frame (0 to 1, values beyond are clamped): focus there.
+     * {"reset": true} goes back to continuous autofocus and the camera's own
+     * metering. 400 unless x and y are finite numbers; 409 when the focus
+     * region can't be set (see [tapToFocusRefusal]), so a success means it was.
+     */
     private fun triggerFocus(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
-        val x = body?.optDouble("x", 0.5) ?: 0.5
-        val y = body?.optDouble("y", 0.5) ?: 0.5
+        if (body?.optBoolean("reset") == true) {
+            camera.unlockFocus()
+            camera.resetMetering()
+            return success(JSONObject().put("success", true).put("reset", true))
+        }
+        val x = ApiInputs.finiteNumber(body, "x")?.coerceIn(0.0, 1.0) ?: return failure(Status.BAD_REQUEST, FOCUS_ERROR)
+        val y = ApiInputs.finiteNumber(body, "y")?.coerceIn(0.0, 1.0) ?: return failure(Status.BAD_REQUEST, FOCUS_ERROR)
+        tapToFocusRefusal(camera)?.let { return it }
 
-        camera.triggerTapToFocus(
-            x.toFloat(),
-            y.toFloat(),
-            android.util.Size(DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT)
-        )
+        camera.triggerTapToFocus(x.toFloat(), y.toFloat(), Size(DEFAULT_PREVIEW_WIDTH, DEFAULT_PREVIEW_HEIGHT))
 
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "x": $x, "y": $y}"""
-        )
+        return success(JSONObject().put("success", true).put("x", x).put("y", y))
     }
 
+    /**
+     * 409 when a tap-to-focus would change nothing, else null.
+     * CameraService.triggerTapToFocus applies a region exactly when the lens
+     * the controllers are set up for has continuous video autofocus, and does
+     * nothing (silently) otherwise: before any lens has been opened, or on a
+     * lens without it (fixed focus, or one-shot autofocus only).
+     */
+    private fun tapToFocusRefusal(camera: CameraService): NanoHTTPD.Response? = when {
+        camera.isTapToFocusSupported() -> null
+        camera.getCurrentLens().value == null -> failure(Status.CONFLICT, NO_CAMERA_OPEN)
+        else -> failure(Status.CONFLICT, NO_TAP_FOCUS)
+    }
+
+    /**
+     * POST /api/exposure {"ev": -2}, in the lens's exposure steps: answers the
+     * compensation applied, within the lens's range. 400 unless ev is a whole number.
+     */
     private fun setExposure(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
-        val ev = body?.optInt("ev", 0) ?: 0
-        camera.setExposureCompensation(ev)
+        val ev = ApiInputs.int(body, "ev") ?: return failure(Status.BAD_REQUEST, ApiInputs.EV_ERROR)
+        val applied = camera.setExposureCompensation(ev)
 
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "ev": $ev}"""
-        )
+        return success(JSONObject().put("success", true).put("ev", applied))
     }
 
     // ==================== Snapshot ====================
 
     private fun captureSnapshot(): NanoHTTPD.Response {
-        val callback = onSnapshotRequest ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.SERVICE_UNAVAILABLE,
-            WebServer.MIME_JSON,
-            """{"error": "Snapshot not available"}"""
-        )
+        val callback = onSnapshotRequest ?: return ApiHandlerUtils.errorJson(Status.SERVICE_UNAVAILABLE, "Snapshot not available")
 
-        val jpegData = callback.invoke() ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.INTERNAL_ERROR,
-            WebServer.MIME_JSON,
-            """{"error": "Failed to capture snapshot"}"""
-        )
+        val jpegData = callback.invoke() ?: return ApiHandlerUtils.errorJson(Status.INTERNAL_ERROR, "Failed to capture snapshot")
 
         return NanoHTTPD.newFixedLengthResponse(
             Status.OK,
@@ -478,6 +434,10 @@ class ApiRoutes(
 
     // ==================== Configuration ====================
 
+    /**
+     * GET /api/config: the running encoder's settings (empty while none runs),
+     * the camera's, and "defaults", the phone's stream defaults.
+     */
     private fun getConfig(): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
 
@@ -502,34 +462,46 @@ class ApiRoutes(
                 put("exposureCompensation", captureConfig.exposureCompensation)
                 put("zoom", captureConfig.zoomRatio)
             })
+            put("defaults", camera.streamDefaults().toJson())
         }
 
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }
 
+    /**
+     * PUT /api/config, with any of:
+     * - "bitrate": the running encoder's bitrate from now on (config and status
+     *   report it, and an active thermal cut applies on top); 409 while no encoder runs
+     * - "zoom" and "exposureCompensation", as POST /api/zoom and /api/exposure
+     * - "defaults": some or all of the phone's stream defaults, saved
+     *
+     * The whole body is checked before anything changes (400 with the reason),
+     * and the reply carries the values applied for what was sent.
+     */
     private fun updateConfig(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return serviceUnavailable()
+        body ?: return failure(Status.BAD_REQUEST, "Request body required")
 
-        body ?: return NanoHTTPD.newFixedLengthResponse(
-            Status.BAD_REQUEST,
-            WebServer.MIME_JSON,
-            """{"error": "Request body required"}"""
-        )
+        val (change, error) = ApiInputs.configChange(body, camera.streamDefaults())
+        change ?: return failure(Status.BAD_REQUEST, error ?: "Invalid configuration")
 
-        if (body.has("bitrate")) {
-            camera.updateEncoderBitrate(body.optInt("bitrate", 0))
+        val reply = JSONObject().put("success", true).put("message", "Configuration updated")
+        // First, as the one change that can be refused: a 409 leaves everything as it was
+        val bitrate = change.bitrate
+        if (bitrate != null) {
+            val applied = camera.setEncoderBitrate(bitrate) ?: return failure(Status.CONFLICT, NO_ENCODER)
+            reply.put("bitrate", applied)
         }
-        if (body.has("zoom")) {
-            camera.setZoom(body.optDouble("zoom", 1.0).toFloat())
+        change.zoom?.let { reply.put("zoom", camera.setZoom(it.toFloat())) }
+        change.exposureCompensation?.let { reply.put("exposureCompensation", camera.setExposureCompensation(it)) }
+        val defaults = change.defaults
+        if (defaults != null) {
+            if (!camera.saveStreamDefaults(defaults)) {
+                return failure(Status.INTERNAL_ERROR, "The stream defaults could not be saved")
+            }
+            reply.put("defaults", defaults.toJson())
         }
-        if (body.has("exposureCompensation")) {
-            camera.setExposureCompensation(body.optInt("exposureCompensation", 0))
-        }
-
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.OK, WebServer.MIME_JSON,
-            """{"success": true, "message": "Configuration updated"}"""
-        )
+        return success(reply)
     }
 
     // ==================== Encoder ====================
@@ -547,9 +519,10 @@ class ApiRoutes(
                 put(JSONObject().apply { put("name", "4K"); put("width", 3840); put("height", 2160) })
             })
             put("frameRates", JSONArray().apply { put(15); put(24); put(30); put(60) })
+            // The bitrates PUT /api/config and the stream defaults accept
             put("bitrateRange", JSONObject().apply {
-                put("min", 500000)
-                put("max", 20000000)
+                put("min", ApiInputs.BITRATE_RANGE.first)
+                put("max", ApiInputs.BITRATE_RANGE.last)
             })
         }
 
@@ -558,11 +531,11 @@ class ApiRoutes(
 
     // ==================== Helpers ====================
 
-    private fun serviceUnavailable(): NanoHTTPD.Response {
-        return NanoHTTPD.newFixedLengthResponse(
-            Status.SERVICE_UNAVAILABLE,
-            WebServer.MIME_JSON,
-            """{"error": "Camera service not available"}"""
-        )
-    }
+    private fun serviceUnavailable(): NanoHTTPD.Response = ApiHandlerUtils.serviceUnavailable("Camera service")
+
+    private fun success(json: JSONObject): NanoHTTPD.Response = ApiHandlerUtils.jsonResponse(Status.OK, json.toString())
+
+    /** A refusal: {"success": false, "error": [message]}. */
+    private fun failure(status: Status, message: String): NanoHTTPD.Response =
+        ApiHandlerUtils.jsonResponse(status, JSONObject().put("success", false).put("error", message).toString())
 }

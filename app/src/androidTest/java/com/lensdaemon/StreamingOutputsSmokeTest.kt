@@ -30,7 +30,9 @@ import java.net.ServerSocket
 /**
  * The outputs (RTSP, MPEG-TS, recording) share one encoder through
  * [CameraService]: an output joins a running encoder instead of restarting it,
- * and stopping one output leaves the others streaming.
+ * and stopping one output leaves the others streaming. A thermal pause stops
+ * them all and the resume brings the same ones back; a thermal encoder limit
+ * restarts the encoder with the outputs kept.
  *
  * Runs the real camera and encoder at a small size so it works on the
  * emulator's virtual camera. Skipped on devices without a back camera.
@@ -128,6 +130,61 @@ class StreamingOutputsSmokeTest {
                 sent <= encoded + 20
             )
         }
+    }
+
+    @Test
+    fun thermalPauseStopsOutputsAndResumeRestartsThem() {
+        val rtspPort = ServerSocket(0).use { it.localPort }
+        assertTrue("RTSP streaming should start", retryFor(10_000) { service.startRtspStreaming(config, rtspPort) })
+
+        DatagramSocket(0, IPV4_LOOPBACK).use { receiver ->
+            val mpegts = MpegTsUdpConfig(mode = MpegTsMode.CALLER, targetHost = "127.0.0.1", targetPort = receiver.localPort)
+            assertTrue("MPEG-TS should start", service.startMpegTsStreaming(config, mpegts))
+            assertTrue("frames should be published", waitUntil(20_000) { (service.getMpegTsStats()?.framesSent ?: 0) > 5 })
+
+            service.pauseForThermal()
+            assertTrue("the thermal pause should be in effect", service.isThermalPaused())
+            assertFalse("RTSP should be stopped", service.isRtspServerRunning())
+            assertFalse("MPEG-TS should be stopped", service.isMpegTsRunning())
+            assertFalse("the encoder should be stopped", service.isStreaming())
+            // A real cool-down takes minutes: let the camera drop the stopped
+            // encoder's surface and the encoder be released before resuming
+            waitUntil(10_000) { service.getEncoderStats() == null }
+
+            service.resumeAfterThermal()
+            assertFalse("the thermal pause should be over", service.isThermalPaused())
+            assertTrue(
+                "RTSP and MPEG-TS should run again",
+                waitUntil(10_000) { service.isRtspServerRunning() && service.isMpegTsRunning() }
+            )
+            assertEquals("RTSP should come back on its port", rtspPort, service.getRtspServerStats()?.port)
+            assertEquals("MPEG-TS should come back to the same target", mpegts, service.getMpegTsConfig())
+            assertTrue(
+                "frames should flow again",
+                waitUntil(20_000) { (service.getMpegTsStats()?.framesSent ?: 0) > 5 }
+            )
+        }
+    }
+
+    @Test
+    fun thermalFrameRateLimitRestartsTheEncoderAndClearingItRestoresIt() {
+        val rtspPort = ServerSocket(0).use { it.localPort }
+        assertTrue("RTSP streaming should start", retryFor(10_000) { service.startRtspStreaming(config, rtspPort) })
+
+        try {
+            service.setThermalEncoderLimits(reduceResolution = false, reduceFramerate = true)
+            assertEquals("the encoder should run at 24 fps", 24, service.getEncoderConfig()?.frameRate)
+            assertEquals("the size should stay as asked", 640, service.getEncoderConfig()?.width)
+            assertTrue("RTSP should keep running through the restart", service.isRtspServerRunning())
+            assertTrue(
+                "the limited encoder should produce frames",
+                waitUntil(20_000) { (service.getEncoderStats()?.framesEncoded ?: 0) > 5 }
+            )
+        } finally {
+            service.setThermalEncoderLimits(reduceResolution = false, reduceFramerate = false)
+        }
+        assertEquals("the requested 30 fps should come back", 30, service.getEncoderConfig()?.frameRate)
+        assertTrue("RTSP should still run", service.isRtspServerRunning())
     }
 
     private fun retryFor(timeoutMs: Long, attempt: () -> Boolean): Boolean {

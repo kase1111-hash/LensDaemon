@@ -92,6 +92,13 @@ class FrameProcessor(
             val newEncoder = VideoEncoder(encoderConfig)
             encoder = newEncoder
 
+            // A codec that fails while running stops producing: report it, so
+            // the owner can rebuild the encoder instead of waiting forever
+            newEncoder.onError = {
+                isRunning.set(false)
+                _state.value = ProcessorState.ERROR
+            }
+
             // Initialize encoder and get input surface
             val surfaceResult = newEncoder.initialize()
             if (surfaceResult.isFailure) {
@@ -241,11 +248,28 @@ class FrameProcessor(
     }
 
     /**
-     * Update encoding bitrate
+     * Update encoding bitrate, within the adaptive range (a quarter to twice
+     * the configured bitrate). Temporary: thermal and adaptive changes use it.
      */
     fun updateBitrate(newBitrateBps: Int) {
         currentBitrate = newBitrateBps.coerceIn(minBitrate, maxBitrate)
         encoder?.updateBitrate(currentBitrate)
+    }
+
+    /**
+     * Make [bps] the configured bitrate: apply it now and re-centre the
+     * adaptive range on it (a quarter to twice it), so later thermal or
+     * adaptive changes through [updateBitrate] scale from it. The caller
+     * clamps [bps] to what the codec supports.
+     *
+     * @return the bitrate applied
+     */
+    fun setConfiguredBitrate(bps: Int): Int {
+        minBitrate = bps / 4
+        maxBitrate = bps * 2
+        currentBitrate = bps
+        encoder?.updateBitrate(bps)
+        return bps
     }
 
     /**
@@ -285,9 +309,10 @@ class FrameProcessor(
     }
 
     /**
-     * Get encoder statistics
+     * Get encoder statistics as of now: frame rate and bitrate over the last
+     * two seconds, 0 when no frame has come for that long
      */
-    fun getEncoderStats(): EncoderStats? = encoder?.stats?.value
+    fun getEncoderStats(): EncoderStats? = encoder?.currentStats()
 
     /**
      * Get current encoder state

@@ -2,7 +2,6 @@ package com.lensdaemon.camera
 
 import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CameraMetadata
 import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.params.MeteringRectangle
@@ -10,7 +9,6 @@ import android.util.Range
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import timber.log.Timber
-import kotlin.math.roundToInt
 
 /**
  * Controls camera exposure including auto-exposure, exposure compensation,
@@ -19,7 +17,9 @@ import kotlin.math.roundToInt
 class ExposureController {
 
     companion object {
-        private const val DEFAULT_METERING_WEIGHT = 1000
+        private const val DEFAULT_METERING_WEIGHT = MeteringRectangle.METERING_WEIGHT_MAX
+
+        // Spot metering region size as a share of the picture's width and height
         private const val TAP_REGION_SIZE_PERCENT = 0.15f
     }
 
@@ -65,6 +65,8 @@ class ExposureController {
      */
     fun initialize(characteristics: CameraCharacteristics) {
         sensorArraySize = characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+        // A spot region of the previous lens is in that lens's coordinates
+        currentAeRegions = null
 
         exposureCompensationRange = characteristics.get(
             CameraCharacteristics.CONTROL_AE_COMPENSATION_RANGE
@@ -181,34 +183,23 @@ class ExposureController {
     fun getSupportedWhiteBalanceModes(): List<WhiteBalanceMode> = supportedWhiteBalanceModes
 
     /**
-     * Trigger spot metering at the specified normalized coordinates.
-     * @param x Normalized X coordinate (0.0 to 1.0)
-     * @param y Normalized Y coordinate (0.0 to 1.0)
-     * @return The metering regions to apply
+     * Trigger spot metering at the specified normalized coordinates, mapped
+     * onto the sensor's 16:9 picture band like tap-to-focus
+     * ([MeteringRegions.tapRect]).
+     * @param x Normalized X coordinate (0.0 to 1.0, left to right)
+     * @param y Normalized Y coordinate (0.0 to 1.0, top to bottom)
+     * @return The AE regions to apply, or null before a camera is set up
      */
     fun triggerSpotMetering(x: Float, y: Float): Array<MeteringRectangle>? {
         val sensor = sensorArraySize ?: return null
 
-        val sensorX = (x * sensor.width()).roundToInt()
-        val sensorY = (y * sensor.height()).roundToInt()
+        val rect = MeteringRegions.tapRect(x, y, sensor.width(), sensor.height(), sizeFraction = TAP_REGION_SIZE_PERCENT)
+        val region = MeteringRectangle(rect.toRect(), DEFAULT_METERING_WEIGHT)
 
-        val regionWidth = (sensor.width() * TAP_REGION_SIZE_PERCENT).roundToInt()
-        val regionHeight = (sensor.height() * TAP_REGION_SIZE_PERCENT).roundToInt()
+        currentAeRegions = arrayOf(region)
+        Timber.i("Spot metering at ($x, $y) -> sensor region ${rect.joinToString()}")
 
-        val left = (sensorX - regionWidth / 2).coerceIn(0, sensor.width() - regionWidth)
-        val top = (sensorY - regionHeight / 2).coerceIn(0, sensor.height() - regionHeight)
-        val right = left + regionWidth
-        val bottom = top + regionHeight
-
-        val meteringRect = MeteringRectangle(
-            Rect(left, top, right, bottom),
-            DEFAULT_METERING_WEIGHT
-        )
-
-        currentAeRegions = arrayOf(meteringRect)
-        Timber.i("Spot metering at ($x, $y) -> sensor ($sensorX, $sensorY)")
-
-        return currentAeRegions
+        return arrayOf(region)
     }
 
     /**
@@ -220,7 +211,8 @@ class ExposureController {
     }
 
     /**
-     * Update exposure state from capture result.
+     * Follow the camera's auto-exposure state (CONTROL_AE_STATE) in a frame's
+     * capture result. Called for every frame, on the camera thread.
      */
     fun updateFromCaptureResult(result: CaptureResult) {
         val aeState = result.get(CaptureResult.CONTROL_AE_STATE) ?: return
@@ -237,13 +229,6 @@ class ExposureController {
 
         if (_exposureState.value != newState) {
             _exposureState.value = newState
-        }
-
-        // Capture current ISO and exposure time for display
-        result.get(CaptureResult.SENSOR_SENSITIVITY)?.let { iso ->
-            if (_manualIso.value == null) {
-                // Store for reference but don't update state (auto mode)
-            }
         }
     }
 

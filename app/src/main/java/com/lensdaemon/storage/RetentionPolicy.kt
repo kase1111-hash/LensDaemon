@@ -2,6 +2,7 @@ package com.lensdaemon.storage
 
 import timber.log.Timber
 import java.io.File
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
@@ -154,15 +155,31 @@ class RetentionPolicy(
 ) {
     companion object {
         private const val TAG = "RetentionPolicy"
+
+        /**
+         * Held while a policy is enforced. Every policy in the app works on the
+         * one recordings folder (the recorder's scheduled and low-space runs, a
+         * recording start, POST /api/storage/cleanup), so runs take turns
+         * instead of choosing and deleting the same files at once.
+         */
+        private val enforceLock = Any()
     }
 
     /**
-     * Enforce the retention policy on a directory
+     * Enforce the retention policy on a directory. Runs one at a time across
+     * all policies. A file that is already gone when its turn to be deleted
+     * comes (deleted by someone else meanwhile) is neither counted as deleted
+     * nor reported as failed.
      *
      * @param directory The directory to enforce policy on
+     * @param exclude Paths of files to leave alone and leave out of the size and
+     *   free-space sums, such as the segment being recorded; compared by canonical path
      * @return Result of the enforcement
      */
-    fun enforce(directory: File): RetentionResult {
+    fun enforce(directory: File, exclude: Set<String> = emptySet()): RetentionResult =
+        synchronized(enforceLock) { enforceNow(directory, exclude) }
+
+    private fun enforceNow(directory: File, exclude: Set<String>): RetentionResult {
         val startTime = System.currentTimeMillis()
 
         if (!directory.exists() || !directory.isDirectory) {
@@ -175,8 +192,8 @@ class RetentionPolicy(
 
         Timber.tag(TAG).d("Enforcing retention policy on ${directory.absolutePath}")
 
-        // Get all matching files
-        val files = getMatchingFiles(directory)
+        // Get all matching files, except the excluded ones
+        val files = withoutExcluded(getMatchingFiles(directory), exclude)
         if (files.isEmpty()) {
             // Still clean up empty directories if configured
             val dirsDeleted = if (config.deleteEmptyDirs) deleteEmptyDirectories(directory) else 0
@@ -223,9 +240,11 @@ class RetentionPolicy(
                     filesDeleted++
                     bytesFreed += size
                     Timber.tag(TAG).d("Deleted: ${fileInfo.name} (${size / 1024}KB)")
-                } else {
+                } else if (fileInfo.exists()) {
                     failedFiles.add(fileInfo.absolutePath)
                     Timber.tag(TAG).w("Failed to delete: ${fileInfo.absolutePath}")
+                } else {
+                    Timber.tag(TAG).d("Already gone: ${fileInfo.name}")
                 }
             } catch (e: Exception) {
                 failedFiles.add(fileInfo.absolutePath)
@@ -261,8 +280,10 @@ class RetentionPolicy(
 
     /**
      * Preview what would be deleted without actually deleting
+     *
+     * @param exclude Paths of files [enforce] would leave alone (see there)
      */
-    fun preview(directory: File): List<File> {
+    fun preview(directory: File, exclude: Set<String> = emptySet()): List<File> {
         if (!directory.exists() || !directory.isDirectory) {
             return emptyList()
         }
@@ -271,7 +292,7 @@ class RetentionPolicy(
             return emptyList()
         }
 
-        val files = getMatchingFiles(directory)
+        val files = withoutExcluded(getMatchingFiles(directory), exclude)
         if (files.isEmpty()) {
             return emptyList()
         }
@@ -342,6 +363,23 @@ class RetentionPolicy(
             }
 
         return files
+    }
+
+    /**
+     * [files] without those whose canonical path is one of [exclude]'s. A file
+     * whose path can't be resolved is left out too: it is kept, not deleted.
+     */
+    private fun withoutExcluded(files: List<RecordingFileInfo>, exclude: Set<String>): List<RecordingFileInfo> {
+        if (exclude.isEmpty()) return files
+        val excluded = exclude.mapNotNullTo(HashSet()) { canonicalPathOrNull(File(it)) }
+        return files.filter { info -> canonicalPathOrNull(info.file)?.let { it !in excluded } ?: false }
+    }
+
+    private fun canonicalPathOrNull(file: File): String? = try {
+        file.canonicalPath
+    } catch (e: IOException) {
+        Timber.tag(TAG).w(e, "Cannot resolve ${file.path}")
+        null
     }
 
     /**

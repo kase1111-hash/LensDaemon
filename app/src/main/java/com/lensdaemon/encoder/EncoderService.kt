@@ -18,6 +18,7 @@ import com.lensdaemon.MainActivity
 import com.lensdaemon.R
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -36,6 +37,13 @@ class EncoderService : Service() {
         private const val TAG = "EncoderService"
         private const val NOTIFICATION_ID = 2001
         private const val CHANNEL_ID = "encoder_service_channel"
+
+        /**
+         * Bitrates accepted when the codec does not report its range. Keep it
+         * equal to StreamDefaults.BITRATE_RANGE (not referenced, so that the
+         * encoder does not depend on the camera package).
+         */
+        private val DEFAULT_BITRATE_RANGE = 100_000..50_000_000
 
         // Intent actions
         const val ACTION_START_ENCODING = "com.lensdaemon.action.START_ENCODING"
@@ -100,11 +108,23 @@ class EncoderService : Service() {
     private val _encoderState = MutableStateFlow(EncoderState.IDLE)
     val encoderState: StateFlow<EncoderState> = _encoderState.asStateFlow()
 
-    // Current configuration
+    // Current configuration; its bitrate follows setConfiguredBitrate
+    @Volatile
     private var currentConfig: EncoderConfig? = null
 
     // Frame listeners (for RTSP server, file writer, etc.)
     private val frameListeners = mutableListOf<(EncodedFrame) -> Unit>()
+
+    /** Follows the current frame processor's state; replaced with each new encoder. */
+    private var stateJob: Job? = null
+
+    /**
+     * True once started in the foreground (ACTION_START_ENCODING). Only then
+     * does this service post its own notification: when it is merely bound
+     * (by CameraService, whose notification covers encoding) it posts none.
+     */
+    @Volatile
+    private var inForeground = false
 
     override fun onCreate() {
         super.onCreate()
@@ -132,6 +152,7 @@ class EncoderService : Service() {
                 )
 
                 startForeground(NOTIFICATION_ID, createNotification("Initializing encoder..."))
+                inForeground = true
                 initializeEncoder(config)
             }
             ACTION_STOP_ENCODING -> {
@@ -153,6 +174,8 @@ class EncoderService : Service() {
         super.onDestroy()
         releaseEncoder()
         serviceScope.cancel()
+        // Nothing of this service's stays on screen once it is gone
+        getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
         Timber.i("$TAG: Service destroyed")
     }
 
@@ -249,11 +272,17 @@ class EncoderService : Service() {
      * Release encoder resources
      */
     fun releaseEncoder() {
+        // A released processor's state no longer speaks for this service
+        stateJob?.cancel()
+        stateJob = null
         frameProcessor?.release()
         frameProcessor = null
         _isEncoding.value = false
         _encoderState.value = EncoderState.IDLE
         currentConfig = null
+        if (!inForeground) {
+            getSystemService(NotificationManager::class.java).cancel(NOTIFICATION_ID)
+        }
         Timber.i("$TAG: Encoder released")
     }
 
@@ -270,11 +299,33 @@ class EncoderService : Service() {
     }
 
     /**
-     * Update encoding bitrate
+     * Update encoding bitrate for now (thermal and adaptive changes). The
+     * configured bitrate that [getConfig] reports stays as it is; see
+     * [setConfiguredBitrate].
      */
     fun updateBitrate(newBitrateBps: Int) {
         frameProcessor?.updateBitrate(newBitrateBps)
         updateNotification("Encoding: ${currentConfig?.width}x${currentConfig?.height} @ ${newBitrateBps / 1000}kbps")
+    }
+
+    /**
+     * Make [bps] the running encoder's configured bitrate: clamped to the
+     * range the codec supports, applied at once, and reported by [getConfig]
+     * from then on. Thermal and adaptive changes ([updateBitrate]) stay
+     * temporary and scale from it.
+     *
+     * @return the bitrate applied, or null when no encoder is running
+     */
+    fun setConfiguredBitrate(bps: Int): Int? {
+        if (_encoderState.value != EncoderState.ENCODING) return null
+        val config = currentConfig ?: return null
+        val range = getEncoderCapabilities(config.codec)?.bitrateRange?.takeUnless { it.isEmpty() }
+            ?: DEFAULT_BITRATE_RANGE
+        val applied = bps.coerceIn(range)
+        currentConfig = config.copy(bitrateBps = applied)
+        frameProcessor?.setConfiguredBitrate(applied)
+        updateNotification("Encoding: ${config.width}x${config.height} @ ${applied / 1000}kbps")
+        return applied
     }
 
     /**
@@ -391,11 +442,15 @@ class EncoderService : Service() {
     }
 
     /**
-     * Observe encoder state changes
+     * Observe the current frame processor's state: one collector at a time,
+     * so collectors don't pile up with every new encoder. A runtime codec
+     * failure reaches [encoderState] as [EncoderState.ERROR].
      */
     private fun observeEncoderState() {
-        serviceScope.launch {
-            frameProcessor?.state?.collect { state ->
+        val processor = frameProcessor ?: return
+        stateJob?.cancel()
+        stateJob = serviceScope.launch {
+            processor.state.collect { state ->
                 when (state) {
                     ProcessorState.ERROR -> {
                         _encoderState.value = EncoderState.ERROR
@@ -454,9 +509,10 @@ class EncoderService : Service() {
     }
 
     /**
-     * Update notification
+     * Update notification; only while started in the foreground (see [inForeground])
      */
     private fun updateNotification(status: String) {
+        if (!inForeground) return
         val notificationManager = getSystemService(NotificationManager::class.java)
         notificationManager.notify(NOTIFICATION_ID, createNotification(status))
     }

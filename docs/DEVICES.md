@@ -65,14 +65,14 @@ The following devices have been tested with LensDaemon by the community. Results
 
 ### Samsung
 
-- **Aggressive thermal throttling.** Samsung devices have vendor-level thermal management that can throttle the CPU and GPU independently of Android's thermal API. LensDaemon may not detect these throttle events through standard `PowerManager` thermal callbacks. The `AGGRESSIVE` thermal preset is recommended for Samsung devices in warm environments.
+- **Aggressive thermal throttling.** Samsung devices have vendor-level thermal management that can throttle the CPU and GPU independently of Android's thermal API. LensDaemon may not detect these throttle events through standard `PowerManager` thermal callbacks. The `AGGRESSIVE` thresholds (see [Thermal Profiles](#thermal-profiles)) are recommended for Samsung devices in warm environments.
 - **Exynos vs. Snapdragon.** Exynos variants (common in Europe/Asia) tend to run hotter than Snapdragon variants under sustained encoding workloads. Check your chipset with `adb shell getprop ro.hardware`.
 - **Camera switching delay.** Samsung's Camera2 implementation adds a noticeable delay (~200-500ms) when switching between rear camera lenses compared to Pixel devices.
 
 ### Google Pixel
 
 - **USB camera switching.** When a USB camera or accessory is connected, some Pixel devices may re-enumerate camera IDs, causing LensDaemon to lose its reference to the active camera. Disconnect USB accessories before starting a streaming session, or restart the camera service after connecting.
-- **Tensor thermal behavior.** Pixel 6 and newer use Google Tensor chips, which run warmer than Qualcomm equivalents under sustained H.265 encoding. The `DEFAULT` thermal profile works well, but consider `AGGRESSIVE` for 4K encoding sessions.
+- **Tensor thermal behavior.** Pixel 6 and newer use Google Tensor chips, which run warmer than Qualcomm equivalents under sustained H.265 encoding. The bundled Pixel 6, 7 and 8 profiles, applied automatically to those exact models (a Pro or `a` model may get another entry or the generic thresholds, see [Thermal Profiles](#thermal-profiles)), already set lower CPU thresholds than the generic ones; consider the `AGGRESSIVE` thresholds for 4K encoding sessions.
 - **Night Sight interference.** Pixel's computational photography pipeline is not used by LensDaemon (which accesses Camera2 directly), but some background camera processes may briefly interfere with session startup.
 
 ### OnePlus
@@ -82,55 +82,123 @@ The following devices have been tested with LensDaemon by the community. Results
 
 ## Thermal Profiles
 
-LensDaemon includes three built-in thermal presets in `ThermalConfig.kt`. Choose a preset based on your deployment environment:
+LensDaemon reads the CPU and battery temperatures every 5 seconds and throttles
+in steps. The thresholds come from a thermal profile:
+
+- **Bundled profiles** for the Pixel 5, 6, 7 and 8, Galaxy S22, S23, S24+ and A54,
+  OnePlus 11 and Xiaomi 13 (`app/src/main/assets/thermal_profiles.json`). When
+  the app starts it takes the entry whose model name equals the phone's model
+  name (such as `Pixel 7`) or device name exactly; failing that, the first
+  entry for the phone's chip (`socModel`, which some phones leave empty);
+  failing that, the generic thresholds. So today:
+  - The Pixel 5, 6, 7 and 8 get their own entries by name. Their Pro and `a`
+    models have other names and are matched by chip, if at all: they may get
+    another phone's entry or the generic thresholds.
+  - Samsung model names carry a variant suffix (`SM-S911B` against the
+    entry's `SM-S911`), so Samsung phones are matched by chip only: the
+    Snapdragon Galaxy S22, S23 and S24+ get their entries, while the Exynos S22
+    (`SM-S901B`) and S24+ (`SM-S926B`) and the Galaxy A54 get the generic
+    thresholds.
+  - The OnePlus 11 and Xiaomi 13 report model names (`CPH2449`, `2211133G`)
+    other than their entries' (`OnePlus 11`, `Xiaomi 13`), and share the Galaxy
+    S23's chip, so both get the Galaxy S23 entry: the same thresholds as the
+    OnePlus 11's own, while its CPU thresholds are 1°C above the Xiaomi 13's
+    own.
+
+  Check which profile your phone got with `GET /api/thermal/profile`, and how it
+  identifies itself with `GET /api/thermal/profile/device`. To use another
+  entry's thresholds (`GET /api/thermal/profiles` lists them all), save them as
+  an override with `PUT /api/thermal/profile` (see below); for the Xiaomi 13:
+  `cpuWarnC` 47, `cpuCriticalC` 52, `cpuEmergencyC` 57, `batteryWarnC` 42,
+  `batteryCriticalC` 45, `batteryEmergencyC` 48.
+- **Generic** thresholds (the DEFAULT set below) on every other phone.
+- **Your own thresholds**, saved as an override with `PUT /api/thermal/profile`.
+  They apply at once and after restarts, until `DELETE /api/thermal/profile`
+  goes back to the bundled or generic profile.
+
+See which profile is in force, and the thresholds in use:
+
+```bash
+curl http://{device-ip}:8080/api/thermal/profile
+```
+
+### What happens at each level
+
+| Level | What LensDaemon does |
+|-------|----------------------|
+| Elevated (5°C below CPU Warning, 4°C below battery Warning) | Nothing |
+| CPU Warning | Bitrate cut by 20% |
+| CPU Critical | Bitrate cut by 40%; the encoder restarts one resolution step down (4K to 1080p, 1080p to 720p) at no more than 24 fps, keeping the outputs connected |
+| Battery Warning or above | Charging held, on phones whose charging switch the app can write; elsewhere the dashboard and API advise unplugging the charger |
+| CPU or battery Emergency | Every output (RTSP, MPEG-TS, recording) stops, and starts again by itself once neither is at Emergency |
+
+A level is left only 3°C (CPU) or 2°C (battery) below its threshold, so the
+throttling does not switch on and off around a threshold: with the DEFAULT
+thresholds, outputs paused at 60°C restart once the CPU is below 57°C. The
+event log (`GET /api/thermal/events`) marks rises to Critical and Emergency
+with `ALERT_USER`; that is a log marker only, no alert is posted.
+
+### Battery charge limiting
+
+On a phone whose kernel offers a charging switch the app itself may write (no
+root), LensDaemon holds the battery at 50%: it stops charging there and charges
+again below 40%. Most phones have no such switch; there LensDaemon cannot stop
+charging and tells you instead when to unplug the charger (the dashboard's
+temperature panel, and `recommendation` in `GET /api/thermal/battery`). The
+50%/40% levels are not part of a thermal profile.
 
 ### DEFAULT
 
-Balanced settings suitable for most indoor environments.
+The generic thresholds, balanced for most indoor environments.
 
-| Parameter | CPU | Battery |
+| Threshold | CPU | Battery |
 |-----------|-----|---------|
-| Normal max | 45C | 38C |
-| Warning | 50C | 42C |
-| Critical | 55C | 45C |
-| Emergency | 60C | 48C |
-| Battery target charge | 50% | |
-
-Actions at each level:
-- **Warning** -- Reduce bitrate by 20%; disable charging
-- **Critical** -- Reduce resolution and framerate; alert user
-- **Emergency** -- Pause streaming; alert user
+| Warning | 50°C | 42°C |
+| Critical | 55°C | 45°C |
+| Emergency | 60°C | 48°C |
 
 ### AGGRESSIVE
 
-Lower thresholds for hot environments, direct sunlight, or devices with poor thermal dissipation (e.g., Samsung Exynos variants).
+Lower thresholds for hot environments, direct sunlight, or devices with poor
+thermal dissipation (e.g., Samsung Exynos variants).
 
-| Parameter | CPU | Battery |
+| Threshold | CPU | Battery |
 |-----------|-----|---------|
-| Normal max | 40C | 35C |
-| Warning | 45C | 38C |
-| Critical | 50C | 42C |
-| Emergency | 55C | 45C |
-| Battery target charge | 40% | |
+| Warning | 45°C | 38°C |
+| Critical | 50°C | 42°C |
+| Emergency | 55°C | 45°C |
+
+Save it as an override:
+
+```bash
+curl -X PUT http://{device-ip}:8080/api/thermal/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"displayName":"Hot room","cpuWarnC":45,"cpuCriticalC":50,"cpuEmergencyC":55,"batteryWarnC":38,"batteryCriticalC":42,"batteryEmergencyC":45}'
+```
 
 ### RELAXED
 
-Higher thresholds for devices with active cooling (fans, heatsinks) or cooled enclosures.
+Higher thresholds for devices with active cooling (fans, heatsinks) or cooled
+enclosures.
 
-| Parameter | CPU | Battery |
+| Threshold | CPU | Battery |
 |-----------|-----|---------|
-| Normal max | 50C | 42C |
-| Warning | 55C | 45C |
-| Critical | 60C | 48C |
-| Emergency | 65C | 52C |
-| Battery target charge | 60% | |
-
-Set the thermal profile via the REST API:
+| Warning | 55°C | 45°C |
+| Critical | 60°C | 48°C |
+| Emergency | 65°C | 52°C |
 
 ```bash
-curl -X PUT http://{device-ip}:8080/api/thermal/config \
-  -H "Content-Type: application/json" \
-  -d '{"preset": "AGGRESSIVE"}'
+curl -X PUT http://{device-ip}:8080/api/thermal/profile \
+  -H 'Content-Type: application/json' \
+  -d '{"displayName":"Cooled enclosure","cpuWarnC":55,"cpuCriticalC":60,"cpuEmergencyC":65,"batteryWarnC":45,"batteryCriticalC":48,"batteryEmergencyC":52}'
+```
+
+Send all six thresholds: one left out takes the DEFAULT value, not the one in
+force. Each set must rise from Warning to Critical to Emergency. Go back to the
+bundled or generic profile with:
+
+```bash
+curl -X DELETE http://{device-ip}:8080/api/thermal/profile
 ```
 
 ## Contributing a Device Profile
@@ -145,10 +213,11 @@ If you test LensDaemon on a device not listed above, please submit a PR or open 
 6. **Thermal behavior** -- Run a 30-minute 1080p30 streaming session and note:
    - Peak CPU temperature
    - Peak battery temperature
-   - Whether thermal throttling occurred
-   - Which thermal preset worked best
+   - Whether thermal throttling occurred, and at which levels (`GET /api/thermal/events`)
+   - Which thresholds worked best
 7. **Known quirks** -- Any camera switching delays, encoder issues, or unexpected behavior
-8. **Recommended thermal preset** (DEFAULT, AGGRESSIVE, or RELAXED)
+8. **Recommended thresholds** for a bundled profile: CPU and battery Warning, Critical and Emergency, plus the bitrate, resolution and frame rate the phone sustains (the fields of an entry in `app/src/main/assets/thermal_profiles.json`)
+9. **Chip model**, from `GET /api/thermal/profile/device`
 
 ### Gathering Thermal Data
 
@@ -158,11 +227,16 @@ Start a streaming session and monitor temperatures via the REST API:
 # Check current temperatures
 curl http://{device-ip}:8080/api/thermal/status
 
-# Get temperature history (after a session)
+# Get temperature history (one entry a minute, last 24 hours)
 curl http://{device-ip}:8080/api/thermal/history
 
-# Get statistics (min/max/average)
+# Get statistics (min/max/average, time at each level)
 curl http://{device-ip}:8080/api/thermal/stats
+
+# Get the level changes and the throttling they caused
+curl http://{device-ip}:8080/api/thermal/events
 ```
+
+The history and the events are kept on the phone across app restarts.
 
 Or view the thermal data in real time on the web dashboard at `http://{device-ip}:8080`.

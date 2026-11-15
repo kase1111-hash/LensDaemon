@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-    <!-- Library module manifest; no components declared here.
-         DirectorService stays in :app since it depends on app-level types. -->
+    <!-- Library module manifest; it declares no components. The director runs inside the
+         app's WebServerService, which creates the DirectorManager and its camera adapter. -->
 </manifest>

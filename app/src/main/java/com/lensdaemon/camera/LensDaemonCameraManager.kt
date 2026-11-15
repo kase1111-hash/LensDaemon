@@ -81,6 +81,9 @@ class LensDaemonCameraManager(private val context: Context) {
     /** The open camera's CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES. */
     private var availableFpsRanges: List<IntRange> = emptyList()
 
+    /** The open camera's active array, AF/AE region counts and zoom-ratio support, for zoom and tap regions. */
+    @Volatile private var lensGeometry = LensGeometry.UNKNOWN
+
     /**
      * The clock this camera's frame timestamps (and so video presentation
      * times) are on. Audio is stamped on the same clock to stay in sync.
@@ -111,6 +114,13 @@ class LensDaemonCameraManager(private val context: Context) {
      */
     @Volatile
     var onImageAvailable: ((android.media.Image) -> Unit)? = null
+
+    /**
+     * Receives every frame's capture result from the repeating request, on the
+     * camera thread (see [captureResultCallback]); must return quickly. Takes
+     * effect with the next repeating request.
+     */
+    @Volatile var captureCallback: CameraCaptureSession.CaptureCallback? = null
 
     init {
         enumerateCameras()
@@ -243,15 +253,9 @@ class LensDaemonCameraManager(private val context: Context) {
             6.0f
         }
 
-        val equivalent35mm = focalLength * cropFactor
-
-        return when {
-            equivalent35mm < 18 -> LensType.ULTRA_WIDE
-            equivalent35mm < 28 -> LensType.WIDE
-            equivalent35mm < 50 -> LensType.MAIN
-            equivalent35mm < 100 -> LensType.TELEPHOTO
-            else -> LensType.SUPER_TELEPHOTO
-        }
+        // Phone terms: the ~24mm main camera is MAIN (with photography's 28-50mm
+        // "normal" range it was WIDE, so "main" found no lens on most phones)
+        return LensSelection.typeForEquivalentFocalLength(focalLength * cropFactor)
     }
 
     /**
@@ -383,8 +387,9 @@ class LensDaemonCameraManager(private val context: Context) {
      */
     @SuppressLint("MissingPermission")
     suspend fun openCamera(lensType: LensType): Boolean {
-        val lens = _availableLenses.find { it.lensType == lensType }
-            ?: _availableLenses.find { it.lensType == LensType.MAIN }
+        val types = _availableLenses.map { it.lensType }
+        val type = LensSelection.pick(lensType, types) ?: LensSelection.pick(LensType.MAIN, types)
+        val lens = _availableLenses.find { it.lensType == type }
             ?: _availableLenses.firstOrNull()
 
         if (lens == null) {
@@ -457,6 +462,7 @@ class LensDaemonCameraManager(private val context: Context) {
             Timber.i("Camera opened: ${lens.cameraId}")
             cameraDevice = camera
             availableFpsRanges = queryFpsRanges(lens.cameraId)
+            lensGeometry = cameraManager.lensGeometry(lens.cameraId)
             mediaClock = queryMediaClock(lens.cameraId)
             _currentLens.value = lens
             _cameraState.value = CameraState.OPENED
@@ -674,6 +680,8 @@ class LensDaemonCameraManager(private val context: Context) {
     private fun startRepeatingRequest() {
         val device = cameraDevice ?: return
         val session = captureSession ?: return
+        // Capture results arrive on the camera thread; without it the camera is closing
+        val handler = cameraHandler ?: return
         val targets = activeSurfaces()
         if (targets.isEmpty()) return
 
@@ -694,13 +702,10 @@ class LensDaemonCameraManager(private val context: Context) {
             set(CaptureRequest.CONTROL_AWB_MODE, currentConfig.whiteBalance.camera2Mode)
             set(CaptureRequest.CONTROL_AE_EXPOSURE_COMPENSATION, currentConfig.exposureCompensation)
 
-            // Set zoom if supported
-            if (currentConfig.zoomRatio != 1.0f) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
-                    set(CaptureRequest.CONTROL_ZOOM_RATIO, currentConfig.zoomRatio)
-                }
-                // For older APIs, would need to use SCALER_CROP_REGION
-            }
+            // Zoom (zoom ratio, or a crop on Android 10) and the tap-to-focus /
+            // spot metering regions, mapped through that crop (CaptureRequestExtras.kt)
+            applyZoom(currentConfig.zoomRatio, lensGeometry)
+            applyMeteringRegions(currentConfig, lensGeometry)
 
             // Video stabilization
             when (currentConfig.stabilizationMode) {
@@ -722,8 +727,8 @@ class LensDaemonCameraManager(private val context: Context) {
 
         session.setRepeatingRequest(
             requestBuilder.build(),
-            null,
-            cameraHandler
+            captureCallback,
+            handler
         )
     }
 
