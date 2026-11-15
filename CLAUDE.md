@@ -977,7 +977,7 @@ The web dashboard now includes a comprehensive AI Director control panel:
 **Session Stats:**
 - Total takes recorded
 - Average quality score (0-10)
-- Good takes count (scoring 7 or more)
+- Good takes count (scoring 6 or more, the director's "good")
 - Cue success rate
 
 ## AI Director Script Files and Take Links

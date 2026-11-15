@@ -2052,10 +2052,11 @@ async function markTake(takeNumber, quality) {
     fetchTakesList();
 }
 
-// Get quality class based on score
+// A take's badge from its score (0-10), with the director's own marks: excellent
+// from 8, good from 6 (as the "Good takes" count), fair from 5 (a suggested take's least)
 function getQualityClass(score) {
-    if (score >= 9.0) return 'excellent';
-    if (score >= 7.0) return 'good';
+    if (score >= 8.0) return 'excellent';
+    if (score >= 6.0) return 'good';
     if (score >= 5.0) return 'fair';
     return 'poor';
 }
