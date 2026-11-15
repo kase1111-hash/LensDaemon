@@ -39,8 +39,8 @@ LensDaemon is an Android application that transforms smartphones into dedicated 
 # Generate release APK
 ./gradlew assembleRelease
 
-# Install on connected device
-./gradlew installDebug
+# Install on connected device (installCoreDebug for the build without the AI Director)
+./gradlew installFullDebug
 ```
 
 ## Project Structure

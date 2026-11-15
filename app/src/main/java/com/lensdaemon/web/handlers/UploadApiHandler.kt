@@ -252,6 +252,7 @@ class UploadApiHandler {
             put("backend", credentials.backend.name)
             put("bucket", credentials.bucket)
             put("endpoint", credentials.endpoint)
+            put("useHttps", credentials.useHttps)
         }
         return NanoHTTPD.newFixedLengthResponse(Status.OK, WebServer.MIME_JSON, json.toString())
     }

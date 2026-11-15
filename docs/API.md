@@ -221,8 +221,8 @@ seconds. It needs no token.
 - `recording.active` is true while a recording is open: running, paused, or
   held by a recorder that reported an error but still has its file open (Stop
   Recording closes it). `paused` is true while it is paused. `error` is true
-  from an error the recorder reports until the recording is stopped or a new
-  one starts.
+  from an error the recorder reports until the recording is stopped, paused or
+  resumed, or a new one starts.
 - `recording.lastError` is the last error the recorder reported since the last
   recording start, such as `Storage full - recording stopped` (see
   [Retention policy](#retention-policy)), kept after the stop that follows it
@@ -605,8 +605,8 @@ encoder, which may support less or more. (`1080p60` is a name only: its size is
 ## RTSP
 
 The RTSP server runs on the port its start request gives, else on the saved
-stream default `rtspPort` (8554 until another is saved with
-`PUT /api/config` `defaults`), and supports up to 10 concurrent clients, over
+stream default `rtspPort` (8554 until another is saved, with
+`PUT /api/config` `defaults` or by a successful start on another port), and supports up to 10 concurrent clients, over
 UDP or TCP (interleaved). Any path is accepted;
 `rtsp://<device-ip>:<port>/stream` is the advertised one, the `url` that the
 start response and `GET /api/rtsp/status` give. It has no authentication.
@@ -1386,7 +1386,8 @@ Android Keystore, and kept out of backups and device transfers).
   "message": "S3 configured",
   "backend": "S3",
   "bucket": "my-recordings",
-  "endpoint": "s3.us-east-1.amazonaws.com"
+  "endpoint": "s3.us-east-1.amazonaws.com",
+  "useHttps": true
 }
 ```
 
@@ -2208,6 +2209,9 @@ audio (10%).
   take.
 - Steadiness is a placeholder too: a constant 0.7, the value for stabilisation
   off, which LensDaemon never switches on.
+- These hold once a take has been sampled (every 100 ms): a take ended within
+  a fraction of a second has no samples and scores 0 on focus lock, exposure
+  stability and steadiness.
 - Audio is not measured and counts as OK.
 
 So takes differ in focus lock and cue timing (and in exposure stability when

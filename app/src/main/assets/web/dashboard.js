@@ -30,6 +30,8 @@ let deviceInfoLoaded = false;
 
 // Encoder settings form: follows the running encoder until edited
 let encoderFormEdited = false;
+// The recording's "New file every" was chosen by hand: the phone's defaults no longer replace it
+let segmentEdited = false;
 
 // The phone's saved stream defaults (GET /api/config "defaults"), or null when unknown
 let streamDefaults = null;
@@ -317,6 +319,7 @@ function setupEventListeners() {
             updateEncoderNote();
         });
     });
+    elements.segmentMinutes.addEventListener('change', () => { segmentEdited = true; });
     elements.btnSaveDefaults.addEventListener('click', saveStreamDefaults);
     // What "Save as phone default" last answered no longer applies once the settings change
     [elements.resolution, elements.bitrate, elements.framerate, elements.codec, elements.segmentMinutes].forEach(el => {
@@ -621,7 +624,7 @@ function applyDefaultsToForm(d) {
     if (d.bitrate) elements.bitrate.value = +(d.bitrate / 1000000).toFixed(1);
     if (d.frameRate) setSelectValue(elements.framerate, String(d.frameRate), `${d.frameRate} fps`);
     if (d.codec) setSelectValue(elements.codec, d.codec, d.codec);
-    if (typeof d.segmentMinutes === 'number') {
+    if (typeof d.segmentMinutes === 'number' && !segmentEdited) {
         setSelectValue(elements.segmentMinutes, String(d.segmentMinutes), `${d.segmentMinutes} minutes`);
     }
     updateEncoderNote();
@@ -1520,6 +1523,8 @@ function smbFormValues() {
     };
     const port = elements.smbPort.value.trim();
     if (port) values.port = Number(port);
+    // Text the number field can't read leaves its value empty: refuse it rather than drop the port
+    else if (elements.smbPort.validity && elements.smbPort.validity.badInput) values.port = NaN;
     return values;
 }
 
@@ -1543,7 +1548,7 @@ async function saveS3() {
     }
     const result = await apiCall('/api/upload/s3/config', 'POST', values);
     if (succeeded(result)) {
-        showResult(elements.s3Result, true, `Saved: ${result.bucket}${result.endpoint ? ' on ' + result.endpoint : ''}`);
+        showResult(elements.s3Result, true, `Saved: ${result.bucket}${result.endpoint ? ' on ' + s3EndpointText(result) : ''}`);
         elements.s3AccessKey.value = '';
         elements.s3SecretKey.value = '';
         fetchStorageConfig();
