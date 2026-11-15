@@ -1167,8 +1167,8 @@ on its own, as `autoStart.startRtsp` and `startRecording` say.
   saves its requested settings; `PUT /api/config {"defaults": ...}` sets them;
   the phone's Start Stream, kiosk auto-start (`CameraService.autoStartIntent`)
   and the sticky restart use them, falling back once to 1080p30 on port 8554.
-  API start requests without settings use fixed 1080p30 H.264 4 Mbps (and,
-  starting the encoder, save those as the defaults).
+  API start requests take any setting they leave out (and the RTSP port and
+  file length) from them.
 - Thermal (`pauseForThermal`, `resumeAfterThermal`, `setThermalEncoderLimits`,
   `setThermalBitrateReduction`): called by WebServerService on one background
   thread. The bitrate cut is state, applied to every encoder that starts; the

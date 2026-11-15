@@ -295,12 +295,16 @@ class KioskManager(
                 features = features or DevicePolicyManager.LOCK_TASK_FEATURE_GLOBAL_ACTIONS
             }
 
-            // Block notifications if configured
+            // Notifications stay hidden whatever lockNotifications says: Android
+            // allows LOCK_TASK_FEATURE_NOTIFICATIONS only together with the Home
+            // button (LOCK_TASK_FEATURE_HOME), which a kiosk does not offer, and
+            // setLockTaskFeatures refuses the whole set when it comes without it
             if (!security.lockNotifications) {
-                features = features or DevicePolicyManager.LOCK_TASK_FEATURE_NOTIFICATIONS
+                Timber.tag(TAG).w("lockNotifications=false has no effect: notifications need the Home button in lock task mode")
             }
 
-            // Block keyguard
+            // Show the phone's own lock screen when it wakes (without this flag
+            // lock task mode hides it, even when a PIN or pattern is set)
             features = features or DevicePolicyManager.LOCK_TASK_FEATURE_KEYGUARD
         }
 

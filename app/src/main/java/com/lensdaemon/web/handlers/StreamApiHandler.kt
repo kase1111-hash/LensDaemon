@@ -1,6 +1,7 @@
 package com.lensdaemon.web.handlers
 
 import com.lensdaemon.camera.CameraService
+import com.lensdaemon.camera.StreamDefaults
 import com.lensdaemon.encoder.EncoderConfig
 import com.lensdaemon.encoder.VideoCodec
 import com.lensdaemon.output.SegmentDuration
@@ -34,10 +35,6 @@ import java.net.UnknownHostException
 class StreamApiHandler {
 
     private companion object {
-        const val DEFAULT_WIDTH = 1920
-        const val DEFAULT_HEIGHT = 1080
-        const val DEFAULT_BITRATE = 4_000_000
-        const val DEFAULT_FRAME_RATE = 30
         const val MIME_MP4 = "video/mp4"
     }
 
@@ -45,9 +42,6 @@ class StreamApiHandler {
 
     /** Held while POST /api/recording/start checks for an open recording and starts one. */
     private val recordingStartLock = Any()
-
-    /** Held while POST /api/storage/cleanup runs a clean-up and reads back its result. */
-    private val cleanupLock = Any()
 
     /**
      * Handle request if URI matches. Returns null for unhandled URIs.
@@ -102,7 +96,7 @@ class StreamApiHandler {
     private fun startStream(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val success = camera.startStreaming(encoderConfigFrom(body))
+        val success = camera.startStreaming(encoderConfigFrom(body, camera.streamDefaults()))
 
         val json = JSONObject().apply {
             put("success", success)
@@ -161,9 +155,10 @@ class StreamApiHandler {
     private fun startRtsp(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val port = body?.optInt("port", 8554) ?: 8554
+        val defaults = camera.streamDefaults()
+        val port = body?.optInt("port", defaults.rtspPort) ?: defaults.rtspPort
 
-        val success = camera.startRtspStreaming(encoderConfigFrom(body), port)
+        val success = camera.startRtspStreaming(encoderConfigFrom(body, defaults), port)
 
         val json = JSONObject().apply {
             put("success", success)
@@ -252,7 +247,7 @@ class StreamApiHandler {
             latencyMs = latencyMs
         )
 
-        val success = camera.startMpegTsStreaming(encoderConfigFrom(body), mpegtsConfig)
+        val success = camera.startMpegTsStreaming(encoderConfigFrom(body, camera.streamDefaults()), mpegtsConfig)
 
         val json = JSONObject().apply {
             put("success", success)
@@ -347,7 +342,8 @@ class StreamApiHandler {
     private fun startRecording(body: JSONObject?): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        val segmentMinutes = body?.optInt("segmentMinutes", 5) ?: 5
+        val defaults = camera.streamDefaults()
+        val segmentMinutes = body?.optInt("segmentMinutes", defaults.segmentMinutes) ?: defaults.segmentMinutes
 
         val segmentDuration = when (segmentMinutes) {
             0 -> SegmentDuration.CONTINUOUS
@@ -361,7 +357,7 @@ class StreamApiHandler {
 
         val success = synchronized(recordingStartLock) {
             if (camera.isRecording() || camera.isRecordingPaused()) return alreadyRecording(camera)
-            camera.startRecording(encoderConfigFrom(body), segmentDuration)
+            camera.startRecording(encoderConfigFrom(body, defaults), segmentDuration)
         }
         // A start that lost a race with one from elsewhere (the phone, kiosk
         // auto-start) finds that recording open
@@ -605,23 +601,18 @@ class StreamApiHandler {
     private fun enforceRetention(): NanoHTTPD.Response {
         val camera = cameraService ?: return cameraUnavailable()
 
-        // Runs the clean-up here, on the request thread. The last result in the
-        // storage status is stored only by clean-ups run through
-        // CameraService.enforceRetention(), which nothing but this endpoint
-        // calls, so with them taking turns on this lock the result read back
-        // is this request's own, not that of one running at the same time
-        // (runs the recorder starts itself take turns with it in RetentionPolicy)
-        val result = synchronized(cleanupLock) {
-            camera.enforceRetention()
-            camera.getStorageStatus().lastRetentionResult
-        }
+        // Runs the clean-up here, on the request thread, and answers with this
+        // run's own result. Clean-ups take turns in RetentionPolicy, so one that
+        // runs at the same time (another request, the recorder's own) cannot
+        // delete the same files under it.
+        val result = camera.enforceRetention()
 
         val json = JSONObject().apply {
             put("success", true)
-            put("filesDeleted", result?.filesDeleted ?: 0)
-            put("bytesFreed", result?.bytesFreed ?: 0L)
+            put("filesDeleted", result.filesDeleted)
+            put("bytesFreed", result.bytesFreed)
             put("failed", JSONArray().apply {
-                result?.failedFiles?.forEach { put(it) }
+                result.failedFiles.forEach { put(it) }
             })
         }
 
@@ -632,19 +623,22 @@ class StreamApiHandler {
 
     /**
      * Encoder settings from a start request: width, height, bitrate (bps),
-     * frameRate and codec (H264 or H265), each defaulting to 1080p30 H.264 at 4 Mbps.
+     * frameRate and codec (H264 or H265). Each one the request leaves out comes
+     * from the phone's saved stream defaults, so a start without settings
+     * streams with them, and the start (which saves its settings as the new
+     * defaults) leaves them as they were.
      */
-    private fun encoderConfigFrom(body: JSONObject?): EncoderConfig {
-        val codecStr = body?.optString("codec", "H264") ?: "H264"
-        val codec = VideoCodec.entries.find { it.name.equals(codecStr, ignoreCase = true) } ?: VideoCodec.H264
+    private fun encoderConfigFrom(body: JSONObject?, defaults: StreamDefaults): EncoderConfig {
+        val codecStr = body?.optString("codec", defaults.codec.name) ?: defaults.codec.name
+        val codec = VideoCodec.entries.find { it.name.equals(codecStr, ignoreCase = true) } ?: defaults.codec
         return EncoderConfig(
             codec = codec,
             resolution = android.util.Size(
-                body?.optInt("width", DEFAULT_WIDTH) ?: DEFAULT_WIDTH,
-                body?.optInt("height", DEFAULT_HEIGHT) ?: DEFAULT_HEIGHT
+                body?.optInt("width", defaults.width) ?: defaults.width,
+                body?.optInt("height", defaults.height) ?: defaults.height
             ),
-            bitrateBps = body?.optInt("bitrate", DEFAULT_BITRATE) ?: DEFAULT_BITRATE,
-            frameRate = body?.optInt("frameRate", DEFAULT_FRAME_RATE) ?: DEFAULT_FRAME_RATE
+            bitrateBps = body?.optInt("bitrate", defaults.bitrateBps) ?: defaults.bitrateBps,
+            frameRate = body?.optInt("frameRate", defaults.frameRate) ?: defaults.frameRate
         )
     }
 

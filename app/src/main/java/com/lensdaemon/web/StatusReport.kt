@@ -2,6 +2,7 @@ package com.lensdaemon.web
 
 import com.lensdaemon.camera.CameraService
 import com.lensdaemon.director.DirectorManager
+import com.lensdaemon.director.TakeManager
 import com.lensdaemon.encoder.EncoderState
 import com.lensdaemon.thermal.ThermalGovernor
 import org.json.JSONArray
@@ -12,8 +13,8 @@ import org.json.JSONObject
  */
 internal object StatusReport {
 
-    /** A take scoring at least this counts as good in the dashboard's stats. */
-    private const val GOOD_TAKE_SCORE = 7.0f
+    /** A take scoring at least this counts as good in the dashboard's stats: the director's own rule. */
+    private const val GOOD_TAKE_SCORE = TakeManager.GOOD_SCORE
 
     fun camera(camera: CameraService?): JSONObject = JSONObject().apply {
         put("previewActive", camera?.isPreviewActive() ?: false)

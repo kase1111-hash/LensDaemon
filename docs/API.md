@@ -220,7 +220,7 @@ seconds. It needs no token.
 - `director` is present on builds with the AI Director. The scene and cue
   fields count from 0 and appear while a script is loaded. In `stats`,
   `averageScore` is the average take score (0-10), `goodTakes` counts takes
-  scoring at least 7, `sessionTime` is the seconds since the script was loaded,
+  scoring at least 6 (the director's "good"), `sessionTime` is the seconds since the script was loaded,
   and `cueSuccessRate` is a fraction (0-1).
 
 ### GET /api/device
@@ -249,13 +249,14 @@ dashboard offers it as the MPEG-TS target: the computer it is open on). Like
 
 | Field | Default | Notes |
 |-------|---------|-------|
-| `width`, `height` | `1920`, `1080` | Must be a size the hardware encoder supports |
-| `bitrate` | `4000000` | Bits per second |
-| `frameRate` | `30` | The camera is locked to this rate (see below) |
-| `codec` | `H264` | `H264` or `H265` |
+| `width`, `height` | saved default (`1920`, `1080` until others are saved) | Must be a size the hardware encoder supports |
+| `bitrate` | saved default (`4000000`) | Bits per second |
+| `frameRate` | saved default (`30`) | The camera is locked to this rate (see below) |
+| `codec` | saved default (`H264`) | `H264` or `H265` |
 
-Fields left out take these values, not the phone's saved stream defaults (see
-[GET /api/config](#get-apiconfig)).
+Fields left out take the phone's saved stream defaults (see
+[GET /api/config](#get-apiconfig)); so do `/api/rtsp/start`'s `port` and
+`/api/recording/start`'s `segmentMinutes`.
 
 There is one encoder, shared by every output. An output started while the
 encoder is already running joins it as it is, and the response's `config`
@@ -271,9 +272,8 @@ Each successful start saves the encoder's requested settings (before any
 thermal limit) as the phone's stream defaults, together with the RTSP port for
 `/api/rtsp/start` and the file length for `/api/recording/start`: the settings
 the request asked for when it started (or, with `/api/stream/start`,
-restarted) the encoder, else those of the encoder it joined. So a start
-without settings while no encoder runs makes 1080p30 H.264 at 4 Mbps the
-defaults again.
+restarted) the encoder, else those of the encoder it joined. A start without
+settings uses the saved defaults, so it leaves them as they were.
 
 The camera's auto-exposure is held at the stream's frame rate, so the stream
 does not drop frames in dim light; if the camera cannot reach the requested
@@ -531,7 +531,7 @@ encoder, which may support less or more. (`1080p60` is a name only: its size is
     { "name": "4K", "width": 3840, "height": 2160 }
   ],
   "frameRates": [15, 24, 30, 60],
-  "bitrateRange": { "min": 500000, "max": 20000000 }
+  "bitrateRange": { "min": 100000, "max": 50000000 }
 }
 ```
 
@@ -1949,6 +1949,9 @@ whether there is one). This example is the APPLIANCE preset with kiosk mode on:
 - LensDaemon's own screen hides the status and navigation bars whatever
   `lockStatusBar` and `lockNavigationBar` say (a swipe shows them for a moment);
   while pinned, Home and Recents are blocked either way.
+- Notifications stay hidden while pinned whatever `lockNotifications` says:
+  Android shows them in lock task mode only together with the Home button,
+  which kiosk mode does not offer.
 - The meaning of the other settings is described above.
 
 ### PUT /api/kiosk/config

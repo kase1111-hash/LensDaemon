@@ -526,9 +526,10 @@ class ApiRoutes(
                 put(JSONObject().apply { put("name", "4K"); put("width", 3840); put("height", 2160) })
             })
             put("frameRates", JSONArray().apply { put(15); put(24); put(30); put(60) })
+            // The bitrates PUT /api/config and the stream defaults accept
             put("bitrateRange", JSONObject().apply {
-                put("min", 500000)
-                put("max", 20000000)
+                put("min", ApiInputs.BITRATE_RANGE.first)
+                put("max", ApiInputs.BITRATE_RANGE.last)
             })
         }
 

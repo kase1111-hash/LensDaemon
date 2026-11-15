@@ -66,7 +66,9 @@ class UploadService : Service(), UploadEventListener {
 
     companion object {
         private const val TAG = "UploadService"
-        private const val NOTIFICATION_ID = 3001
+        // Its own ID: the web server's notification uses 3001, and sharing it
+        // made the upload notification replace the dashboard address
+        private const val NOTIFICATION_ID = 5001
         private const val CHANNEL_ID = "upload_service_channel"
 
         // Intent actions
