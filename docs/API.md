@@ -40,6 +40,10 @@ The MJPEG preview (`/mjpeg`, `/stream.mjpeg`) follows the same rule. The
 bundled dashboard and setup wizard send no token, so with one set their
 controls fail with 401. RTSP and MPEG-TS have no authentication.
 
+The rate limit (below) is checked before the token, so requests with a wrong
+token use up the client's allowance like any others: once a token is set, the
+limit is what slows down guessing it.
+
 ### Cross-site requests
 
 A `POST`, `PUT` or `DELETE` whose `Origin` header names another site than the
@@ -59,8 +63,10 @@ are not affected. This does not protect against DNS rebinding.
 ### Rate limit
 
 Each client address (the connection's; `X-Forwarded-For` is ignored) may send
-bursts of 60 requests, refilled at 10 per second. Beyond that the answer is
-`429`, with a `Retry-After` header (seconds) and `X-RateLimit-Remaining: 0`:
+bursts of 60 requests, refilled at 10 per second; `/api/` requests and MJPEG
+preview connections count alike (the dashboard's pages and scripts do not).
+Beyond that the answer is `429`, with a `Retry-After` header (seconds) and
+`X-RateLimit-Remaining: 0`:
 
 ```json
 {"error": "Rate limit exceeded", "retryAfter": 1}
@@ -77,7 +83,7 @@ names another charset. A body that is not a JSON object, or is larger than
 1 MB, counts as no body.
 
 Every `/api/` request passes these steps in order: the body is read, the
-cross-site check (403), the token (401), the rate limit (429), then the
+cross-site check (403), the rate limit (429), the token (401), then the
 endpoint itself.
 
 Errors come back as JSON with an `error` field. Endpoints that report `success`
@@ -94,7 +100,7 @@ add `"success": false`, and some repeat the reason in `message`:
 | 401 | Token missing or wrong (only once a token is set) |
 | 403 | Cross-site write refused |
 | 404 | Unknown endpoint (`{"error": "Endpoint not found", "uri": "/api/x", "method": "GET"}`), or a recording, script file, take or upload task that does not exist |
-| 409 | Conflicts with what runs now: no encoder for a bitrate change, the file being recorded, a director that runs or is too hot, a phone that cannot switch charging |
+| 409 | Conflicts with what runs now: no encoder for a bitrate change, the file being recorded, a lens without tap-to-focus, a director that runs or is too hot, a phone that cannot switch charging |
 | 429 | Rate limit, see above |
 | 500 | The phone could not do it: an encoder or server that did not start, a file that could not be deleted |
 | 503 | The service behind the endpoint is not connected (yet): `{"error": "Camera service not available"}`, likewise the Upload, Thermal, Kiosk and Director services |
@@ -261,9 +267,13 @@ resolution step down (4K to 1080p, 1080p to 720p) and at no more than 24 fps;
 `config` shows what runs. The requested settings come back when the phone
 cools down.
 
-Each successful start saves the encoder settings it asked for (before any
+Each successful start saves the encoder's requested settings (before any
 thermal limit) as the phone's stream defaults, together with the RTSP port for
-`/api/rtsp/start` and the file length for `/api/recording/start`.
+`/api/rtsp/start` and the file length for `/api/recording/start`: the settings
+the request asked for when it started (or, with `/api/stream/start`,
+restarted) the encoder, else those of the encoder it joined. So a start
+without settings while no encoder runs makes 1080p30 H.264 at 4 Mbps the
+defaults again.
 
 The camera's auto-exposure is held at the stream's frame rate, so the stream
 does not drop frames in dim light; if the camera cannot reach the requested
@@ -276,7 +286,8 @@ running until `/api/stream/stop`, whether or not any output is attached. RTSP,
 MPEG-TS and recording are started by their own endpoints and share this
 encoder. If the encoder is already running with different settings it is
 restarted: RTSP and MPEG-TS viewers stay connected and continue from the new
-stream's first keyframe, and an active recording continues in a new file.
+stream's first keyframe, and an open recording continues in a new file (a
+paused one stays paused).
 
 **Response:**
 ```json
@@ -706,9 +717,10 @@ is missing, not a number, or not finite.
 Focus on a point of the picture. `x` and `y` are shares of the frame as the
 stream shows it, from the left and the top edge (0 to 1; values beyond are
 clamped). The camera stays in continuous video autofocus and is given a focus
-region there; the exposure is not metered on it. On a lens without continuous
-video autofocus the request is accepted but changes nothing. The answer does
-not report a focus state.
+region there; the exposure is not metered on it. A lens without continuous
+video autofocus (fixed focus, or one-shot autofocus only) has no tap-to-focus:
+the request is refused with `409` and nothing changes, so a success means the
+region was set. The answer does not report a focus state.
 
 **Request:**
 ```json
@@ -730,8 +742,12 @@ not report a focus state.
 `{"reset": true}` drops the focus and metering regions and goes back to plain
 continuous autofocus, answering `{"success": true, "reset": true}`.
 
-`400` `{"success": false, "error": "x and y must be finite numbers from 0 to 1"}`
-when `x` or `y` is missing, not a number, or not finite.
+**Errors:**
+- `400` `{"success": false, "error": "x and y must be finite numbers from 0 to 1"}`
+  when `x` or `y` is missing, not a number, or not finite
+- `409` `{"success": false, "error": "This lens has no tap-to-focus (it needs continuous video autofocus)"}`
+- `409` `{"success": false, "error": "The camera is not open"}` before the
+  camera has opened a lens
 
 ### POST /api/exposure
 
@@ -1427,8 +1443,9 @@ override saved with `PUT /api/thermal/profile`. With the generic profile:
   (or the configured bitrate when that is lower). It applies to every encoder
   that starts while it lasts.
 - At `CRITICAL` the outputs stay connected while the encoder restarts: viewers
-  continue from the next keyframe and a recording continues in a new file. The
-  requested settings come back once the CPU has cooled.
+  continue from the next keyframe and a recording continues in a new file (a
+  paused one stays paused). The requested settings come back once the CPU has
+  cooled.
 - At `EMERGENCY` LensDaemon remembers what ran (RTSP with its port, MPEG-TS
   with its settings, the recording with its file length and whether it was
   paused, the encoder settings) and stops it all; `/api/status` reports
@@ -1771,9 +1788,10 @@ adb shell dpm set-device-owner com.lensdaemon/.AdminReceiver
 What kiosk mode does, with Device Owner:
 - **Pinned** (lock task mode): Home and Recents are blocked, the status bar is
   hidden; the power menu stays available while the exit gesture is allowed.
-- **Restrictions** from the moment LensDaemon is pinned: no safe boot (which
-  would start the phone without LensDaemon), no factory reset, no USB file
-  transfer. They are lifted when kiosk mode is turned off.
+- **Restrictions** while kiosk mode is on: no safe boot (which would start the
+  phone without LensDaemon), no factory reset, no USB file transfer. They are
+  set as soon as kiosk mode is turned on, pinned or not (and again when
+  LensDaemon pins itself), and lifted when it is turned off.
 - **Screen** (while pinned): `PREVIEW` shows the camera preview; `DIM` lowers
   the brightness to `dimBrightness` (0-255); `BLACK` covers the screen with
   black at that brightness; `OFF`, or `keepScreenOn: false`, lets the phone's
@@ -1798,9 +1816,9 @@ What kiosk mode does, with Device Owner:
   read again at that point, so turning kiosk mode or its auto-start off during
   the wait (from the dashboard, which is already up) starts nothing more.
 - Without Device Owner, Android 10+ does not let LensDaemon open its screen by
-  itself, and Android 11+ gives it no camera when started at boot: there the
-  camera is not started, and only the web server and thermal monitoring come
-  up.
+  itself, and Android 11+ gives it no camera when started at boot: on Android
+  11+ the camera is therefore not started, and only the web server and thermal
+  monitoring come up.
 
 **After a crash or when Android kills the app**, Android restarts LensDaemon's
 camera service. With kiosk mode, `autoStart.enabled` and
@@ -2734,9 +2752,14 @@ GET /stream.mjpeg
 ```
 
 - Frames flow while the camera is capturing.
-- Once a token is set it needs one, like the API (`?token=` works in an
-  `<img>`); `401` otherwise.
-- At most 8 viewers at once: more get `503` `{"error": "Too many preview viewers"}`
+- Each connection counts against the API's rate limit (`429`). Once a token
+  is set it needs one, like the API (`?token=` works in an `<img>`); `401`
+  otherwise.
+- At most 8 viewers at once. When 8 are watching, the one that has gone
+  longest without a frame written to it makes room for the newcomer, if that
+  is more than 3 seconds (it has left, is stuck, or watches a camera that sends
+  nothing: a viewer that left is only noticed when a write to it fails).
+  Otherwise the newcomer gets `503` `{"error": "Too many preview viewers"}`
   (`{"error": "Preview stopped"}` while the web server shuts down).
 - A slow viewer skips frames. A viewer whose connection has not taken a frame
   for 5 seconds (a phone locked with the preview open, a laptop that left the

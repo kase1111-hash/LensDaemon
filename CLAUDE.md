@@ -187,6 +187,7 @@ app/src/main/java/com/lensdaemon/camera/
 ├── FocusController.kt           # Focus control and tap-to-focus
 │                                # - A tap keeps CONTINUOUS_VIDEO and sets an AF region;
 │                                #   a lens without continuous video AF gets no tap-to-focus
+│                                #   (isTapToFocusSupported; POST /api/focus answers 409)
 │                                # - No focus state reporting (no capture callback feeds it)
 │                                # - Manual focus distance control
 │                                # - Focus lock/unlock operations
@@ -312,7 +313,7 @@ app/src/main/java/com/lensdaemon/web/
 │                                # - Static asset serving from assets/web/
 │                                # - API routing to ApiRoutes handler
 │                                # - MJPEG stream endpoint (/mjpeg, /stream.mjpeg), with
-│                                #   the API's token rule
+│                                #   the API's rate limit and token rule (ApiRoutes.admit)
 │                                # - Never gzips text/event-stream (useGzipWhenAccepted)
 │                                # - MIME type detection
 │                                # - Server statistics tracking
@@ -323,6 +324,7 @@ app/src/main/java/com/lensdaemon/web/
 │                                # - POST /api/lens/{wide|main|tele} - lens switching
 │                                # - POST /api/zoom - set zoom (answers the applied zoom)
 │                                # - POST /api/focus - focus region at x, y, or {reset: true}
+│                                #   (409 on a lens without tap-to-focus)
 │                                # - POST /api/exposure - exposure compensation
 │                                # - POST /api/snapshot - capture JPEG
 │                                # - GET/PUT /api/config - bitrate, zoom, exposure and
@@ -331,8 +333,9 @@ app/src/main/java/com/lensdaemon/web/
 │                                # - Motion JPEG multipart response
 │                                # - pushFrame only fills each viewer's one-frame slot;
 │                                #   each viewer's own connection thread writes
-│                                # - At most 8 viewers (503 beyond); a viewer whose write
-│                                #   is stuck for 5 s is closed
+│                                # - At most 8 viewers: at the cap the one longest without
+│                                #   a write (over 3 s) makes room, else 503; a viewer
+│                                #   whose write is stuck for 5 s is closed
 │                                # - Frame rate limiting (configurable max FPS)
 │                                # - JpegFrameConverter for YUV/Bitmap conversion
 └── WebServerService.kt          # Foreground web server service
@@ -615,8 +618,9 @@ app/src/main/java/com/lensdaemon/kiosk/
 │                                # - setLockTaskPackages for allowlist
 │                                # - System UI hiding (status bar, navigation bar)
 │                                # - User restrictions (no factory reset, safe boot or USB
-│                                #   file transfer): set when pinned, cleared when kiosk
-│                                #   mode is turned off
+│                                #   file transfer): set when kiosk mode is turned on
+│                                #   (pinned or not) and when pinned, cleared when it is
+│                                #   turned off
 │                                # - Kiosk state tracking via StateFlow
 │                                # - Event log in memory (last 100), recordEvent();
 │                                #   recordRestart() persists the restart count and time
@@ -684,8 +688,9 @@ the activity is in the foreground, and also owns keep-screen-on and the screen
 mode (DIM, BLACK; OFF is the phone's own screen timeout). `enabled` also gates
 boot auto-start (`BootReceiver`). Presets change the settings but leave
 `enabled` and the exit PIN as they were. The restrictions (no safe boot, factory
-reset or USB file transfer) are set when the phone is pinned and cleared
-whenever `enabled` turns false.
+reset or USB file transfer) are set whenever `enabled` turns true (as device
+owner, pinned or not) and when the phone is pinned, and cleared whenever
+`enabled` turns false.
 
 Crash recovery is Android's sticky restart: `CameraService.onStartCommand` gets
 a null intent after the process died and, with kiosk mode, `autoStart` and
@@ -1121,9 +1126,10 @@ followed by a second review round:
   sticky restart after a crash, saved stream defaults for boot and restarts,
   boot honours its flags, presets keep the exit PIN, PIN validated, restrictions
   follow kiosk mode
-- Web: cross-site writes refused, /mjpeg behind the token rule, MJPEG never
-  blocks the camera thread, SSE no longer gzipped, inputs validated, JSON built
-  with JSONObject
+- Web: cross-site writes refused, /mjpeg behind the rate limit and token rule,
+  the rate limit checked before the token, MJPEG never blocks the camera thread,
+  SSE no longer gzipped, inputs validated (tap-to-focus refused with 409 where
+  it can't apply), JSON built with JSONObject
 - Director: live events reach the browser, real 0-10 take scores, thermal hold
   that stays until cool, run control that acts at once, script errors reported,
   partial config updates (REMOTE refused); DirectorService removed
@@ -1161,7 +1167,8 @@ on its own, as `autoStart.startRtsp` and `startRecording` say.
   saves its requested settings; `PUT /api/config {"defaults": ...}` sets them;
   the phone's Start Stream, kiosk auto-start (`CameraService.autoStartIntent`)
   and the sticky restart use them, falling back once to 1080p30 on port 8554.
-  API start requests without settings use fixed 1080p30 H.264 4 Mbps.
+  API start requests without settings use fixed 1080p30 H.264 4 Mbps (and,
+  starting the encoder, save those as the defaults).
 - Thermal (`pauseForThermal`, `resumeAfterThermal`, `setThermalEncoderLimits`,
   `setThermalBitrateReduction`): called by WebServerService on one background
   thread. The bitrate cut is state, applied to every encoder that starts; the
@@ -1227,8 +1234,8 @@ GET  /api/mpegts/status # MPEG-TS/UDP publisher statistics
 
 ```
 app/src/main/java/com/lensdaemon/web/
-├── ApiRoutes.kt                 # Thin dispatcher: body, cross-site check, token
-│                                # (authorize, also used for /mjpeg), rate limit, routing
+├── ApiRoutes.kt                 # Thin dispatcher: body, cross-site check, then admit
+│                                # (rate limit, then token; also used for /mjpeg), routing
 ├── CrossSiteGuard.kt            # 403 for POST/PUT/DELETE whose Origin isn't this Host
 ├── ApiInputs.kt                 # Strict number parsing (finite, whole); PUT /api/config
 │                                # checks (ConfigChange, stream defaults merge)
@@ -1240,7 +1247,8 @@ app/src/main/java/com/lensdaemon/web/
 ├── RateLimiter.kt               # Token bucket per connection address (X-Forwarded-For
 │                                # ignored), at most 1024 clients tracked
 ├── WebServer.kt                 # NanoHTTPD HTTP server (no gzip for text/event-stream)
-├── MjpegStreamer.kt             # MJPEG live preview (per-viewer slot, 8 viewers max)
+├── MjpegStreamer.kt             # MJPEG live preview (per-viewer slot, 8 viewers max;
+│                                # an idle viewer makes room at the cap)
 ├── WebServerService.kt          # Foreground service
 └── handlers/
     ├── ApiHandlerUtils.kt       # Shared: sanitize, validate, response helpers

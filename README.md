@@ -75,7 +75,7 @@ Write a script with scene cues, load it from the dashboard, and the AI Director 
 **Thermal-Safe Design:**
 - **Completely inert when disabled** — No background processing, zero thermal impact
 - Cues are parsed on the phone when the script loads; no cloud service or language model is involved
-- The director stops at its temperature threshold (55°C by default) and waits for the phone to cool before it runs again
+- The director stops at its temperature threshold (55°C by default) and can't be started again until the phone is 5°C cooler
 
 **Use Cases:**
 - Solo content creators directing their own shots
@@ -221,8 +221,10 @@ curl -X POST http://192.168.1.50:8080/api/snapshot -o snapshot.jpg
 ```
 
 `POST /api/stream/start` starts only the encoder; RTSP, MPEG-TS and recording
-have their own start endpoints. The API, the preview and the streams have no
-authentication by default, so keep the phone on a network you trust.
+have their own start endpoints. A start request without settings uses 1080p30
+H.264 at 4 Mbps, and a successful start saves its settings as the phone's
+stream defaults. The API, the preview and the streams have no authentication
+by default, so keep the phone on a network you trust.
 
 See [API.md](docs/API.md) for full reference.
 
